@@ -22,7 +22,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://wb_user:wb_pass_2024@db:5432/wrong_book
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: change-me-in-production
-      AES_KEY: change-me-32bytes-key-here!!
+      AES_KEY: change-me-32bytes-secret-key-ok!
     volumes:
       - ./app:/app/app
       - uploads:/app/uploads
