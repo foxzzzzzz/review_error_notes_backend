@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<style>
+  @page { size: A4; margin: 15mm; }
+  body { font-family: "SimSun", "KaiTi", serif; font-size: 12pt; }
+  .header { text-align: center; margin-bottom: 10mm; }
+  .header h1 { font-size: 16pt; margin: 0; }
+  .header p { color: #666; margin: 2mm 0; }
+  .columns { display: flex; gap: 8mm; }
+  .column { flex: 1; }
+  .column h2 { font-size: 14pt; border-bottom: 1px solid #333; padding-bottom: 3mm; }
+  .question { margin: 8mm 0; }
+  .question .number { font-weight: bold; }
+  .question .content { margin: 3mm 0; }
+  .answer-line { border-bottom: 1px dashed #999; height: 8mm; margin-top: 5mm; }
+  .divider { border-left: 1px dashed #999; }
+  .footer { position: fixed; bottom: 0; width: 100%; text-align: center;
+            font-size: 10pt; color: #999; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>{{ student_name }} · {{ subject }} · {{ title }}</h1>
+  <p>日期: {{ date }}</p>
+</div>
+<div class="columns">
+  <div class="column">
+    <h2>一、原题重做</h2>
+    {% for item in original_items %}
+    <div class="question">
+      <span class="number">{{ loop.index }}.</span>
+      <div class="content">{{ item }}</div>
+      <div class="answer-line"></div>
+    </div>
+    {% endfor %}
+  </div>
+  <div class="divider"></div>
+  <div class="column">
+    <h2>二、衍生题（难度提升）</h2>
+    {% for item in derived_items %}
+    <div class="question">
+      <span class="number">{{ loop.index }}.</span>
+      <div class="content">{{ item }}</div>
+      <div class="answer-line"></div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+<div class="footer">错题重练</div>
+</body>
+</html>
