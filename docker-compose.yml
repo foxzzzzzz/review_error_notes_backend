@@ -1,0 +1,47 @@
+version: '3.8'
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: wrong_book
+      POSTGRES_USER: wb_user
+      POSTGRES_PASSWORD: wb_pass_2024
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  api:
+    build: .
+    ports: ["8000:8000"]
+    depends_on: [db, redis]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://wb_user:wb_pass_2024@db:5432/wrong_book
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: change-me-in-production
+      AES_KEY: change-me-32bytes-key-here!!
+    volumes:
+      - ./app:/app/app
+      - uploads:/app/uploads
+      - pdfs:/app/pdfs
+
+  worker:
+    build: .
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    depends_on: [db, redis]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://wb_user:wb_pass_2024@db:5432/wrong_book
+      REDIS_URL: redis://redis:6379/0
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_API_BASE: ${LLM_API_BASE:-https://api.openai.com/v1}
+    volumes:
+      - ./app:/app/app
+      - uploads:/app/uploads
+
+volumes:
+  pgdata:
+  uploads:
+  pdfs:
