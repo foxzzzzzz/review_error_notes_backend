@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select
 from app.database import get_db
 from app.api.deps import get_current_student
 from app.models.wrong_question import WrongQuestion
@@ -44,7 +44,10 @@ async def get_question(question_id: str, student_id=Depends(get_current_student)
             WrongQuestion.student_id == student_id,
         )
     )
-    return result.scalar_one()
+    q = result.scalar_one_or_none()
+    if not q:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
+    return q
 
 
 @router.patch("/{question_id}")
@@ -60,7 +63,9 @@ async def update_question(
             WrongQuestion.student_id == student_id,
         )
     )
-    q = result.scalar_one()
+    q = result.scalar_one_or_none()
+    if not q:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
     for k, v in data.model_dump(exclude_unset=True).items():
         setattr(q, k, v)
     await db.commit()
@@ -75,7 +80,9 @@ async def delete_question(question_id: str, student_id=Depends(get_current_stude
             WrongQuestion.student_id == student_id,
         )
     )
-    q = result.scalar_one()
+    q = result.scalar_one_or_none()
+    if not q:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
     await db.delete(q)
     await db.commit()
     return {"ok": True}

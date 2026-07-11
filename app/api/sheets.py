@@ -35,7 +35,7 @@ async def create_sheet(
     )
     questions = qs.scalars().all()
     if not questions:
-        raise HTTPException(400, "No valid questions selected")
+        raise HTTPException(status_code=400, detail="No valid questions selected")
 
     subject = questions[0].subject or "math"
 

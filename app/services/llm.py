@@ -76,6 +76,8 @@ async def _call_llm(prompt: str) -> str:
             },
         )
         data = resp.json()
+        if resp.status_code != 200:
+            raise RuntimeError(f"LLM API error {resp.status_code}: {data}")
         return data["choices"][0]["message"]["content"]
 
 

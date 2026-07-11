@@ -1,16 +1,9 @@
-import cv2
-import numpy as np
-from PIL import Image
-
 def segment_questions(image_path: str, ocr_lines: list) -> list[dict]:
     """
     基于 OCR 行间距和编号（1. 2. ① ② 等）切分题目区域。
     返回 cropped regions: [{"index": 0, "bbox": [x,y,w,h], "text_lines": [...]}, ...]
     """
-    # 策略：按大间距（>2倍行高）或题号标记切分
-    img = cv2.imread(image_path)
-    h, w = img.shape[:2]
-
+    # 策略：按大间距（>40px）或题号标记切分
     regions = []
     current_region = []
     prev_bottom = 0
