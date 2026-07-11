@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     PDF_DIR: str = "./pdfs"
     WECHAT_APP_ID: str = ""
     WECHAT_APP_SECRET: str = ""
+    DEV_MODE: bool = False
 
     class Config:
         env_file = ".env"

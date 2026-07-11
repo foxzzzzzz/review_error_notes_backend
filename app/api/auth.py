@@ -61,3 +61,31 @@ async def bind_phone(req: BindPhoneRequest, student_id=Depends(get_current_stude
     student.phone_bound = True
     await db.commit()
     return {"ok": True}
+
+
+@router.post("/dev-login", response_model=LoginResponse)
+async def dev_login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
+    """开发模式：绕过微信直接登录（仅在 DEV_MODE=true 时可用）"""
+    if not settings.DEV_MODE:
+        raise HTTPException(status_code=403, detail="Dev login only available in DEV_MODE")
+    if not req.code:
+        raise HTTPException(status_code=400, detail="code is required (used as openid in dev mode)")
+
+    openid = req.code  # dev 模式下 code 即 openid
+    result = await db.execute(select(Student).where(Student.openid == openid))
+    student = result.scalar_one_or_none()
+    if student:
+        return LoginResponse(
+            token=create_token(str(student.id)),
+            need_phone=not student.phone_bound,
+            student_id=str(student.id),
+        )
+    student = Student(openid=openid, nickname=openid)
+    db.add(student)
+    await db.commit()
+    await db.refresh(student)
+    return LoginResponse(
+        token=create_token(str(student.id)),
+        need_phone=True,
+        student_id=str(student.id),
+    )
