@@ -23,7 +23,9 @@ services:
       JWT_SECRET: change-me-in-production
       AES_KEY: change-me-32bytes-secret-key-ok!
       DEV_MODE: "true"
+      PIP_CACHE_DIR: /root/.cache/pip
     volumes:
+      - pip_cache:/root/.cache/pip
       - ./app:/app/app
       - ./alembic.ini:/app/alembic.ini
       - ./alembic:/app/alembic
@@ -48,3 +50,4 @@ volumes:
   pgdata:
   uploads:
   pdfs:
+  pip_cache:
