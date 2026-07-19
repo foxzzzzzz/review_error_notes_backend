@@ -25,6 +25,9 @@ services:
       DEV_MODE: "true"
     volumes:
       - ./app:/app/app
+      - ./alembic.ini:/app/alembic.ini
+      - ./alembic:/app/alembic
+      - ./templates:/app/templates
       - uploads:/app/uploads
       - pdfs:/app/pdfs
 
