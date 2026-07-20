@@ -14,10 +14,12 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
+# Read DATABASE_URL from environment (set by docker-compose), fall back to alembic.ini
+import os
+db_url = os.getenv("DATABASE_URL", config.get_main_option("sqlalchemy.url"))
 # Alembic requires a sync driver; strip +asyncpg for migration runs
-config.set_main_option("sqlalchemy.url", re.sub(
-    r"\+asyncpg", "", config.get_main_option("sqlalchemy.url")
-))
+db_url = re.sub(r"\+asyncpg", "", db_url)
+config.set_main_option("sqlalchemy.url", db_url)
 
 
 def run_migrations_offline() -> None:

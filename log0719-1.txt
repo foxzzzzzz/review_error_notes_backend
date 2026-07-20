@@ -1,0 +1,244 @@
+ubuntu@VM-0-15-ubuntu:~/review_error_notes/review_error_notes_backend$ sudo docker-compose ps -a
+WARN[0000] /home/ubuntu/review_error_notes/review_error_notes_backend/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion 
+NAME                                  IMAGE                               COMMAND                  SERVICE   CREATED        STATUS                          PORTS
+review_error_notes_backend-api-1      review_error_notes_backend-api      "uvicorn app.main:ap…"   api       11 hours ago   Exited (1) About a minute ago   
+review_error_notes_backend-db-1       postgres:16-alpine                  "docker-entrypoint.s…"   db        11 hours ago   Up 11 hours                     0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp
+review_error_notes_backend-redis-1    redis:7-alpine                      "docker-entrypoint.s…"   redis     11 hours ago   Up 11 hours                     0.0.0.0:6379->6379/tcp, [::]:6379->6379/tcp
+review_error_notes_backend-worker-1   review_error_notes_backend-worker   "celery -A app.tasks…"   worker    11 hours ago   Up 11 hours                     
+ubuntu@VM-0-15-ubuntu:~/review_error_notes/review_error_notes_backend$ sudo docker-compose logs api
+WARN[0000] /home/ubuntu/review_error_notes/review_error_notes_backend/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion 
+api-1  | /usr/local/lib/python3.11/site-packages/paddle/utils/cpp_extension/extension_utils.py:711: UserWarning: No ccache found. Please be aware that recompiling all source files may be required. You can download and install ccache from: https://github.com/ccache/ccache/blob/master/doc/INSTALL.md
+api-1  |   warnings.warn(warning_message)
+api-1  | download https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_det_infer.tar to /root/.paddleocr/whl/det/ch/ch_PP-OCRv4_det_infer/ch_PP-OCRv4_det_infer.tar
+100%|██████████| 4780/4780 [00:00<00:00, 9656.40it/s]
+api-1  | download https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_rec_infer.tar to /root/.paddleocr/whl/rec/ch/ch_PP-OCRv4_rec_infer/ch_PP-OCRv4_rec_infer.tar
+100%|██████████| 10720/10720 [00:11<00:00, 914.08it/s] 
+api-1  | download https://paddleocr.bj.bcebos.com/dygraph_v2.0/ch/ch_ppocr_mobile_v2.0_cls_infer.tar to /root/.paddleocr/whl/cls/ch_ppocr_mobile_v2.0_cls_infer/ch_ppocr_mobile_v2.0_cls_infer.tar
+100%|██████████| 2138/2138 [00:02<00:00, 746.53it/s]
+api-1  | [2026/07/18 14:10:29] ppocr DEBUG: Namespace(help='==SUPPRESS==', use_gpu=False, use_xpu=False, use_npu=False, use_mlu=False, ir_optim=True, use_tensorrt=False, min_subgraph_size=15, precision='fp32', gpu_mem=500, gpu_id=0, image_dir=None, page_num=0, det_algorithm='DB', det_model_dir='/root/.paddleocr/whl/det/ch/ch_PP-OCRv4_det_infer', det_limit_side_len=960, det_limit_type='max', det_box_type='quad', det_db_thresh=0.3, det_db_box_thresh=0.6, det_db_unclip_ratio=1.5, max_batch_size=10, use_dilation=False, det_db_score_mode='fast', det_east_score_thresh=0.8, det_east_cover_thresh=0.1, det_east_nms_thresh=0.2, det_sast_score_thresh=0.5, det_sast_nms_thresh=0.2, det_pse_thresh=0, det_pse_box_thresh=0.85, det_pse_min_area=16, det_pse_scale=1, scales=[8, 16, 32], alpha=1.0, beta=1.0, fourier_degree=5, rec_algorithm='SVTR_LCNet', rec_model_dir='/root/.paddleocr/whl/rec/ch/ch_PP-OCRv4_rec_infer', rec_image_inverse=True, rec_image_shape='3, 48, 320', rec_batch_num=6, max_text_length=25, rec_char_dict_path='/usr/local/lib/python3.11/site-packages/paddleocr/ppocr/utils/ppocr_keys_v1.txt', use_space_char=True, vis_font_path='./doc/fonts/simfang.ttf', drop_score=0.5, e2e_algorithm='PGNet', e2e_model_dir=None, e2e_limit_side_len=768, e2e_limit_type='max', e2e_pgnet_score_thresh=0.5, e2e_char_dict_path='./ppocr/utils/ic15_dict.txt', e2e_pgnet_valid_set='totaltext', e2e_pgnet_mode='fast', use_angle_cls=True, cls_model_dir='/root/.paddleocr/whl/cls/ch_ppocr_mobile_v2.0_cls_infer', cls_image_shape='3, 48, 192', label_list=['0', '180'], cls_batch_num=6, cls_thresh=0.9, enable_mkldnn=False, cpu_threads=10, use_pdserving=False, warmup=False, sr_model_dir=None, sr_image_shape='3, 32, 128', sr_batch_num=1, draw_img_save_dir='./inference_results', save_crop_res=False, crop_res_save_dir='./output', use_mp=False, total_process_num=1, process_id=0, benchmark=False, save_log_path='./log_output/', show_log=True, use_onnx=False, return_word_box=False, output='./output', table_max_len=488, table_algorithm='TableAttn', table_model_dir=None, merge_no_span_structure=True, table_char_dict_path=None, formula_algorithm='LaTeXOCR', formula_model_dir=None, formula_char_dict_path=None, formula_batch_num=1, layout_model_dir=None, layout_dict_path=None, layout_score_threshold=0.5, layout_nms_threshold=0.5, kie_algorithm='LayoutXLM', ser_model_dir=None, re_model_dir=None, use_visual_backbone=True, ser_dict_path='../train_data/XFUND/class_list_xfun.txt', ocr_order_method=None, mode='structure', image_orientation=False, layout=True, table=True, formula=False, ocr=True, recovery=False, recovery_to_markdown=False, use_pdf2docx_api=False, invert=False, binarize=False, alphacolor=(255, 255, 255), lang='ch', det=True, rec=True, type='ocr', savefile=False, ocr_version='PP-OCRv4', structure_version='PP-StructureV2')
+api-1  | Traceback (most recent call last):
+api-1  |   File "/usr/local/bin/uvicorn", line 8, in <module>
+api-1  | 
+api-1  | -----
+api-1  | 
+api-1  | WeasyPrint could not import some external libraries. Please carefully follow the installation steps before reporting an issue:
+api-1  | https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation
+api-1  | https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#troubleshooting 
+api-1  | 
+api-1  | -----
+api-1  | 
+api-1  |     sys.exit(main())
+api-1  |              ^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/click/core.py", line 1569, in __call__
+api-1  |     return self.main(*args, **kwargs)
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/click/core.py", line 1490, in main
+api-1  |     rv = self.invoke(ctx)
+api-1  |          ^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/click/core.py", line 1353, in invoke
+api-1  |     return ctx.invoke(self.callback, **ctx.params)
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/click/core.py", line 907, in invoke
+api-1  |     return callback(*args, **kwargs)
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/main.py", line 410, in main
+api-1  |     run(
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/main.py", line 577, in run
+api-1  |     server.run()
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/server.py", line 65, in run
+api-1  |     return asyncio.run(self.serve(sockets=sockets))
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/asyncio/runners.py", line 190, in run
+api-1  |     return runner.run(main)
+api-1  |            ^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/asyncio/runners.py", line 118, in run
+api-1  |     return self._loop.run_until_complete(task)
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/server.py", line 69, in serve
+api-1  |     await self._serve(sockets)
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/server.py", line 76, in _serve
+api-1  |     config.load()
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/config.py", line 434, in load
+api-1  |     self.loaded_app = import_from_string(self.app)
+api-1  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/importer.py", line 19, in import_from_string
+api-1  |     module = importlib.import_module(module_str)
+api-1  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/importlib/__init__.py", line 126, in import_module
+api-1  |     return _bootstrap._gcd_import(name[level:], package, level)
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "<frozen importlib._bootstrap>", line 1204, in _gcd_import
+api-1  |   File "<frozen importlib._bootstrap>", line 1176, in _find_and_load
+api-1  |   File "<frozen importlib._bootstrap>", line 1147, in _find_and_load_unlocked
+api-1  |   File "<frozen importlib._bootstrap>", line 690, in _load_unlocked
+api-1  |   File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+api-1  |   File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+api-1  |   File "/app/app/main.py", line 3, in <module>
+api-1  |     from app.api.router import api_router
+api-1  |   File "/app/app/api/router.py", line 5, in <module>
+api-1  |     from app.api.sheets import router as sheets_router
+api-1  |   File "/app/app/api/sheets.py", line 13, in <module>
+api-1  |     from app.services.pdf import generate_sheet_pdf
+api-1  |   File "/app/app/services/pdf.py", line 3, in <module>
+api-1  |     from weasyprint import HTML
+api-1  |   File "/usr/local/lib/python3.11/site-packages/weasyprint/__init__.py", line 419, in <module>
+api-1  |     from .css import preprocess_stylesheet  # noqa: I001, E402
+api-1  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/weasyprint/css/__init__.py", line 28, in <module>
+api-1  |     from .computed_values import COMPUTER_FUNCTIONS
+api-1  |   File "/usr/local/lib/python3.11/site-packages/weasyprint/css/computed_values.py", line 9, in <module>
+api-1  |     from ..text.ffi import ffi, pango, units_to_double
+api-1  |   File "/usr/local/lib/python3.11/site-packages/weasyprint/text/ffi.py", line 434, in <module>
+api-1  |     pango = _dlopen(
+api-1  |             ^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/weasyprint/text/ffi.py", line 420, in _dlopen
+api-1  |     return ffi.dlopen(names[0])  # pragma: no cover
+api-1  |            ^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/cffi/api.py", line 143, in dlopen
+api-1  |     lib, function_cache = _make_ffi_library(self, name, flags)
+api-1  |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/cffi/api.py", line 827, in _make_ffi_library
+api-1  |     backendlib = _load_backend_lib(backend, libname, flags)
+api-1  |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/cffi/api.py", line 822, in _load_backend_lib
+api-1  |     raise OSError(msg)
+api-1  | OSError: cannot load library 'pango-1.0-0': pango-1.0-0: cannot open shared object file: No such file or directory.  Additionally, ctypes.util.find_library() did not manage to locate a library called 'pango-1.0-0'
+api-1  | /usr/local/lib/python3.11/site-packages/paddle/utils/cpp_extension/extension_utils.py:711: UserWarning: No ccache found. Please be aware that recompiling all source files may be required. You can download and install ccache from: https://github.com/ccache/ccache/blob/master/doc/INSTALL.md
+api-1  |   warnings.warn(warning_message)
+api-1  | [2026/07/19 01:03:00] ppocr DEBUG: Namespace(help='==SUPPRESS==', use_gpu=False, use_xpu=False, use_npu=False, use_mlu=False, ir_optim=True, use_tensorrt=False, min_subgraph_size=15, precision='fp32', gpu_mem=500, gpu_id=0, image_dir=None, page_num=0, det_algorithm='DB', det_model_dir='/root/.paddleocr/whl/det/ch/ch_PP-OCRv4_det_infer', det_limit_side_len=960, det_limit_type='max', det_box_type='quad', det_db_thresh=0.3, det_db_box_thresh=0.6, det_db_unclip_ratio=1.5, max_batch_size=10, use_dilation=False, det_db_score_mode='fast', det_east_score_thresh=0.8, det_east_cover_thresh=0.1, det_east_nms_thresh=0.2, det_sast_score_thresh=0.5, det_sast_nms_thresh=0.2, det_pse_thresh=0, det_pse_box_thresh=0.85, det_pse_min_area=16, det_pse_scale=1, scales=[8, 16, 32], alpha=1.0, beta=1.0, fourier_degree=5, rec_algorithm='SVTR_LCNet', rec_model_dir='/root/.paddleocr/whl/rec/ch/ch_PP-OCRv4_rec_infer', rec_image_inverse=True, rec_image_shape='3, 48, 320', rec_batch_num=6, max_text_length=25, rec_char_dict_path='/usr/local/lib/python3.11/site-packages/paddleocr/ppocr/utils/ppocr_keys_v1.txt', use_space_char=True, vis_font_path='./doc/fonts/simfang.ttf', drop_score=0.5, e2e_algorithm='PGNet', e2e_model_dir=None, e2e_limit_side_len=768, e2e_limit_type='max', e2e_pgnet_score_thresh=0.5, e2e_char_dict_path='./ppocr/utils/ic15_dict.txt', e2e_pgnet_valid_set='totaltext', e2e_pgnet_mode='fast', use_angle_cls=True, cls_model_dir='/root/.paddleocr/whl/cls/ch_ppocr_mobile_v2.0_cls_infer', cls_image_shape='3, 48, 192', label_list=['0', '180'], cls_batch_num=6, cls_thresh=0.9, enable_mkldnn=False, cpu_threads=10, use_pdserving=False, warmup=False, sr_model_dir=None, sr_image_shape='3, 32, 128', sr_batch_num=1, draw_img_save_dir='./inference_results', save_crop_res=False, crop_res_save_dir='./output', use_mp=False, total_process_num=1, process_id=0, benchmark=False, save_log_path='./log_output/', show_log=True, use_onnx=False, return_word_box=False, output='./output', table_max_len=488, table_algorithm='TableAttn', table_model_dir=None, merge_no_span_structure=True, table_char_dict_path=None, formula_algorithm='LaTeXOCR', formula_model_dir=None, formula_char_dict_path=None, formula_batch_num=1, layout_model_dir=None, layout_dict_path=None, layout_score_threshold=0.5, layout_nms_threshold=0.5, kie_algorithm='LayoutXLM', ser_model_dir=None, re_model_dir=None, use_visual_backbone=True, ser_dict_path='../train_data/XFUND/class_list_xfun.txt', ocr_order_method=None, mode='structure', image_orientation=False, layout=True, table=True, formula=False, ocr=True, recovery=False, recovery_to_markdown=False, use_pdf2docx_api=False, invert=False, binarize=False, alphacolor=(255, 255, 255), lang='ch', det=True, rec=True, type='ocr', savefile=False, ocr_version='PP-OCRv4', structure_version='PP-StructureV2')
+api-1  | Traceback (most recent call last):
+api-1  |   File "/usr/local/bin/uvicorn", line 8, in <module>
+api-1  |     sys.exit(main())
+api-1  |              ^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/click/core.py", line 1569, in __call__
+api-1  | 
+api-1  | -----
+api-1  | 
+api-1  | WeasyPrint could not import some external libraries. Please carefully follow the installation steps before reporting an issue:
+api-1  | https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation
+api-1  | https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#troubleshooting 
+api-1  | 
+api-1  | -----
+api-1  | 
+api-1  |     return self.main(*args, **kwargs)
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/click/core.py", line 1490, in main
+api-1  |     rv = self.invoke(ctx)
+api-1  |          ^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/click/core.py", line 1353, in invoke
+api-1  |     return ctx.invoke(self.callback, **ctx.params)
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/click/core.py", line 907, in invoke
+api-1  |     return callback(*args, **kwargs)
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/main.py", line 410, in main
+api-1  |     run(
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/main.py", line 577, in run
+api-1  |     server.run()
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/server.py", line 65, in run
+api-1  |     return asyncio.run(self.serve(sockets=sockets))
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/asyncio/runners.py", line 190, in run
+api-1  |     return runner.run(main)
+api-1  |            ^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/asyncio/runners.py", line 118, in run
+api-1  |     return self._loop.run_until_complete(task)
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/server.py", line 69, in serve
+api-1  |     await self._serve(sockets)
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/server.py", line 76, in _serve
+api-1  |     config.load()
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/config.py", line 434, in load
+api-1  |     self.loaded_app = import_from_string(self.app)
+api-1  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/uvicorn/importer.py", line 19, in import_from_string
+api-1  |     module = importlib.import_module(module_str)
+api-1  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/importlib/__init__.py", line 126, in import_module
+api-1  |     return _bootstrap._gcd_import(name[level:], package, level)
+api-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "<frozen importlib._bootstrap>", line 1204, in _gcd_import
+api-1  |   File "<frozen importlib._bootstrap>", line 1176, in _find_and_load
+api-1  |   File "<frozen importlib._bootstrap>", line 1147, in _find_and_load_unlocked
+api-1  |   File "<frozen importlib._bootstrap>", line 690, in _load_unlocked
+api-1  |   File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+api-1  |   File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+api-1  |   File "/app/app/main.py", line 3, in <module>
+api-1  |     from app.api.router import api_router
+api-1  |   File "/app/app/api/router.py", line 5, in <module>
+api-1  |     from app.api.sheets import router as sheets_router
+api-1  |   File "/app/app/api/sheets.py", line 13, in <module>
+api-1  |     from app.services.pdf import generate_sheet_pdf
+api-1  |   File "/app/app/services/pdf.py", line 3, in <module>
+api-1  |     from weasyprint import HTML
+api-1  |   File "/usr/local/lib/python3.11/site-packages/weasyprint/__init__.py", line 419, in <module>
+api-1  |     from .css import preprocess_stylesheet  # noqa: I001, E402
+api-1  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/weasyprint/css/__init__.py", line 28, in <module>
+api-1  |     from .computed_values import COMPUTER_FUNCTIONS
+api-1  |   File "/usr/local/lib/python3.11/site-packages/weasyprint/css/computed_values.py", line 9, in <module>
+api-1  |     from ..text.ffi import ffi, pango, units_to_double
+api-1  |   File "/usr/local/lib/python3.11/site-packages/weasyprint/text/ffi.py", line 434, in <module>
+api-1  |     pango = _dlopen(
+api-1  |             ^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/weasyprint/text/ffi.py", line 420, in _dlopen
+api-1  |     return ffi.dlopen(names[0])  # pragma: no cover
+api-1  |            ^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/cffi/api.py", line 143, in dlopen
+api-1  |     lib, function_cache = _make_ffi_library(self, name, flags)
+api-1  |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/cffi/api.py", line 827, in _make_ffi_library
+api-1  |     backendlib = _load_backend_lib(backend, libname, flags)
+api-1  |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+api-1  |   File "/usr/local/lib/python3.11/site-packages/cffi/api.py", line 822, in _load_backend_lib
+api-1  |     raise OSError(msg)
+api-1  | OSError: cannot load library 'pango-1.0-0': pango-1.0-0: cannot open shared object file: No such file or directory.  Additionally, ctypes.util.find_library() did not manage to locate a library called 'pango-1.0-0'
+ubuntu@VM-0-15-ubuntu:~/review_error_notes/review_error_notes_backend$ sudo docker-compose logs worker
+WARN[0000] /home/ubuntu/review_error_notes/review_error_notes_backend/docker-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion 
+worker-1  | /usr/local/lib/python3.11/site-packages/celery/platforms.py:829: SecurityWarning: You're running the worker with superuser privileges: this is
+worker-1  | absolutely not recommended!
+worker-1  | 
+worker-1  | Please specify a different user using the --uid option.
+worker-1  | 
+worker-1  | User information: uid=0 euid=0 gid=0 egid=0
+worker-1  | 
+worker-1  |   warnings.warn(SecurityWarning(ROOT_DISCOURAGED.format(
+worker-1  |  
+worker-1  |  -------------- celery@d1d146143d05 v5.4.0 (opalescent)
+worker-1  | --- ***** ----- 
+worker-1  | -- ******* ---- Linux-6.8.0-124-generic-x86_64-with-glibc2.41 2026-07-18 14:10:07
+worker-1  | - *** --- * --- 
+worker-1  | - ** ---------- [config]
+worker-1  | - ** ---------- .> app:         wrong_book:0x7a67976b5ed0
+worker-1  | - ** ---------- .> transport:   redis://redis:6379/0
+worker-1  | - ** ---------- .> results:     redis://redis:6379/0
+worker-1  | - *** --- * --- .> concurrency: 4 (prefork)
+worker-1  | -- ******* ---- .> task events: OFF (enable -E to monitor tasks in this worker)
+worker-1  | --- ***** ----- 
+worker-1  |  -------------- [queues]
+worker-1  |                 .> celery           exchange=celery(direct) key=celery
+worker-1  |                 
+worker-1  | 
+worker-1  | [tasks]
+worker-1  | 
+worker-1  | 
+worker-1  | [2026-07-18 14:10:08,156: WARNING/MainProcess] /usr/local/lib/python3.11/site-packages/celery/worker/consumer/consumer.py:508: CPendingDeprecationWarning: The broker_connection_retry configuration setting will no longer determine
+worker-1  | whether broker connection retries are made during startup in Celery 6.0 and above.
+worker-1  | If you wish to retain the existing behavior for retrying connections on startup,
+worker-1  | you should set broker_connection_retry_on_startup to True.
+worker-1  |   warnings.warn(
+worker-1  | 
+worker-1  | [2026-07-18 14:10:08,176: INFO/MainProcess] Connected to redis://redis:6379/0
+worker-1  | [2026-07-18 14:10:08,177: WARNING/MainProcess] /usr/local/lib/python3.11/site-packages/celery/worker/consumer/consumer.py:508: CPendingDeprecationWarning: The broker_connection_retry configuration setting will no longer determine
+worker-1  | whether broker connection retries are made during startup in Celery 6.0 and above.
+worker-1  | If you wish to retain the existing behavior for retrying connections on startup,
+worker-1  | you should set broker_connection_retry_on_startup to True.
+worker-1  |   warnings.warn(
+worker-1  | 
+worker-1  | [2026-07-18 14:10:08,180: INFO/MainProcess] mingle: searching for neighbors
+worker-1  | [2026-07-18 14:10:09,193: INFO/MainProcess] mingle: all alone
+worker-1  | [2026-07-18 14:10:09,210: INFO/MainProcess] celery@d1d146143d05 ready.
+ubuntu@VM-0-15-ubuntu:~/review_error_notes/review_error_notes_backend$ 
+ubuntu@VM-0-15-ubuntu:~/review_error_notes/review_error_notes_backend$ 
