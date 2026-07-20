@@ -30,6 +30,7 @@ services:
       - ./alembic.ini:/app/alembic.ini
       - ./alembic:/app/alembic
       - ./templates:/app/templates
+      - ./tests:/app/tests
       - uploads:/app/uploads
       - pdfs:/app/pdfs
 
