@@ -90,28 +90,37 @@ def _extract_output(raw: str) -> str:
 
 
 async def _call_llm(prompt: str) -> str:
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            f"{settings.LLM_API_BASE}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.LLM_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.LLM_MODEL,
-                "messages": [
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.3,
-                "max_tokens": 8192,
-            },
-        )
-        data = resp.json()
-        if resp.status_code != 200:
-            raise RuntimeError(f"LLM API error {resp.status_code}: {data}")
-        msg = data["choices"][0]["message"]
-        raw = msg.get("content") or msg.get("reasoning_content", "")
-        return _extract_output(raw)
+    import asyncio
+    last_err = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    f"{settings.LLM_API_BASE}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.LLM_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": settings.LLM_MODEL,
+                        "messages": [
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.3,
+                        "max_tokens": 8192,
+                    },
+                )
+                data = resp.json()
+                if resp.status_code != 200:
+                    raise RuntimeError(f"LLM API error {resp.status_code}: {data}")
+                msg = data["choices"][0]["message"]
+                raw = msg.get("content") or msg.get("reasoning_content", "")
+                return _extract_output(raw)
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                await asyncio.sleep(1.0 * (attempt + 1))
+    raise last_err
 
 
 def _parse_json(raw: str) -> dict:
