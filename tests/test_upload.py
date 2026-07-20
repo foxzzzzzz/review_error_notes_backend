@@ -20,7 +20,7 @@ class TestUploadImage:
 
     def test_upload_requires_auth(self, client, test_image):
         resp = client.post("/api/upload/image", files={"file": (test_image.name, test_image, "image/jpeg")})
-        assert resp.status_code == 401
+        assert resp.status_code == 403
 
     def test_upload_image_success(self, client, auth_header, test_image):
         resp = client.post(

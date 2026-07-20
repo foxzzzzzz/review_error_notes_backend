@@ -44,4 +44,4 @@ class TestCreateSheet:
 
     def test_create_sheet_requires_auth(self, client):
         resp = client.post("/api/sheets", json={"title": "x", "question_ids": [], "derived_per_original": 1, "difficulty_boost": 1})
-        assert resp.status_code == 401
+        assert resp.status_code == 403

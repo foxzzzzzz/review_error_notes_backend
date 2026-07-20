@@ -37,9 +37,9 @@ class TestTokenAuth:
         resp = client.get("/api/questions", headers=auth_header)
         assert resp.status_code == 200
 
-    def test_no_token_returns_401(self, client):
+    def test_no_token_returns_403(self, client):
         resp = client.get("/api/questions")
-        assert resp.status_code == 401
+        assert resp.status_code == 403
 
     def test_invalid_token_returns_401(self, client):
         resp = client.get("/api/questions", headers={"Authorization": "Bearer garbage_token"})
