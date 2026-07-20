@@ -1,30 +1,29 @@
 import httpx, json, re
 from app.config import settings
 
-ANALYSIS_PROMPT = """分析以下{subject_hint}题目，将结构化结果放在 <output>...</output> 标签中。
+ANALYSIS_PROMPT = """分析以下{subject_hint}题目，将结构化结果放在 <output> 标签中，标签内必须是合法JSON。
 
-要求输出严格的JSON格式：
-{{
-  "subject": "math" | "chinese" | "english",
-  "question_type": "calculation" | "word_problem" | "fill_blank" | "choice" | "reading",
-  "problem_schema": {{...}},
-  "difficulty_params": {{...}},
-  "tags": ["...", "..."],
-  "difficulty": 1-5
-}}
-
-题目: {question_text}
-
-严格按照以下格式输出，不要有任何额外内容在 <output> 标签之外：
+JSON格式（参考示例，用实际分析结果替换）：
 <output>
-{{"subject": "...", "question_type": "...", "problem_schema": {{}}, "difficulty_params": {{}}, "tags": [], "difficulty": 3}}
-</output>"""
+{{"subject": "math", "question_type": "word_problem", "problem_schema": {{"operation": "subtraction", "operands": [12, 3]}}, "difficulty_params": {{"num_range": [1, 30], "steps": 1}}, "tags": ["减法", "应用题"], "difficulty": 2}}
+</output>
 
-DERIVATIVE_PROMPT = """基于以下题目，生成一道难度提升的衍生题。
+题目: {question_text}"""
 
+ANALYSIS_FALLBACK = {
+    "subject": None,
+    "question_type": None,
+    "problem_schema": {},
+    "difficulty_params": {},
+    "tags": [],
+    "difficulty": 3,
+}
+
+DERIVATIVE_PROMPT = """基于以下题目，生成一道难度提升的衍生题，只把衍生题文本放在 <output> 标签内。
+
+原题: {question_text}
 原题结构: {problem_schema}
-当前难度: {difficulty}
-目标难度: {target_difficulty}
+当前难度: {difficulty} / 目标难度: {target_difficulty}
 科目: {subject}
 
 要求：
@@ -32,12 +31,13 @@ DERIVATIVE_PROMPT = """基于以下题目，生成一道难度提升的衍生题
 - 语文：同知识点，替换字词或调整语境
 - 英语：替换词汇、变化时态
 
-严格按照以下格式输出，衍生题放在 <output> 标签内：
+输出格式示例：
 <output>
-[衍生题文本]
+小明有48颗糖，第一天吃了15颗，第二天吃了9颗，还剩几颗？
 </output>"""
 
 OUTPUT_RE = re.compile(r"<output>\s*(.*?)\s*</output>", re.DOTALL)
+MARKDOWN_JSON_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
 
 
 async def analyze_question(question_text: str, subject_hint: str = "") -> dict:
@@ -46,8 +46,11 @@ async def analyze_question(question_text: str, subject_hint: str = "") -> dict:
         subject_hint=subject_hint or "自动判断",
         question_text=question_text,
     )
-    result = await _call_llm(prompt)
-    return _parse_json(result)
+    try:
+        result = await _call_llm(prompt)
+        return _parse_json(result)
+    except Exception:
+        return {**ANALYSIS_FALLBACK}
 
 
 async def generate_derivative(
@@ -59,18 +62,31 @@ async def generate_derivative(
 ) -> str:
     """调用 LLM 生成衍生题"""
     prompt = DERIVATIVE_PROMPT.format(
+        question_text=question_text,
         problem_schema=json.dumps(problem_schema, ensure_ascii=False),
         difficulty=difficulty,
         target_difficulty=target_difficulty,
         subject=subject,
     )
-    return await _call_llm(prompt)
+    try:
+        result = await _call_llm(prompt)
+        return result if result.strip() else question_text
+    except Exception:
+        return question_text
 
 
 def _extract_output(raw: str) -> str:
-    """Extract content between <output> tags. Falls back to raw text."""
+    """Extract content between <output> tags. Falls back to stripping markdown fences then raw."""
+    if not raw or not raw.strip():
+        return ""
     m = OUTPUT_RE.search(raw)
-    return m.group(1).strip() if m else raw.strip()
+    if m:
+        return m.group(1).strip()
+    # Fallback: try extracting from markdown code block
+    m = MARKDOWN_JSON_RE.search(raw)
+    if m:
+        return m.group(1).strip()
+    return raw.strip()
 
 
 async def _call_llm(prompt: str) -> str:
@@ -93,21 +109,21 @@ async def _call_llm(prompt: str) -> str:
         data = resp.json()
         if resp.status_code != 200:
             raise RuntimeError(f"LLM API error {resp.status_code}: {data}")
-        # Prefer content; fall back to reasoning_content (reasoning models)
         msg = data["choices"][0]["message"]
         raw = msg.get("content") or msg.get("reasoning_content", "")
         return _extract_output(raw)
 
 
 def _parse_json(raw: str) -> dict:
-    # Strip markdown fences if present
+    if not raw or not raw.strip():
+        raise ValueError("Empty LLM response")
     raw = raw.strip()
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        # Remove first and last fence lines
-        if lines[-1].strip() == "```":
-            lines = lines[1:-1]
-        else:
-            lines = lines[1:]
-        raw = "\n".join(lines)
+    # Strip markdown fences
+    fences = ["```json", "```"]
+    for f in fences:
+        if raw.startswith(f):
+            raw = raw[len(f):].strip()
+            break
+    if raw.endswith("```"):
+        raw = raw[:-3].strip()
     return json.loads(raw)
