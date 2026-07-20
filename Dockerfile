@@ -5,8 +5,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev shared-mime-info \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+
+# Heavy deps (rarely change — cached layer, ~60min saved on rebuild)
+COPY requirements-heavy.txt .
+RUN pip install --no-cache-dir -r requirements-heavy.txt
+
+# Light deps (frequently change — fast rebuild)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
 COPY app/ ./app/
 COPY alembic.ini .
 COPY alembic/ ./alembic/
