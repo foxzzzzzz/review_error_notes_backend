@@ -9,6 +9,8 @@ class QuestionOut(BaseModel):
     grade: int
     semester: int
     ocr_text: Optional[str]
+    crop_region: Optional[dict] = None
+    image_url: Optional[str] = None
     question_type: Optional[str]
     tags: list[str]
     difficulty: Optional[int]

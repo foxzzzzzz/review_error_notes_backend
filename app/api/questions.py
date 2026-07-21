@@ -4,6 +4,7 @@ from sqlalchemy import select
 from app.database import get_db
 from app.api.deps import get_current_student
 from app.models.wrong_question import WrongQuestion
+from app.models.wrong_image import WrongImage
 from app.schemas.question import QuestionOut, QuestionUpdate
 
 router = APIRouter(prefix="/questions", tags=["questions"])
@@ -39,15 +40,23 @@ async def list_questions(
 @router.get("/{question_id}", response_model=QuestionOut)
 async def get_question(question_id: str, student_id=Depends(get_current_student), db=Depends(get_db)):
     result = await db.execute(
-        select(WrongQuestion).where(
+        select(WrongQuestion, WrongImage)
+        .join(WrongImage, WrongImage.id == WrongQuestion.image_id)
+        .where(
             WrongQuestion.id == question_id,
             WrongQuestion.student_id == student_id,
         )
     )
-    q = result.scalar_one_or_none()
-    if not q:
+    row = result.one_or_none()
+    if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
-    return q
+    q, image = row
+    data = QuestionOut.model_validate(q).model_dump()
+    data.update({
+        "crop_region": q.crop_region,
+        "image_url": image.original_url,
+    })
+    return data
 
 
 @router.patch("/{question_id}")
