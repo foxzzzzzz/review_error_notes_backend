@@ -21,10 +21,10 @@ async def main():
                "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"]:
         if os.path.exists(fp): font = ImageFont.truetype(fp, 20); print(f"  Font: {fp}"); break
     if font is None: font = ImageFont.load_default()
-    img = Image.new('RGB', (600, 200), 'white')
+    img = Image.new('RGB', (600, 300), 'white')
     d = ImageDraw.Draw(img)
     for i, text in enumerate(['1. 12 - 3 = ?', '2. 8 + 7 = ?', '3. 25 - 9 = ?', '4. 15 + 6 = ?']):
-        d.text((20, 30 + i*30), text, fill='black', font=font)
+        d.text((20, 10 + i*70), text, fill='black', font=font)
     os.makedirs('/app/uploads', exist_ok=True)
     img.save('/app/uploads/test_page.jpg')
     print("  ✅ Created")
