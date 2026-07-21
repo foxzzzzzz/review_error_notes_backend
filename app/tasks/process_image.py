@@ -8,8 +8,12 @@ from app.services.segmenter import segment_questions
 from app.config import settings
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
+# Import all models so sync engine metadata has full FK graph
 from app.models.wrong_image import WrongImage
 from app.models.wrong_question import WrongQuestion
+from app.models.student import Student
+from app.models.practice_sheet import PracticeSheet
+from app.models.sheet_item import SheetItem
 from sqlalchemy import select
 
 
