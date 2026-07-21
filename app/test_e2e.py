@@ -1,5 +1,5 @@
 """End-to-end test: upload image → OCR → LLM → sheet → PDF. Run: python app/test_e2e.py"""
-import httpx, time, json, uuid
+import httpx, time, json, uuid, os
 
 BASE = "http://localhost:8000"
 TEST_USER = f"e2e_{uuid.uuid4().hex[:8]}"
@@ -24,24 +24,33 @@ auth = {"Authorization": f"Bearer {token}"}
 print(f"  Token: {token[:50]}...")
 
 # ── Step 2: Create test image ──
-step("Step 2: Create test image", lambda: (
-    __import__('PIL.Image', fromlist=['Image']).Image.new('RGB', (600, 200), 'white')
-    .__class__.__init__ or True,
-    print("  Creating image...") or
-    setattr(
-        __import__('PIL.Image', fromlist=['Image']),
-        '_img',
-        None
-    )
-))
-from PIL import Image, ImageDraw
-img = Image.new('RGB', (600, 250), 'white')
+print("\n  Step 2: Create test image")
+from PIL import Image, ImageDraw, ImageFont
+
+# Try to find a CJK-capable font
+font_paths = [
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
+font = None
+for fp in font_paths:
+    if os.path.exists(fp):
+        font = ImageFont.truetype(fp, 20)
+        print(f"  Using font: {fp}")
+        break
+if font is None:
+    font = ImageFont.load_default()
+    print("  Using default font (no CJK)")
+
+img = Image.new('RGB', (600, 200), 'white')
 d = ImageDraw.Draw(img)
-d.text((20, 30), '1. 小明有12个苹果，吃了3个，还剩几个？', fill='black')
-d.text((20, 80), '2. 8 + 7 = ?', fill='black')
-d.text((20, 130), '3. 小红买了15支铅笔，用了7支，', fill='black')
-d.text((20, 155), '   还剩几支？', fill='black')
-d.text((20, 200), '4. 25 - 9 = ?', fill='black')
+d.text((20, 30), '1. 12 - 3 = ?', fill='black', font=font)
+d.text((20, 60), '2. 8 + 7 = ?', fill='black', font=font)
+d.text((20, 90), '3. 25 - 9 = ?', fill='black', font=font)
+d.text((20, 120), '4. 15 + 6 - 4 = ?', fill='black', font=font)
+os.makedirs('/app/uploads', exist_ok=True)
 img.save('/app/uploads/test_page.jpg')
 print("  ✅ /app/uploads/test_page.jpg")
 
