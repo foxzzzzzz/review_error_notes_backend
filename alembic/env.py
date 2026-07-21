@@ -7,6 +7,11 @@ from sqlalchemy import pool
 from alembic import context
 
 from app.models import Base
+import app.models.student
+import app.models.wrong_image
+import app.models.wrong_question
+import app.models.practice_sheet
+import app.models.sheet_item
 
 config = context.config
 if config.config_file_name is not None:
