@@ -69,3 +69,17 @@ def test_wechat_phone_flow_rejects_malformed_upstream_responses(responses):
 
     with pytest.raises(WeChatAPIError):
         asyncio.run(run())
+
+
+def test_wechat_phone_flow_wraps_transport_failures():
+    from app.services.wechat import WeChatAPIError, get_phone_number
+
+    def handler(request):
+        raise httpx.ConnectError("network unavailable", request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await get_phone_number("phone-code", "app-id", "app-secret", client=client)
+
+    with pytest.raises(WeChatAPIError, match="Unable to contact WeChat"):
+        asyncio.run(run())

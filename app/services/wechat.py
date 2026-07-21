@@ -45,6 +45,8 @@ async def get_phone_number(
         if phone_data.get("errcode") not in (None, 0) or not phone_number:
             raise WeChatAPIError("Unable to verify WeChat phone number")
         return phone_number
+    except httpx.HTTPError as exc:
+        raise WeChatAPIError("Unable to contact WeChat") from exc
     finally:
         if owns_client:
             await client.aclose()
