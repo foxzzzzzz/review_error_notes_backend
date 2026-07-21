@@ -8,11 +8,11 @@ WORKDIR /app
 
 # Heavy deps (rarely change — cached layer, ~60min saved on rebuild)
 COPY requirements-heavy.txt .
-RUN pip install --no-cache-dir -r requirements-heavy.txt
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-heavy.txt
 
 # Light deps (frequently change — fast rebuild)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
 COPY app/ ./app/
 COPY alembic.ini .
