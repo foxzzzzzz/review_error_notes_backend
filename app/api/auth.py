@@ -9,6 +9,7 @@ from app.utils.jwt import create_token
 from app.utils.crypto import encrypt_phone
 from app.api.deps import get_current_student
 from app.config import settings
+from app.services.wechat import WeChatAPIError, get_phone_number
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -53,11 +54,18 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
 
 @router.post("/bind-phone")
 async def bind_phone(req: BindPhoneRequest, student_id=Depends(get_current_student), db=Depends(get_db)):
-    # 微信手机号解密在后端完成(实际需调用微信解密接口)
-    # TODO: 接入微信手机号解密API, 此处暂存加密数据
+    try:
+        phone_number = await get_phone_number(
+            req.code,
+            settings.WECHAT_APP_ID,
+            settings.WECHAT_APP_SECRET,
+        )
+    except WeChatAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     result = await db.execute(select(Student).where(Student.id == student_id))
     student = result.scalar_one()
-    student.phone = encrypt_phone(req.encrypted_data)  # 实际为解密后的手机号
+    student.phone = encrypt_phone(phone_number)
     student.phone_bound = True
     await db.commit()
     return {"ok": True}

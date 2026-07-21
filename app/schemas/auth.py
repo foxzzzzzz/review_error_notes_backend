@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
@@ -12,5 +12,4 @@ class LoginResponse(BaseModel):
 
 
 class BindPhoneRequest(BaseModel):
-    encrypted_data: str
-    iv: str
+    code: str = Field(min_length=1)
