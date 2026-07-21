@@ -12,4 +12,5 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="Asia/Shanghai",
     task_track_started=True,
+    imports=["app.tasks.process_image"],
 )
