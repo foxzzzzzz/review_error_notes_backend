@@ -1,5 +1,46 @@
 import re, random
 
+
+async def generate_derivative_variants(
+    question_text: str,
+    problem_schema: dict,
+    difficulty: int,
+    target_difficulty: int,
+    subject: str,
+    count: int,
+    use_llm: bool,
+    llm_generator=None,
+):
+    """Generate the requested variants and record the method used for each."""
+    if llm_generator is None:
+        from app.services.llm import generate_derivative as llm_generator
+
+    variants = []
+    for _ in range(count):
+        if use_llm:
+            try:
+                text = await llm_generator(
+                    question_text=question_text,
+                    problem_schema=problem_schema,
+                    difficulty=difficulty,
+                    target_difficulty=target_difficulty,
+                    subject=subject,
+                )
+                variants.append((text, "llm"))
+                continue
+            except Exception:
+                pass
+
+        text = generate_derivative_rule(
+            question_text,
+            problem_schema,
+            target_difficulty,
+            subject,
+        )
+        variants.append((text, "rule"))
+
+    return variants
+
 def generate_derivative_rule(
     question_text: str,
     problem_schema: dict,

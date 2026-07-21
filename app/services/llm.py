@@ -68,11 +68,8 @@ async def generate_derivative(
         target_difficulty=target_difficulty,
         subject=subject,
     )
-    try:
-        result = await _call_llm(prompt)
-        return result if result.strip() else question_text
-    except Exception:
-        return question_text
+    result = await _call_llm(prompt)
+    return result if result.strip() else question_text
 
 
 def _extract_output(raw: str) -> str:

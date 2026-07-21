@@ -8,8 +8,7 @@ from app.models.practice_sheet import PracticeSheet
 from app.models.sheet_item import SheetItem
 from app.models.student import Student
 from app.schemas.sheet import SheetCreate, SheetOut
-from app.services.llm import generate_derivative
-from app.services.derivative import generate_derivative_rule
+from app.services.derivative import generate_derivative_variants
 from app.services.pdf import generate_sheet_pdf
 from app.config import settings
 
@@ -64,38 +63,26 @@ async def create_sheet(
 
         # 衍生题
         target_diff = min(5, (q.difficulty or 2) + data.difficulty_boost)
-        method = "rule"
-        derived_text = q.ocr_text or ""
-
-        if settings.LLM_API_KEY:
-            try:
-                derived_text = await generate_derivative(
-                    question_text=q.ocr_text or "",
-                    problem_schema=q.problem_schema or {},
-                    difficulty=q.difficulty or 2,
-                    target_difficulty=target_diff,
-                    subject=q.subject or "math",
-                )
-                method = "llm"
-            except Exception:
-                derived_text = generate_derivative_rule(
-                    q.ocr_text or "", q.problem_schema or {}, target_diff, q.subject or "math"
-                )
-        else:
-            derived_text = generate_derivative_rule(
-                q.ocr_text or "", q.problem_schema or {}, target_diff, q.subject or "math"
-            )
-
-        db.add(SheetItem(
-            sheet_id=sheet.id,
-            wrong_question_id=q.id,
-            question_type="derived",
-            derived_from=q.id,
-            question_text=derived_text,
-            sort_order=sort,
-            generation_method=method,
-        ))
-        sort += 1
+        variants = await generate_derivative_variants(
+            question_text=q.ocr_text or "",
+            problem_schema=q.problem_schema or {},
+            difficulty=q.difficulty or 2,
+            target_difficulty=target_diff,
+            subject=q.subject or "math",
+            count=data.derived_per_original,
+            use_llm=bool(settings.LLM_API_KEY),
+        )
+        for derived_text, method in variants:
+            db.add(SheetItem(
+                sheet_id=sheet.id,
+                wrong_question_id=q.id,
+                question_type="derived",
+                derived_from=q.id,
+                question_text=derived_text,
+                sort_order=sort,
+                generation_method=method,
+            ))
+            sort += 1
 
     await db.commit()
     await db.refresh(sheet)

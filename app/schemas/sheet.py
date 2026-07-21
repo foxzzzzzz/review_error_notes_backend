@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
 
@@ -6,8 +6,8 @@ from datetime import datetime
 class SheetCreate(BaseModel):
     title: str = "错题重练"
     question_ids: list[str]
-    derived_per_original: int = 1
-    difficulty_boost: int = 2
+    derived_per_original: int = Field(default=1, ge=1, le=3)
+    difficulty_boost: int = Field(default=2, ge=1, le=3)
 
 
 class SheetItemOut(BaseModel):
