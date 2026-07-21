@@ -1,5 +1,7 @@
 import uuid, os, aiofiles
-from fastapi import APIRouter, UploadFile, File, Depends
+from typing import Literal
+
+from fastapi import APIRouter, UploadFile, File, Form, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.api.deps import get_current_student
@@ -15,6 +17,9 @@ router = APIRouter(prefix="/upload", tags=["upload"])
 @router.post("/image")
 async def upload_image(
     file: UploadFile = File(...),
+    subject: Literal["math", "chinese", "english"] | None = Form(None),
+    grade: int | None = Form(None, ge=1, le=6),
+    semester: int | None = Form(None, ge=1, le=2),
     student_id: str = Depends(get_current_student),
     db: AsyncSession = Depends(get_db),
 ):
@@ -34,8 +39,9 @@ async def upload_image(
     image = WrongImage(
         student_id=student_id,
         original_url=f"/uploads/{filename}",
-        grade=student.grade,
-        semester=student.semester,
+        subject=subject,
+        grade=grade or student.grade,
+        semester=semester or student.semester,
         status="pending",
     )
     db.add(image)
