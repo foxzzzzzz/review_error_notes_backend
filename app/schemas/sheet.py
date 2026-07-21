@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
+from uuid import UUID
 
 
 class SheetCreate(BaseModel):
@@ -20,7 +21,7 @@ class SheetItemOut(BaseModel):
 
 
 class SheetOut(BaseModel):
-    id: str
+    id: UUID
     title: Optional[str]
     config_json: Optional[dict]
     pdf_url: Optional[str]

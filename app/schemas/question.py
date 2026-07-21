@@ -1,10 +1,11 @@
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+from uuid import UUID
 
 class QuestionOut(BaseModel):
-    id: str
-    image_id: str
+    id: UUID
+    image_id: UUID
     subject: Optional[str]
     grade: int
     semester: int
