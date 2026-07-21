@@ -80,6 +80,9 @@ async def main():
             "derived_per_original": 1,
             "difficulty_boost": 2,
         }, headers=auth, timeout=120)
+        if resp.status_code != 200:
+            print(f"  ❌ Sheet API failed: {resp.status_code} {resp.text[:500]}")
+            return
         sheet = resp.json()
         print(f"  Sheet: {sheet.get('id')} pdf={sheet.get('pdf_url', '')}")
         pdf = sheet.get('pdf_url', '')
