@@ -23,6 +23,16 @@ def test_llm_derivative_failure_propagates_to_the_caller(monkeypatch):
         asyncio.run(llm.generate_derivative("1 + 1 =", {}, 1, 2, "math"))
 
 
+def test_empty_llm_derivative_is_treated_as_a_generation_failure(monkeypatch):
+    async def empty(_prompt):
+        return "   "
+
+    monkeypatch.setattr(llm, "_call_llm", empty)
+
+    with pytest.raises(ValueError, match="empty derivative"):
+        asyncio.run(llm.generate_derivative("1 + 1 =", {}, 1, 2, "math"))
+
+
 def test_generate_variants_honors_count_and_records_llm_method():
     calls = []
 

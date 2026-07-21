@@ -69,7 +69,9 @@ async def generate_derivative(
         subject=subject,
     )
     result = await _call_llm(prompt)
-    return result if result.strip() else question_text
+    if not result.strip():
+        raise ValueError("LLM returned an empty derivative")
+    return result
 
 
 def _extract_output(raw: str) -> str:
