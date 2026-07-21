@@ -16,9 +16,11 @@ from sqlalchemy import select
 @celery_app.task(bind=True)
 def process_image(self, image_id: str, filepath: str):
     """OCR → segment → create WrongQuestions → optional LLM analysis."""
-    # Sync engine: strip +asyncpg, use psycopg2
+    # Sync engine: strip +asyncpg, use psycopg2. Bind metadata so FK resolution works.
     sync_url = settings.DATABASE_URL.replace("+asyncpg", "")
     engine = create_engine(sync_url)
+    from app.models import Base
+    Base.metadata.create_all(engine, checkfirst=True)
 
     with Session(engine) as db:
         # Step 1: OCR
@@ -61,6 +63,8 @@ def process_image(self, image_id: str, filepath: str):
         try:
             import asyncio
             engine2 = create_engine(sync_url)
+            from app.models import Base as _Base
+            _Base.metadata.create_all(engine2, checkfirst=True)
             with Session(engine2) as db2:
                 for qid in question_ids:
                     q = db2.scalar(select(WrongQuestion).where(WrongQuestion.id == qid))
