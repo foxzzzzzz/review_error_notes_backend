@@ -1,6 +1,27 @@
 from app.services.vision_recognition import VisionItem
 
 
+def test_worker_registers_complete_foreign_key_model_graph():
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).parents[2] / "app" / "tasks" / "process_image.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported_models = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("app.models.")
+    }
+
+    assert {
+        "app.models.student",
+        "app.models.wrong_image",
+        "app.models.wrong_question",
+        "app.models.practice_sheet",
+        "app.models.sheet_item",
+    } <= imported_models
+
+
 def _item(**overrides):
     data = {
         "raw_text": "qin tin\n蜻蜓",

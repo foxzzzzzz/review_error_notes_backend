@@ -4,6 +4,10 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
+# Register the complete SQLAlchemy foreign-key graph before sync-session flushes.
+from app.models.practice_sheet import PracticeSheet  # noqa: F401
+from app.models.sheet_item import SheetItem  # noqa: F401
+from app.models.student import Student  # noqa: F401
 from app.models.wrong_image import WrongImage
 from app.models.wrong_question import WrongQuestion
 from app.services.vision_recognition import (
