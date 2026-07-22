@@ -207,6 +207,16 @@ cd miniprogram
 
 ## API 接口一览
 
+### 多模态识别坐标格式
+
+MiniMax 每个识别项的 `bbox` 使用归一化角点坐标：
+
+```text
+[left, top, right, bottom]
+```
+
+坐标必须满足 `0 <= left < right <= 1` 和 `0 <= top < bottom <= 1`。后端不转换该数组，写入 `crop_region.bbox` 时同时记录 `bbox_format: "normalized_ltrb"`。现有业务尚未使用该字段裁图；未来消费者必须根据 `bbox_format` 解释坐标。
+
 | Method | Path | 说明 | 鉴权 |
 |--------|------|------|------|
 | GET | `/health` | 健康检查 | ❌ |

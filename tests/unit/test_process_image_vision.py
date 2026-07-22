@@ -33,7 +33,7 @@ def _item(**overrides):
         "difficulty": 2,
         "confidence": 0.92,
         "uncertain_segments": [],
-        "bbox": [0.1, 0.2, 0.3, 0.2],
+        "bbox": [0.1, 0.2, 0.4, 0.4],
     }
     data.update(overrides)
     return VisionItem(**data)
@@ -52,9 +52,26 @@ def test_question_values_preserve_raw_writing_and_normalized_content():
     assert values["ocr_raw_json"]["raw_text"] == values["ocr_text"]
     assert values["ocr_raw_json"]["answer"] == values["ocr_answer"]
     assert values["ocr_raw_json"]["subject"] == "chinese"
-    assert values["ocr_raw_json"]["bbox"] == [0.1, 0.2, 0.3, 0.2]
-    assert values["crop_region"] == {"bbox": [0.1, 0.2, 0.3, 0.2], "index": 0}
+    assert values["ocr_raw_json"]["bbox"] == [0.1, 0.2, 0.4, 0.4]
+    assert values["crop_region"] == {
+        "bbox": [0.1, 0.2, 0.4, 0.4],
+        "bbox_format": "normalized_ltrb",
+        "index": 0,
+    }
     assert values["status"] == "confirmed"
+
+
+def test_question_values_label_minimax_corner_bbox_format():
+    from app.services.vision_recognition import build_question_values
+
+    bbox = [0.0, 0.45, 1.0, 0.88]
+    values = build_question_values(_item(bbox=bbox), index=1, confidence_threshold=0.85)
+
+    assert values["crop_region"] == {
+        "bbox": bbox,
+        "bbox_format": "normalized_ltrb",
+        "index": 1,
+    }
 
 
 def test_low_confidence_item_requires_review():

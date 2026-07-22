@@ -25,7 +25,7 @@ def _valid_payload():
                 "difficulty": 2,
                 "confidence": 0.91,
                 "uncertain_segments": [],
-                "bbox": [0.1, 0.2, 0.3, 0.2],
+                "bbox": [0.1, 0.2, 0.4, 0.4],
             }
         ],
         "ignored_text": ["Date:"],
@@ -41,6 +41,22 @@ def test_prompt_prioritizes_red_error_marks_and_falls_back_to_all_questions():
     assert "没有发现明确的红色错误标记" in RECOGNITION_PROMPT
     assert "输出图片中的所有题目" in RECOGNITION_PROMPT
     assert "红色对勾" in RECOGNITION_PROMPT
+    assert "[left, top, right, bottom]" in RECOGNITION_PROMPT
+
+
+@pytest.mark.parametrize(
+    "bbox",
+    [
+        [0.0, 0.45, 1.0, 0.88],
+        [0.0, 0.85, 1.0, 1.0],
+    ],
+)
+def test_vision_item_accepts_live_minimax_corner_bbox(bbox):
+    from app.services.vision_recognition import VisionItem
+
+    item = VisionItem(**{**_valid_payload()["items"][0], "bbox": bbox})
+
+    assert item.bbox == bbox
 
 
 def test_prepare_image_data_url_normalizes_and_limits_dimensions(tmp_path):
@@ -175,8 +191,8 @@ def test_client_rejects_prose_around_json(tmp_path, content):
         {"items": [{**_valid_payload()["items"][0], "confidence": 1.5}]},
         {"items": [{**_valid_payload()["items"][0], "confidence": "0.9"}]},
         {"items": [{**_valid_payload()["items"][0], "unexpected": "value"}]},
-        {"items": [{**_valid_payload()["items"][0], "bbox": [0.9, 0.2, 0.2, 0.2]}]},
-        {"items": [{**_valid_payload()["items"][0], "bbox": [0.1, 0.2, 0, 0.2]}]},
+        {"items": [{**_valid_payload()["items"][0], "bbox": [0.9, 0.2, 0.2, 0.8]}]},
+        {"items": [{**_valid_payload()["items"][0], "bbox": [0.1, 0.2, 0.1, 0.4]}]},
     ],
 )
 def test_client_rejects_invalid_recognition_contract(tmp_path, payload):
