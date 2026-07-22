@@ -14,10 +14,10 @@ EXPECTED_TABLES = {
 
 
 def test_initial_revision_creates_and_drops_every_model_table():
-    revisions = [path for path in VERSIONS.glob("*.py") if path.name != "__init__.py"]
-    assert len(revisions) == 1
+    initial_revision = VERSIONS / "0001_initial_schema.py"
+    assert initial_revision.exists()
 
-    tree = ast.parse(revisions[0].read_text(encoding="utf-8"))
+    tree = ast.parse(initial_revision.read_text(encoding="utf-8"))
     created = set()
     dropped = set()
     for node in ast.walk(tree):

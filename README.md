@@ -1,6 +1,6 @@
 # 错题本 — Wrong Homework Collection App
 
-面向小学生家长的错题管理应用。拍照录入错题 → OCR 自动识别分类 → 生成 A4 分栏错题集（原题 + 衍生题），可打印练习。
+面向小学生家长的错题管理应用。拍照录入错题 → MiniMax 多模态识别与分类 → 生成 A4 分栏错题集（原题 + 衍生题），可打印练习。
 
 ---
 
@@ -11,7 +11,7 @@
 │   微信小程序（前端）   │ ←──────────────────→ │   Python FastAPI 后端           │
 │                     │                      │                                │
 │  · 拍照录入          │                      │  · 账号体系（微信登录 + JWT）     │
-│  · 错题库管理        │                      │  · OCR 引擎（PaddleOCR）         │
+│  · 错题库管理        │                      │  · MiniMax 多模态图片识别        │
 │  · 错题集生成        │                      │  · LLM 分析 + 衍生题生成         │
 │  · PDF 预览/分享     │                      │  · A4 PDF 渲染（WeasyPrint）    │
 │                     │                      │  · 异步任务（Celery + Redis）    │
@@ -28,8 +28,8 @@
 | 前端 | 微信原生小程序 + WeUI | 4 个 Tab 页面，拍照/管理/出卷/设置 |
 | 后端框架 | Python FastAPI (async) | REST API，自动生成 Swagger 文档 |
 | 数据库 | PostgreSQL 16 | JSONB 字段，GIN 索引，5 张表 |
-| 异步队列 | Celery + Redis | OCR 和 LLM 调用走异步任务 |
-| OCR | PaddleOCR | 开源免费，版面分析 + 题目切分 |
+| 异步队列 | Celery + Redis | 图片识别和 LLM 调用走异步任务 |
+| 图片识别 | MiniMax Token Plan | 手写内容识别、版面分组和结构化输出 |
 | LLM | OpenAI 兼容 API | 题目分析 + 衍生题难度递进 |
 | PDF | WeasyPrint + Jinja2 | A4 HTML 模板渲染 |
 | 部署 | Docker Compose | 4 容器：API / Worker / PostgreSQL / Redis |
@@ -45,7 +45,7 @@ review_error_notes/
 │   │   ├── api/            # 路由：auth, upload, questions, sheets
 │   │   ├── models/         # ORM：Student, WrongImage, WrongQuestion, PracticeSheet, SheetItem
 │   │   ├── schemas/        # Pydantic 请求/响应模型
-│   │   ├── services/       # OCR, Segmenter, LLM, Derivative, PDF
+│   │   ├── services/       # MiniMax Vision, LLM, Derivative, PDF
 │   │   ├── tasks/          # Celery 异步任务定义
 │   │   └── utils/          # JWT, AES 加密
 │   ├── templates/          # Jinja2 PDF 模板
@@ -73,7 +73,7 @@ review_error_notes/
 ### 环境要求
 
 - Docker + Docker Compose
-- 2C4G 云服务器（推荐，PaddleOCR 需要一定内存）
+- 可访问 MiniMax API 的服务器
 
 ### 快速启动
 
@@ -85,6 +85,8 @@ cp .env.example .env
 # 编辑 .env，填入：
 #   LLM_API_KEY=sk-xxx          （OpenAI 兼容 API Key）
 #   LLM_API_BASE=https://api.openai.com/v1
+#   MINIMAX_API_KEY=...         （MiniMax Token Plan Key）
+#   MINIMAX_API_HOST=https://api.minimaxi.com  （国内 Key）
 #   WECHAT_APP_ID=wxXXX         （小程序 AppID，生产环境必填）
 #   WECHAT_APP_SECRET=xxx       （小程序 Secret，生产环境必填）
 
@@ -197,7 +199,7 @@ cd miniprogram
 |------|------|---------|
 | 📷 拍照录入 | 拍照上传错题 | `wx.chooseMedia` 拍照/选图 → 上传后端 → 科目回显 |
 | 📚 错题库 | 浏览管理错题 | 按科目/标签筛选 → 勾选 → 跳转出卷 |
-| 🔍 错题详情 | 修正 OCR 结果 | 编辑文字/调整标签/修改难度/删除 |
+| 🔍 错题详情 | 修正识别结果 | 编辑文字/调整标签/修改难度/删除 |
 | 📝 出卷 | 生成错题集 | 配置衍生题数+难度 → 生成 A4 PDF → 预览/分享 |
 | 👤 我的 | 个人设置 | 年级/册别设定、手机绑定、统计信息 |
 
@@ -250,6 +252,14 @@ student (学生)
 | `LLM_API_KEY` | OpenAI 兼容 API Key | 空=不启用 LLM |
 | `LLM_API_BASE` | LLM API 地址 | `https://api.openai.com/v1` |
 | `LLM_MODEL` | 模型名称 | `gpt-4o-mini` |
+| `MINIMAX_API_KEY` | MiniMax Token Plan Key | - |
+| `MINIMAX_API_HOST` | 与 Key 地区匹配的 API Host | - |
+| `MINIMAX_VISION_TIMEOUT_SECONDS` | 图片理解请求超时秒数 | `60` |
+| `MINIMAX_VISION_MAX_RETRIES` | 瞬时错误最大重试次数 | `2` |
+| `MINIMAX_VISION_RETRY_DELAY_SECONDS` | 重试等待秒数 | `1` |
+| `MINIMAX_CONFIDENCE_THRESHOLD` | 自动确认最低置信度 | `0.85` |
+| `MINIMAX_IMAGE_MAX_EDGE` | 预处理图片最长边像素数 | `2048` |
+| `MINIMAX_IMAGE_JPEG_QUALITY` | 预处理 JPEG 质量 | `90` |
 | `DEV_MODE` | 开发模式（启用 dev-login） | `false` |
 | `WECHAT_APP_ID` | 小程序 AppID | - |
 | `WECHAT_APP_SECRET` | 小程序 Secret | - |

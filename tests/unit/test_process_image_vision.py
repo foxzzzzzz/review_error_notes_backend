@@ -1,0 +1,76 @@
+from app.services.vision_recognition import VisionItem
+
+
+def _item(**overrides):
+    data = {
+        "raw_text": "qin tin\n蜻蜓",
+        "normalized_text": "qīng tíng\n蜻蜓",
+        "answer": "qīng tíng",
+        "subject": "chinese",
+        "question_type": "pinyin",
+        "tags": ["拼音"],
+        "difficulty": 2,
+        "confidence": 0.92,
+        "uncertain_segments": [],
+        "bbox": [0.1, 0.2, 0.3, 0.2],
+    }
+    data.update(overrides)
+    return VisionItem(**data)
+
+
+def test_question_values_preserve_raw_writing_and_normalized_content():
+    from app.services.vision_recognition import build_question_values
+
+    values = build_question_values(_item(), index=0, confidence_threshold=0.85)
+
+    assert values["ocr_text"] == "qin tin\n蜻蜓"
+    assert values["ocr_text"] != values["ocr_raw_json"]["normalized_text"]
+    assert values["ocr_answer"] == "qīng tíng"
+    assert values["ocr_raw_json"]["provider"] == "minimax"
+    assert values["ocr_raw_json"]["confidence"] == 0.92
+    assert values["ocr_raw_json"]["raw_text"] == values["ocr_text"]
+    assert values["ocr_raw_json"]["answer"] == values["ocr_answer"]
+    assert values["ocr_raw_json"]["subject"] == "chinese"
+    assert values["ocr_raw_json"]["bbox"] == [0.1, 0.2, 0.3, 0.2]
+    assert values["crop_region"] == {"bbox": [0.1, 0.2, 0.3, 0.2], "index": 0}
+    assert values["status"] == "confirmed"
+
+
+def test_low_confidence_item_requires_review():
+    from app.services.vision_recognition import build_question_values
+
+    values = build_question_values(_item(confidence=0.7), index=1, confidence_threshold=0.85)
+
+    assert values["status"] == "needs_review"
+
+
+def test_uncertain_segments_require_review_even_with_high_confidence():
+    from app.services.vision_recognition import build_question_values
+
+    values = build_question_values(
+        _item(confidence=0.99, uncertain_segments=["第一个拼音末尾"]),
+        index=0,
+        confidence_threshold=0.85,
+    )
+
+    assert values["status"] == "needs_review"
+
+
+def test_image_status_requires_review_when_any_question_does():
+    from app.services.vision_recognition import image_status_for
+
+    assert image_status_for([{"status": "confirmed"}, {"status": "needs_review"}]) == "needs_review"
+    assert image_status_for([{"status": "confirmed"}]) == "confirmed"
+
+
+def test_task_claims_image_before_remote_call_and_resets_failed_claim():
+    from pathlib import Path
+
+    source = (Path(__file__).parents[2] / "app" / "tasks" / "process_image.py").read_text(encoding="utf-8")
+
+    claim = source.index("with_for_update()")
+    remote_call = source.index(".recognize(")
+    assert claim < remote_call
+    assert 'image.status != "pending"' in source
+    assert 'image.status = "segmented"' in source
+    assert 'claimed_image.status = "pending"' in source

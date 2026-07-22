@@ -12,4 +12,7 @@ class WrongImage(Base, TimestampMixin):
     grade = Column(SmallInteger, nullable=False)
     semester = Column(SmallInteger, nullable=False)
     question_count = Column(Integer, default=0)
-    status = Column(ENUM("pending", "segmented", "confirmed", name="image_status_enum"), default="pending")
+    status = Column(
+        ENUM("pending", "segmented", "needs_review", "confirmed", name="image_status_enum"),
+        default="pending",
+    )

@@ -23,6 +23,6 @@ class WrongQuestion(Base, TimestampMixin):
     difficulty = Column(SmallInteger, nullable=True)
     wrong_count = Column(Integer, default=1)
     status = Column(
-        ENUM("pending", "ocr_done", "confirmed", "mastered", name="question_status_enum"),
+        ENUM("pending", "ocr_done", "needs_review", "confirmed", "mastered", name="question_status_enum"),
         default="pending"
     )

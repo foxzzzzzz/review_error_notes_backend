@@ -75,8 +75,29 @@ async def update_question(
     q = result.scalar_one_or_none()
     if not q:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
+    was_needs_review = q.status == "needs_review"
+    image = None
+    if was_needs_review:
+        image = await db.scalar(
+            select(WrongImage)
+            .where(WrongImage.id == q.image_id)
+            .with_for_update()
+        )
     for k, v in data.model_dump(exclude_unset=True).items():
         setattr(q, k, v)
+    if was_needs_review:
+        q.status = "confirmed"
+        await db.flush()
+        remaining_review = await db.scalar(
+            select(WrongQuestion.id)
+            .where(
+                WrongQuestion.image_id == q.image_id,
+                WrongQuestion.status == "needs_review",
+            )
+            .limit(1)
+        )
+        if not remaining_review and image:
+            image.status = "confirmed"
     await db.commit()
     return {"ok": True}
 
