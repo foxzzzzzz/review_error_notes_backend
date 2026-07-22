@@ -37,11 +37,23 @@ def test_prompt_prioritizes_red_error_marks_and_falls_back_to_all_questions():
 
     assert "红圈" in RECOGNITION_PROMPT
     assert "红叉" in RECOGNITION_PROMPT
-    assert "只输出与这些红色错误标记关联的完整题目" in RECOGNITION_PROMPT
+    assert "每个被标记的独立作答单元输出一个 item" in RECOGNITION_PROMPT
     assert "没有发现明确的红色错误标记" in RECOGNITION_PROMPT
-    assert "输出图片中的所有题目" in RECOGNITION_PROMPT
+    assert "输出图片中的所有最小可独立作答单元" in RECOGNITION_PROMPT
     assert "红色对勾" in RECOGNITION_PROMPT
     assert "[left, top, right, bottom]" in RECOGNITION_PROMPT
+
+
+def test_prompt_splits_marked_worksheet_into_smallest_answerable_units():
+    from app.services.vision_recognition import RECOGNITION_PROMPT
+
+    assert "最小可独立作答单元" in RECOGNITION_PROMPT
+    assert "不能把整道编号大题合并成一个 item" in RECOGNITION_PROMPT
+    assert "必须分别输出多个 item" in RECOGNITION_PROMPT
+    assert "未标记的兄弟小题" in RECOGNITION_PROMPT
+    assert "同一作答单元上的红圈、红叉和纠正笔迹视为同一标记组" in RECOGNITION_PROMPT
+    assert "计算" in RECOGNITION_PROMPT
+    assert "识字、组词、图形、合唱" in RECOGNITION_PROMPT
 
 
 @pytest.mark.parametrize(
