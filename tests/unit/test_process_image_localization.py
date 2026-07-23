@@ -83,12 +83,14 @@ class FakeClient:
             items=[
                 LocalizationItem(
                     index=0,
-                    bbox=[0.2, 0.2, 0.45, 0.5],
+                    matched=True,
+                    bbox=[0.45, 0.23, 0.66, 0.4],
                     confidence=0.94,
                 ),
                 LocalizationItem(
                     index=1,
-                    bbox=[0.5, 0.5, 0.8, 0.8],
+                    matched=True,
+                    bbox=[0.02, 0.63, 0.28, 0.8],
                     confidence=0.91,
                 ),
             ]
@@ -105,6 +107,7 @@ def test_pipeline_recognizes_and_localizes_once_per_image(tmp_path):
         subject_hint="chinese",
         confidence_threshold=0.85,
         localization_threshold=0.85,
+        localization_min_iou=0.1,
         tag_config_path=_write_tag_config(tmp_path),
     )
 
@@ -113,7 +116,7 @@ def test_pipeline_recognizes_and_localizes_once_per_image(tmp_path):
     assert client.localize_calls == 1
     assert values[0]["tags"] == ["拼音", "老师批改"]
     assert values[1]["tags"] == ["词语", "错别字"]
-    assert values[0]["crop_region"]["bbox"] == [0.2, 0.2, 0.45, 0.5]
+    assert values[0]["crop_region"]["bbox"] == [0.45, 0.23, 0.66, 0.4]
 
 
 def test_pipeline_falls_back_without_candidate_bbox_when_localization_fails(tmp_path):
@@ -126,6 +129,7 @@ def test_pipeline_falls_back_without_candidate_bbox_when_localization_fails(tmp_
         subject_hint="chinese",
         confidence_threshold=0.85,
         localization_threshold=0.85,
+        localization_min_iou=0.1,
         tag_config_path=_write_tag_config(tmp_path),
     )
 

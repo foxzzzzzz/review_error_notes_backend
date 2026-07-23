@@ -1,3 +1,5 @@
+import pytest
+
 from app.services.vision_recognition import LocalizationItem, VisionItem
 
 
@@ -46,6 +48,7 @@ def test_question_values_preserve_raw_writing_and_normalized_content():
 
     localization = LocalizationItem(
         index=0,
+        matched=True,
         bbox=[0.05, 0.15, 0.45, 0.5],
         confidence=0.93,
     )
@@ -55,6 +58,7 @@ def test_question_values_preserve_raw_writing_and_normalized_content():
         confidence_threshold=0.85,
         localization=localization,
         localization_threshold=0.85,
+        localization_min_iou=0.1,
         normalized_tags=["拼音", "老师批改"],
     )
 
@@ -86,6 +90,7 @@ def test_low_confidence_localization_discards_candidate_bbox():
 
     localization = LocalizationItem(
         index=1,
+        matched=True,
         bbox=[0.0, 0.45, 1.0, 0.88],
         confidence=0.7,
     )
@@ -95,6 +100,7 @@ def test_low_confidence_localization_discards_candidate_bbox():
         confidence_threshold=0.85,
         localization=localization,
         localization_threshold=0.85,
+        localization_min_iou=0.1,
         normalized_tags=["拼音"],
     )
 
@@ -116,6 +122,7 @@ def test_low_confidence_item_requires_review():
         confidence_threshold=0.85,
         localization=None,
         localization_threshold=0.85,
+        localization_min_iou=0.1,
         normalized_tags=["拼音"],
     )
 
@@ -131,9 +138,90 @@ def test_uncertain_segments_require_review_even_with_high_confidence():
         confidence_threshold=0.85,
         localization=None,
         localization_threshold=0.85,
+        localization_min_iou=0.1,
         normalized_tags=["拼音"],
     )
 
+    assert values["status"] == "needs_review"
+
+
+def test_unmatched_localization_discards_bbox_even_with_high_confidence():
+    from app.services.vision_recognition import build_question_values
+
+    localization = LocalizationItem(
+        index=0,
+        matched=False,
+        bbox=None,
+        confidence=0.99,
+    )
+    values = build_question_values(
+        _item(),
+        index=0,
+        confidence_threshold=0.85,
+        localization=localization,
+        localization_threshold=0.85,
+        localization_min_iou=0.1,
+        normalized_tags=["拼音"],
+    )
+
+    assert "bbox" not in values["crop_region"]
+    assert values["status"] == "needs_review"
+
+
+def test_distant_localization_discards_bbox_even_with_high_confidence():
+    from app.services.vision_recognition import build_question_values
+
+    localization = LocalizationItem(
+        index=0,
+        matched=True,
+        bbox=[0.7, 0.7, 0.9, 0.9],
+        confidence=0.99,
+    )
+    values = build_question_values(
+        _item(),
+        index=0,
+        confidence_threshold=0.85,
+        localization=localization,
+        localization_threshold=0.85,
+        localization_min_iou=0.1,
+        normalized_tags=["拼音"],
+    )
+
+    assert "bbox" not in values["crop_region"]
+    assert values["status"] == "needs_review"
+
+
+@pytest.mark.parametrize(
+    ("recognition_bbox", "localization_bbox"),
+    [
+        ([0.04, 0.7, 0.31, 0.83], [0.144, 0.661, 0.33, 0.762]),
+        ([0.46, 0.32, 0.65, 0.42], [0.337, 0.475, 0.498, 0.62]),
+        ([0.42, 0.22, 0.6, 0.3], [0.359, 0.296, 0.501, 0.396]),
+    ],
+)
+def test_live_mismatched_localizations_fall_back_to_original_image(
+    recognition_bbox,
+    localization_bbox,
+):
+    from app.services.vision_recognition import build_question_values
+
+    localization = LocalizationItem(
+        index=0,
+        matched=True,
+        bbox=localization_bbox,
+        confidence=0.95,
+    )
+    values = build_question_values(
+        _item(bbox=recognition_bbox),
+        index=0,
+        confidence_threshold=0.85,
+        localization=localization,
+        localization_threshold=0.85,
+        localization_min_iou=0.1,
+        normalized_tags=["拼音"],
+    )
+
+    assert "bbox" not in values["crop_region"]
     assert values["status"] == "needs_review"
 
 

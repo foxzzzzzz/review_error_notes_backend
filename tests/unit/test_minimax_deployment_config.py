@@ -15,6 +15,7 @@ def test_worker_receives_every_minimax_setting_without_a_secret_value():
         "MINIMAX_VISION_RETRY_DELAY_SECONDS",
         "MINIMAX_CONFIDENCE_THRESHOLD",
         "MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD",
+        "MINIMAX_LOCALIZATION_MIN_IOU",
         "MINIMAX_IMAGE_MAX_EDGE",
         "MINIMAX_IMAGE_JPEG_QUALITY",
         "TAG_ALIAS_CONFIG_PATH",

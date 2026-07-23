@@ -49,6 +49,8 @@ def test_localization_prompt_defines_the_complete_independent_unit():
     assert "印刷提示、学生答案和相关红色批改标记" in LOCALIZATION_PROMPT
     assert "未标记的相邻兄弟小题" in LOCALIZATION_PROMPT
     assert "每个 index 恰好返回一次" in LOCALIZATION_PROMPT
+    assert "matched=false" in LOCALIZATION_PROMPT
+    assert "第一次识别的候选 bbox" in LOCALIZATION_PROMPT
     assert "tags 只能使用中文标签" in RECOGNITION_PROMPT
 
 
@@ -65,8 +67,18 @@ def test_localize_sends_all_recognized_indexes_in_one_request(tmp_path):
                 "content": json.dumps(
                     {
                         "items": [
-                            {"index": 0, "bbox": [0.1, 0.2, 0.4, 0.5], "confidence": 0.94},
-                            {"index": 1, "bbox": [0.5, 0.2, 0.8, 0.5], "confidence": 0.91},
+                            {
+                                "index": 0,
+                                "matched": True,
+                                "bbox": [0.1, 0.2, 0.4, 0.5],
+                                "confidence": 0.94,
+                            },
+                            {
+                                "index": 1,
+                                "matched": True,
+                                "bbox": [0.5, 0.2, 0.8, 0.5],
+                                "confidence": 0.91,
+                            },
                         ]
                     }
                 ),
@@ -86,21 +98,66 @@ def test_localize_sends_all_recognized_indexes_in_one_request(tmp_path):
     assert body["image_url"].startswith("data:image/jpeg;base64,")
     assert '"index": 0' in body["prompt"]
     assert '"index": 1' in body["prompt"]
+    assert '"recognition_bbox": [' in body["prompt"]
     assert [item.index for item in result.items] == [0, 1]
+
+
+def test_localization_allows_an_explicit_unmatched_result_without_bbox():
+    from app.services.vision_recognition import LocalizationItem
+
+    item = LocalizationItem(
+        index=0,
+        matched=False,
+        bbox=None,
+        confidence=0.96,
+    )
+
+    assert item.matched is False
+    assert item.bbox is None
 
 
 @pytest.mark.parametrize(
     ("items", "item_count"),
     [
-        ([{"index": 0, "bbox": [0.1, 0.2, 0.4, 0.5], "confidence": 0.9}], 2),
         (
             [
-                {"index": 0, "bbox": [0.1, 0.2, 0.4, 0.5], "confidence": 0.9},
-                {"index": 0, "bbox": [0.5, 0.2, 0.8, 0.5], "confidence": 0.9},
+                {
+                    "index": 0,
+                    "matched": True,
+                    "bbox": [0.1, 0.2, 0.4, 0.5],
+                    "confidence": 0.9,
+                }
             ],
             2,
         ),
-        ([{"index": 2, "bbox": [0.1, 0.2, 0.4, 0.5], "confidence": 0.9}], 1),
+        (
+            [
+                {
+                    "index": 0,
+                    "matched": True,
+                    "bbox": [0.1, 0.2, 0.4, 0.5],
+                    "confidence": 0.9,
+                },
+                {
+                    "index": 0,
+                    "matched": True,
+                    "bbox": [0.5, 0.2, 0.8, 0.5],
+                    "confidence": 0.9,
+                },
+            ],
+            2,
+        ),
+        (
+            [
+                {
+                    "index": 2,
+                    "matched": True,
+                    "bbox": [0.1, 0.2, 0.4, 0.5],
+                    "confidence": 0.9,
+                }
+            ],
+            1,
+        ),
     ],
 )
 def test_rejects_missing_duplicate_and_out_of_range_indexes(items, item_count):

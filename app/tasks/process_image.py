@@ -48,6 +48,7 @@ def process_image(self, image_id: str, filepath: str):
             subject_hint=subject_hint,
             confidence_threshold=settings.MINIMAX_CONFIDENCE_THRESHOLD,
             localization_threshold=settings.MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD,
+            localization_min_iou=settings.MINIMAX_LOCALIZATION_MIN_IOU,
             tag_config_path=settings.TAG_ALIAS_CONFIG_PATH,
         )
 

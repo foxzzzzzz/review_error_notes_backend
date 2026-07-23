@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     MINIMAX_VISION_RETRY_DELAY_SECONDS: float = 1
     MINIMAX_CONFIDENCE_THRESHOLD: float = 0.85
     MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0, le=1)
+    MINIMAX_LOCALIZATION_MIN_IOU: float = Field(default=0.1, ge=0, le=1)
     MINIMAX_IMAGE_MAX_EDGE: int = 2048
     MINIMAX_IMAGE_JPEG_QUALITY: int = 90
     TAG_ALIAS_CONFIG_PATH: str = "./config/tag-aliases.json"

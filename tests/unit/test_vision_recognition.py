@@ -55,19 +55,23 @@ def test_prompt_splits_marked_worksheet_into_smallest_answerable_units():
     assert "必须分别输出多个 item" in RECOGNITION_PROMPT
     assert "未标记的兄弟小题" in RECOGNITION_PROMPT
     assert "同一作答单元上的红圈、红叉和纠正笔迹视为同一标记组" in RECOGNITION_PROMPT
-    assert "计算" in RECOGNITION_PROMPT
-    assert "识字、组词、图形、合唱" in RECOGNITION_PROMPT
+    assert "同一行存在多个兄弟小题" in RECOGNITION_PROMPT
 
 
-def test_prompt_expands_marked_fragment_to_complete_word_group():
+def test_prompt_describes_complete_word_group_without_literal_answer_examples():
     from app.services.vision_recognition import RECOGNITION_PROMPT
 
     assert "完整词语格组" in RECOGNITION_PROMPT
     assert "完整词语优先于红色标记的像素覆盖范围" in RECOGNITION_PROMPT
-    assert "prompt_text=课文" in RECOGNITION_PROMPT
-    assert "raw_text=合做" in RECOGNITION_PROMPT
-    assert "answer=合作" in RECOGNITION_PROMPT
-    assert "不得只输出 kè、suàn 或 做" in RECOGNITION_PROMPT
+    assert "各字段必须保持同一范围" in RECOGNITION_PROMPT
+    for leaked_example in (
+        "prompt_text=课文",
+        "raw_text=合做",
+        "answer=合作",
+        "不得只输出 kè、suàn 或 做",
+        "例如“计算”或“hé zuò”",
+    ):
+        assert leaked_example not in RECOGNITION_PROMPT
 
 
 def test_prompt_separates_student_answer_from_printable_prompt():
