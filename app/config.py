@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     MINIMAX_CONFIDENCE_THRESHOLD: float = 0.85
     MINIMAX_IMAGE_MAX_EDGE: int = 2048
     MINIMAX_IMAGE_JPEG_QUALITY: int = 90
+    QUESTION_IMAGE_MAX_PIXELS: int = 40_000_000
     UPLOAD_DIR: str = "./uploads"
     PDF_DIR: str = "./pdfs"
     WECHAT_APP_ID: str = ""

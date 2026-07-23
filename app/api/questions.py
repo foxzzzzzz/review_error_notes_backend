@@ -1,11 +1,20 @@
-from fastapi import APIRouter, Depends, Query, HTTPException, status
+from pathlib import Path
+from typing import Literal
+
+from fastapi import APIRouter, Depends, Query, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from app.config import settings
 from app.database import get_db
 from app.api.deps import get_current_student
 from app.models.wrong_question import WrongQuestion
 from app.models.wrong_image import WrongImage
 from app.schemas.question import QuestionOut, QuestionUpdate
+from app.services.question_image import (
+    QuestionImageInvalid,
+    QuestionImageNotFound,
+    render_question_image,
+)
 
 router = APIRouter(prefix="/questions", tags=["questions"])
 
@@ -57,6 +66,43 @@ async def get_question(question_id: str, student_id=Depends(get_current_student)
         "image_url": image.original_url,
     })
     return data
+
+
+@router.get("/{question_id}/image")
+async def get_question_image(
+    question_id: str,
+    view: Literal["crop", "original"] = "crop",
+    student_id=Depends(get_current_student),
+    db=Depends(get_db),
+):
+    result = await db.execute(
+        select(WrongQuestion, WrongImage)
+        .join(WrongImage, WrongImage.id == WrongQuestion.image_id)
+        .where(
+            WrongQuestion.id == question_id,
+            WrongQuestion.student_id == student_id,
+        )
+    )
+    row = result.one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Question image not found")
+
+    question, image = row
+    image_path = Path(settings.UPLOAD_DIR) / Path(image.original_url).name
+    try:
+        content = render_question_image(
+            image_path,
+            question.crop_region,
+            view,
+            settings.MINIMAX_IMAGE_JPEG_QUALITY,
+            settings.QUESTION_IMAGE_MAX_PIXELS,
+        )
+    except QuestionImageNotFound:
+        raise HTTPException(status_code=404, detail="Question image not found")
+    except QuestionImageInvalid:
+        raise HTTPException(status_code=422, detail="Question image is invalid")
+
+    return Response(content=content, media_type="image/jpeg")
 
 
 @router.patch("/{question_id}")
