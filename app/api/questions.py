@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -18,6 +19,13 @@ from app.services.question_image import (
 
 router = APIRouter(prefix="/questions", tags=["questions"])
 
+
+def _normalize_created_from(created_from: datetime) -> datetime:
+    if created_from.tzinfo is None:
+        return created_from
+    return created_from.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 @router.get("", response_model=list[QuestionOut])
 async def list_questions(
     subject: str = None,
@@ -27,6 +35,7 @@ async def list_questions(
     tag: str = None,
     limit: int = Query(20, le=100),
     offset: int = 0,
+    created_from: datetime = None,
     student_id: str = Depends(get_current_student),
     db: AsyncSession = Depends(get_db),
 ):
@@ -41,6 +50,8 @@ async def list_questions(
         q = q.where(WrongQuestion.status == status)
     if tag:
         q = q.where(WrongQuestion.tags.any(tag))
+    if created_from:
+        q = q.where(WrongQuestion.created_at >= _normalize_created_from(created_from))
     q = q.order_by(WrongQuestion.created_at.desc()).offset(offset).limit(limit)
     result = await db.execute(q)
     return result.scalars().all()

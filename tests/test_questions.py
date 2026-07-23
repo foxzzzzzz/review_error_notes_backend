@@ -1,5 +1,9 @@
 """Tests for question CRUD API."""
+import asyncio
+from datetime import datetime, timedelta, timezone
+
 import pytest
+from sqlalchemy.dialects import postgresql
 
 
 @pytest.fixture
@@ -17,6 +21,62 @@ def question_id(client, auth_header):
 
 class TestListQuestions:
     """GET /api/questions — list and filter."""
+
+    def test_rejects_invalid_created_from(self, client, auth_header):
+        resp = client.get(
+            "/api/questions?created_from=not-a-date",
+            headers=auth_header,
+        )
+        assert resp.status_code == 422
+
+    def test_filters_by_created_from(self):
+        from app.api.questions import list_questions
+
+        class EmptyResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        class CapturingDB:
+            query = None
+
+            async def execute(self, query):
+                self.query = query
+                return EmptyResult()
+
+        created_from = datetime(
+            2026,
+            7,
+            1,
+            12,
+            0,
+            0,
+            tzinfo=timezone(timedelta(hours=8)),
+        )
+        expected_created_from = datetime(2026, 7, 1, 4, 0, 0)
+        db = CapturingDB()
+
+        asyncio.run(
+            list_questions(
+                subject=None,
+                grade=None,
+                semester=None,
+                status=None,
+                tag=None,
+                limit=20,
+                offset=0,
+                created_from=created_from,
+                student_id="student-id",
+                db=db,
+            )
+        )
+
+        compiled = db.query.compile(dialect=postgresql.dialect())
+        query_sql = str(compiled)
+        assert "wrong_questions.created_at >=" in query_sql
+        assert expected_created_from in compiled.params.values()
 
     def test_list_empty(self, client, auth_header):
         resp = client.get("/api/questions", headers=auth_header)
