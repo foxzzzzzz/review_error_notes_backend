@@ -42,6 +42,7 @@ async def create_sheet(
         select(WrongQuestion).where(
             WrongQuestion.id.in_(data.question_ids),
             WrongQuestion.student_id == student_id,
+            WrongQuestion.deleted_at.is_(None),
         )
     )
     questions = order_questions(question_result.scalars().all(), data.question_ids)

@@ -55,9 +55,26 @@ services:
       MINIMAX_CONFIDENCE_THRESHOLD: ${MINIMAX_CONFIDENCE_THRESHOLD:-0.85}
       MINIMAX_IMAGE_MAX_EDGE: ${MINIMAX_IMAGE_MAX_EDGE:-2048}
       MINIMAX_IMAGE_JPEG_QUALITY: ${MINIMAX_IMAGE_JPEG_QUALITY:-90}
+      QUESTION_SOFT_DELETE_RETENTION_DAYS: ${QUESTION_SOFT_DELETE_RETENTION_DAYS:-30}
+      QUESTION_CLEANUP_INTERVAL_SECONDS: ${QUESTION_CLEANUP_INTERVAL_SECONDS:-86400}
+      QUESTION_CLEANUP_BATCH_SIZE: ${QUESTION_CLEANUP_BATCH_SIZE:-100}
+      UPLOAD_DIR: /app/uploads
     volumes:
       - ./app:/app/app
       - uploads:/app/uploads
+
+  beat:
+    build: .
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+    depends_on: [db, redis]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://wb_user:wb_pass_2024@db:5432/wrong_book
+      REDIS_URL: redis://redis:6379/0
+      QUESTION_SOFT_DELETE_RETENTION_DAYS: ${QUESTION_SOFT_DELETE_RETENTION_DAYS:-30}
+      QUESTION_CLEANUP_INTERVAL_SECONDS: ${QUESTION_CLEANUP_INTERVAL_SECONDS:-86400}
+      QUESTION_CLEANUP_BATCH_SIZE: ${QUESTION_CLEANUP_BATCH_SIZE:-100}
+    volumes:
+      - ./app:/app/app
 
 volumes:
   pgdata:

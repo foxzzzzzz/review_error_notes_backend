@@ -12,5 +12,14 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="Asia/Shanghai",
     task_track_started=True,
-    imports=["app.tasks.process_image"],
+    imports=[
+        "app.tasks.process_image",
+        "app.tasks.cleanup_questions",
+    ],
+    beat_schedule={
+        "cleanup-expired-questions": {
+            "task": "app.tasks.cleanup_questions.cleanup_expired_questions_task",
+            "schedule": settings.QUESTION_CLEANUP_INTERVAL_SECONDS,
+        },
+    },
 )

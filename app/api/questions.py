@@ -39,7 +39,10 @@ async def list_questions(
     student_id: str = Depends(get_current_student),
     db: AsyncSession = Depends(get_db),
 ):
-    q = select(WrongQuestion).where(WrongQuestion.student_id == student_id)
+    q = select(WrongQuestion).where(
+        WrongQuestion.student_id == student_id,
+        WrongQuestion.deleted_at.is_(None),
+    )
     if subject:
         q = q.where(WrongQuestion.subject == subject)
     if grade:
@@ -65,6 +68,7 @@ async def get_question(question_id: str, student_id=Depends(get_current_student)
         .where(
             WrongQuestion.id == question_id,
             WrongQuestion.student_id == student_id,
+            WrongQuestion.deleted_at.is_(None),
         )
     )
     row = result.one_or_none()
@@ -92,6 +96,7 @@ async def get_question_image(
         .where(
             WrongQuestion.id == question_id,
             WrongQuestion.student_id == student_id,
+            WrongQuestion.deleted_at.is_(None),
         )
     )
     row = result.one_or_none()
@@ -127,6 +132,7 @@ async def update_question(
         select(WrongQuestion).where(
             WrongQuestion.id == question_id,
             WrongQuestion.student_id == student_id,
+            WrongQuestion.deleted_at.is_(None),
         )
     )
     q = result.scalar_one_or_none()
@@ -150,6 +156,7 @@ async def update_question(
             .where(
                 WrongQuestion.image_id == q.image_id,
                 WrongQuestion.status == "needs_review",
+                WrongQuestion.deleted_at.is_(None),
             )
             .limit(1)
         )
@@ -170,6 +177,7 @@ async def delete_question(question_id: str, student_id=Depends(get_current_stude
     q = result.scalar_one_or_none()
     if not q:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
-    await db.delete(q)
+    if q.deleted_at is None:
+        q.deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
     return {"ok": True}

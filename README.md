@@ -32,7 +32,7 @@
 | 图片识别 | MiniMax Token Plan | 手写内容识别、版面分组和结构化输出 |
 | LLM | OpenAI 兼容 API | 题目分析 + 衍生题难度递进 |
 | PDF | WeasyPrint + Jinja2 | A4 HTML 模板渲染 |
-| 部署 | Docker Compose | 4 容器：API / Worker / PostgreSQL / Redis |
+| 部署 | Docker Compose | 5 容器：API / Worker / Beat / PostgreSQL / Redis |
 
 ---
 
@@ -90,14 +90,15 @@ cp .env.example .env
 #   WECHAT_APP_ID=wxXXX         （小程序 AppID，生产环境必填）
 #   WECHAT_APP_SECRET=xxx       （小程序 Secret，生产环境必填）
 
-# 2. 构建并启动所有服务（Dockerfile 或模板变化后必须重新 build）
-docker compose build api worker
-docker compose up -d
+# 2. 备份 PostgreSQL 后构建镜像
+docker compose build api worker beat
 
-# 3. 运行数据库迁移
-docker compose exec api alembic upgrade head
+# 3. 只启动基础服务，并在 API/Worker/Beat 启动前运行数据库迁移
+docker compose up -d db redis
+docker compose run --rm api alembic upgrade head
 
-# 4. 验证
+# 4. 启动应用服务并验证
+docker compose up -d api worker beat
 curl http://localhost:8000/health
 # → {"status": "ok"}
 ```
@@ -111,6 +112,33 @@ docker compose build --build-arg DEBIAN_MIRROR=https://mirrors.aliyun.com worker
 镜像地址应提供标准的 `/debian` 和 `/debian-security` 仓库路径；覆盖参数只影响本次镜像构建。
 
 本版本的 PDF 镜像会安装 Noto CJK 中文字体。仅执行 `docker compose restart` 不会更新镜像；从 Git 拉取本次改动后必须重新执行上面的 `build` 和 `up -d`。历史错题如果没有 `instruction`、`prompt_text` 结构化字段，出卷接口会返回 422，需要重新上传识别后再生成错题集。
+
+### 软删除迁移、Beat 与 Worker
+
+软删除功能依赖 Alembic 迁移。部署时先备份 PostgreSQL，再执行上面的 `alembic upgrade head`，最后确认 API、Worker 和 Beat 均已启动：
+
+```bash
+docker compose ps
+docker compose logs --tail=100 api worker beat
+```
+
+Beat 仅按 `QUESTION_CLEANUP_INTERVAL_SECONDS` 投递任务；Worker 执行实际清理，因此 Worker 必须与 API 挂载同一个 `uploads` volume。默认每天一次清理，删除超过保留期的软删除错题，并清理无题目引用的历史图片。历史 `sheet_items` 外键会自动置空，题目快照、错题集和 PDF 不会删除。
+
+管理员恢复不提供公开 API，只能在物理清理前通过数据库执行。以下 SQL 同时限定题目、学生和当前配置的保留窗口；将三个占位符替换为实际 UUID 和 `QUESTION_SOFT_DELETE_RETENTION_DAYS` 的整数值后执行：
+
+```sql
+UPDATE wrong_questions
+SET deleted_at = NULL
+WHERE id = '<question_id>'
+  AND student_id = '<student_id>'
+  AND deleted_at IS NOT NULL
+  AND deleted_at > (NOW() AT TIME ZONE 'UTC')
+      - INTERVAL '1 day' * <retention_days>;
+```
+
+影响行数为 `0` 表示题目不属于该学生、未删除、已超过当前保留窗口，或已经被物理清理。已物理清理的题目不能恢复；原图文件已经丢失时，数据库记录也无法重建图片，只能重新录入。
+
+部署后至少验证：已出卷题目可软删除且历史错题集/PDF 仍可查看；删除题目不能通过列表、详情、图片或新出卷访问；`/api/questions/{question_id}/image` 已出现在 OpenAPI；有文件的图片能读取，缺失文件由接口返回 404，且小程序显示“原图文件不存在，请重新录入”。
 
 ### 服务端口
 
@@ -293,6 +321,9 @@ student (学生)
 | `MINIMAX_CONFIDENCE_THRESHOLD` | 自动确认最低置信度 | `0.85` |
 | `MINIMAX_IMAGE_MAX_EDGE` | 预处理图片最长边像素数 | `2048` |
 | `MINIMAX_IMAGE_JPEG_QUALITY` | 预处理 JPEG 质量 | `90` |
+| `QUESTION_SOFT_DELETE_RETENTION_DAYS` | 软删除错题和无引用图片在物理清理前的保留天数 | `30` |
+| `QUESTION_CLEANUP_INTERVAL_SECONDS` | Beat 投递周期清理任务的间隔秒数 | `86400` |
+| `QUESTION_CLEANUP_BATCH_SIZE` | Worker 单次清理最多锁定和处理的记录数 | `100` |
 | `DEV_MODE` | 开发模式（启用 dev-login） | `false` |
 | `WECHAT_APP_ID` | 小程序 AppID | - |
 | `WECHAT_APP_SECRET` | 小程序 Secret | - |

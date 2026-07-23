@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, SmallInteger, Integer, ForeignKey, Text
+from sqlalchemy import Column, DateTime, String, SmallInteger, Integer, ForeignKey, Text
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ENUM, ARRAY
 from app.models import Base, TimestampMixin, gen_uuid
 
@@ -22,6 +22,7 @@ class WrongQuestion(Base, TimestampMixin):
     tags = Column(ARRAY(String), default=[])
     difficulty = Column(SmallInteger, nullable=True)
     wrong_count = Column(Integer, default=1)
+    deleted_at = Column(DateTime, nullable=True, index=True)
     status = Column(
         ENUM("pending", "ocr_done", "needs_review", "confirmed", "mastered", name="question_status_enum"),
         default="pending"

@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -19,6 +20,21 @@ class Settings(BaseSettings):
     MINIMAX_IMAGE_MAX_EDGE: int = 2048
     MINIMAX_IMAGE_JPEG_QUALITY: int = 90
     QUESTION_IMAGE_MAX_PIXELS: int = 40_000_000
+    QUESTION_SOFT_DELETE_RETENTION_DAYS: int = Field(
+        default=30,
+        ge=0,
+        description="Days to retain soft-deleted questions and unreferenced images.",
+    )
+    QUESTION_CLEANUP_INTERVAL_SECONDS: int = Field(
+        default=86_400,
+        gt=0,
+        description="Seconds between periodic cleanup runs.",
+    )
+    QUESTION_CLEANUP_BATCH_SIZE: int = Field(
+        default=100,
+        gt=0,
+        description="Maximum records claimed by one cleanup query.",
+    )
     UPLOAD_DIR: str = "./uploads"
     PDF_DIR: str = "./pdfs"
     WECHAT_APP_ID: str = ""

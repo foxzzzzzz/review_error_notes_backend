@@ -1,9 +1,74 @@
 """Tests for question CRUD API."""
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy.dialects import postgresql
+
+from app.api import questions as question_api
+
+
+def test_list_route_hides_soft_deleted_question_without_postgres():
+    question_id = uuid4()
+    image_id = uuid4()
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self.rows
+
+    class SoftDeletedOnlyDB:
+        async def execute(self, query):
+            query_sql = str(query.compile(dialect=postgresql.dialect()))
+            if "wrong_questions.deleted_at IS NULL" in query_sql:
+                return Result([])
+            return Result(
+                [
+                    SimpleNamespace(
+                        id=question_id,
+                        image_id=image_id,
+                        subject="math",
+                        grade=1,
+                        semester=1,
+                        ocr_text="1 + 1",
+                        ocr_answer="2",
+                        ocr_raw_json=None,
+                        question_type="calculation",
+                        tags=[],
+                        difficulty=1,
+                        wrong_count=1,
+                        status="confirmed",
+                        created_at=datetime(2026, 7, 1),
+                        deleted_at=datetime(2026, 7, 2),
+                    )
+                ]
+            )
+
+    async def current_student():
+        return str(uuid4())
+
+    async def get_db():
+        yield SoftDeletedOnlyDB()
+
+    app = FastAPI()
+    app.include_router(question_api.router)
+    app.dependency_overrides[question_api.get_current_student] = current_student
+    app.dependency_overrides[question_api.get_db] = get_db
+
+    with TestClient(app) as client:
+        response = client.get("/questions")
+
+    assert response.status_code == 200
+    assert response.json() == []
 
 
 @pytest.fixture
