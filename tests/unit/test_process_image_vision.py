@@ -25,10 +25,12 @@ def test_worker_registers_complete_foreign_key_model_graph():
 def _item(**overrides):
     data = {
         "raw_text": "qin tin\n蜻蜓",
+        "instruction": "看词语写拼音",
+        "prompt_text": "蜻蜓",
         "normalized_text": "qīng tíng\n蜻蜓",
         "answer": "qīng tíng",
         "subject": "chinese",
-        "question_type": "pinyin",
+        "question_type": "write_pinyin",
         "tags": ["拼音"],
         "difficulty": 2,
         "confidence": 0.92,
@@ -50,6 +52,8 @@ def test_question_values_preserve_raw_writing_and_normalized_content():
     assert values["ocr_raw_json"]["provider"] == "minimax"
     assert values["ocr_raw_json"]["confidence"] == 0.92
     assert values["ocr_raw_json"]["raw_text"] == values["ocr_text"]
+    assert values["ocr_raw_json"]["instruction"] == "看词语写拼音"
+    assert values["ocr_raw_json"]["prompt_text"] == "蜻蜓"
     assert values["ocr_raw_json"]["answer"] == values["ocr_answer"]
     assert values["ocr_raw_json"]["subject"] == "chinese"
     assert values["ocr_raw_json"]["bbox"] == [0.1, 0.2, 0.4, 0.4]

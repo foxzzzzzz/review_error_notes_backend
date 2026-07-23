@@ -5,6 +5,7 @@ import json
 import httpx
 import pytest
 from PIL import Image
+from pydantic import ValidationError
 
 
 def _write_image(path, size=(2400, 1200)):
@@ -17,10 +18,12 @@ def _valid_payload():
         "items": [
             {
                 "raw_text": "qin tin\n蜻蜓",
+                "instruction": "看词语写拼音",
+                "prompt_text": "蜻蜓",
                 "normalized_text": "qīng tíng\n蜻蜓",
                 "answer": "qīng tíng",
                 "subject": "chinese",
-                "question_type": "pinyin",
+                "question_type": "write_pinyin",
                 "tags": ["拼音"],
                 "difficulty": 2,
                 "confidence": 0.91,
@@ -54,6 +57,25 @@ def test_prompt_splits_marked_worksheet_into_smallest_answerable_units():
     assert "同一作答单元上的红圈、红叉和纠正笔迹视为同一标记组" in RECOGNITION_PROMPT
     assert "计算" in RECOGNITION_PROMPT
     assert "识字、组词、图形、合唱" in RECOGNITION_PROMPT
+
+
+def test_prompt_separates_student_answer_from_printable_prompt():
+    from app.services.vision_recognition import RECOGNITION_PROMPT
+
+    assert '"instruction"' in RECOGNITION_PROMPT
+    assert '"prompt_text"' in RECOGNITION_PROMPT
+    assert "不得包含学生作答" in RECOGNITION_PROMPT
+
+
+@pytest.mark.parametrize("missing_field", ["instruction", "prompt_text"])
+def test_vision_item_requires_clean_practice_prompt_fields(missing_field):
+    from app.services.vision_recognition import VisionItem
+
+    item = _valid_payload()["items"][0]
+    item.pop(missing_field)
+
+    with pytest.raises(ValidationError):
+        VisionItem(**item)
 
 
 @pytest.mark.parametrize(

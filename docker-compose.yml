@@ -20,6 +20,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://wb_user:wb_pass_2024@db:5432/wrong_book
       REDIS_URL: redis://redis:6379/0
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_API_BASE: ${LLM_API_BASE:-https://api.deepseek.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-pro}
       JWT_SECRET: change-me-in-production
       AES_KEY: change-me-32bytes-secret-key-ok!
       DEV_MODE: "true"

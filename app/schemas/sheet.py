@@ -7,7 +7,7 @@ from uuid import UUID
 class SheetCreate(BaseModel):
     title: str = "错题重练"
     question_ids: list[str]
-    derived_per_original: int = Field(default=1, ge=1, le=3)
+    derived_per_original: int = Field(default=0, ge=0, le=3)
     difficulty_boost: int = Field(default=2, ge=1, le=3)
 
 

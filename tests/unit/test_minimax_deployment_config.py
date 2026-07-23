@@ -25,6 +25,15 @@ def test_worker_receives_every_minimax_setting_without_a_secret_value():
     assert "secret-token" not in compose
 
 
+def test_api_receives_deepseek_settings_for_synchronous_derivative_generation():
+    compose = (BACKEND_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    api = compose.split("  api:", 1)[1].split("  worker:", 1)[0]
+
+    assert "LLM_API_KEY: ${LLM_API_KEY}" in api
+    assert "LLM_API_BASE: ${LLM_API_BASE:-https://api.deepseek.com/v1}" in api
+    assert "LLM_MODEL: ${LLM_MODEL:-deepseek-v4-pro}" in api
+
+
 def test_paddleocr_is_absent_from_runtime_and_production_task():
     heavy_requirements = (BACKEND_ROOT / "requirements-heavy.txt").read_text(encoding="utf-8").lower()
     task = (BACKEND_ROOT / "app" / "tasks" / "process_image.py").read_text(encoding="utf-8").lower()

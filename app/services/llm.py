@@ -19,10 +19,12 @@ ANALYSIS_FALLBACK = {
     "difficulty": 3,
 }
 
-DERIVATIVE_PROMPT = """基于以下题目，生成一道难度提升的衍生题，只把衍生题文本放在 <output> 标签内。
+DERIVATIVE_PROMPT = """基于以下结构化题目，生成一道同知识点、难度递进的衍生题。
 
-原题: {question_text}
-原题结构: {problem_schema}
+原练习要求: {instruction}
+原题提示材料: {prompt_text}
+原题题型: {question_type}
+原题正确答案: {answer}
 当前难度: {difficulty} / 目标难度: {target_difficulty}
 科目: {subject}
 
@@ -30,10 +32,14 @@ DERIVATIVE_PROMPT = """基于以下题目，生成一道难度提升的衍生题
 - 数学：增大数值、增加计算步骤、或改变问法（正向→逆向）
 - 语文：同知识点，替换字词或调整语境
 - 英语：替换词汇、变化时态
+- 不得返回原题复制品，不得包含学生错误答案或老师批改内容
+- instruction、prompt_text、answer 都必须非空
+- question_type 只能是 write_pinyin、write_word、fill_blank、calculation、other 之一
+- 只在 <output> 内输出一个合法 JSON 对象，不要解释
 
-输出格式示例：
+输出格式：
 <output>
-小明有48颗糖，第一天吃了15颗，第二天吃了9颗，还剩几颗？
+{{"instruction":"看词语写拼音","prompt_text":"算式","question_type":"write_pinyin","answer":"suàn shì"}}
 </output>"""
 
 OUTPUT_RE = re.compile(r"<output>\s*(.*?)\s*</output>", re.DOTALL)
@@ -54,16 +60,17 @@ async def analyze_question(question_text: str, subject_hint: str = "") -> dict:
 
 
 async def generate_derivative(
-    question_text: str,
-    problem_schema: dict,
+    original,
     difficulty: int,
     target_difficulty: int,
     subject: str,
-) -> str:
-    """调用 LLM 生成衍生题"""
+) -> dict:
+    """调用 LLM 生成一条结构化衍生题。"""
     prompt = DERIVATIVE_PROMPT.format(
-        question_text=question_text,
-        problem_schema=json.dumps(problem_schema, ensure_ascii=False),
+        instruction=original.instruction,
+        prompt_text=original.prompt_text,
+        question_type=original.question_type,
+        answer=original.answer or "",
         difficulty=difficulty,
         target_difficulty=target_difficulty,
         subject=subject,
@@ -71,7 +78,10 @@ async def generate_derivative(
     result = await _call_llm(prompt)
     if not result.strip():
         raise ValueError("LLM returned an empty derivative")
-    return result
+    parsed = _parse_json(result)
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM returned an invalid derivative")
+    return parsed
 
 
 def _extract_output(raw: str) -> str:

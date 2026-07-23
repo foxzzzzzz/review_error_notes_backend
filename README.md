@@ -1,6 +1,6 @@
 # 错题本 — Wrong Homework Collection App
 
-面向小学生家长的错题管理应用。拍照录入错题 → MiniMax 多模态识别与分类 → 生成 A4 分栏错题集（原题 + 衍生题），可打印练习。
+面向小学生家长的错题管理应用。拍照录入错题 → MiniMax 多模态识别与分类 → 重建干净题干并生成 A4 错题集，可打印练习。
 
 ---
 
@@ -90,16 +90,19 @@ cp .env.example .env
 #   WECHAT_APP_ID=wxXXX         （小程序 AppID，生产环境必填）
 #   WECHAT_APP_SECRET=xxx       （小程序 Secret，生产环境必填）
 
-# 2. 启动所有服务
-docker-compose up -d
+# 2. 构建并启动所有服务（Dockerfile 或模板变化后必须重新 build）
+docker compose build api worker
+docker compose up -d
 
 # 3. 运行数据库迁移
-docker-compose exec api alembic upgrade head
+docker compose exec api alembic upgrade head
 
 # 4. 验证
 curl http://localhost:8000/health
 # → {"status": "ok"}
 ```
+
+本版本的 PDF 镜像会安装 Noto CJK 中文字体。仅执行 `docker compose restart` 不会更新镜像；从 Git 拉取本次改动后必须重新执行上面的 `build` 和 `up -d`。历史错题如果没有 `instruction`、`prompt_text` 结构化字段，出卷接口会返回 422，需要重新上传识别后再生成错题集。
 
 ### 服务端口
 
@@ -220,6 +223,14 @@ MiniMax 每个识别项的 `bbox` 使用归一化角点坐标：
 ### 红色批改标记与错题粒度
 
 图片中存在红圈、红叉、红色删除线或纠错批注时，只识别与标记关联的最小可独立作答单元。单个拼音格、词语格、填空或选择项分别生成一条错题；同一道编号大题中有多个标记时分别生成多条，未标记的兄弟小题不写入。落在同一作答单元上的红圈、红叉和纠正笔迹视为同一标记组。图片中没有明确红色错误标记时，识别全部独立作答单元，但仍不把整道编号大题合并成一条记录。
+
+### 结构化题干与错题集
+
+每个新识别项同时保存：学生实际作答 `raw_text`、原练习要求 `instruction`、干净提示材料 `prompt_text`、正确答案 `answer` 和稳定题型 `question_type`。错题详情可以展示学生错答和模型参考，但 PDF 只根据 `instruction`、`prompt_text`、`question_type` 重建练习题，不打印学生错答和答案。
+
+`POST /api/sheets` 的 `derived_per_original` 支持 0 至 3，默认 0。值为 0 时仅生成原题且不依赖 LLM；值为 1 至 3 时需要配置 `LLM_API_KEY`，并对结构化衍生题执行非空、非原题复制和同组去重校验。PDF 使用单栏分组布局，不生成答案页。
+
+衍生题在 API 请求内同步生成，因此 `LLM_API_KEY`、`LLM_API_BASE`、`LLM_MODEL` 必须注入 `api` 容器；项目的 Docker Compose 已同时向 API 注入这三项配置。
 
 | Method | Path | 说明 | 鉴权 |
 |--------|------|------|------|

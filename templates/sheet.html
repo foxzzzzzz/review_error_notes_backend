@@ -1,53 +1,94 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <style>
-  @page { size: A4; margin: 15mm; }
-  body { font-family: "SimSun", "KaiTi", serif; font-size: 12pt; }
-  .header { text-align: center; margin-bottom: 10mm; }
-  .header h1 { font-size: 16pt; margin: 0; }
-  .header p { color: #666; margin: 2mm 0; }
-  .columns { display: flex; gap: 8mm; }
-  .column { flex: 1; }
-  .column h2 { font-size: 14pt; border-bottom: 1px solid #333; padding-bottom: 3mm; }
-  .question { margin: 8mm 0; }
-  .question .number { font-weight: bold; }
-  .question .content { margin: 3mm 0; }
-  .answer-line { border-bottom: 1px dashed #999; height: 8mm; margin-top: 5mm; }
-  .divider { border-left: 1px dashed #999; }
-  .footer { position: fixed; bottom: 0; width: 100%; text-align: center;
-            font-size: 10pt; color: #999; }
+  @page {
+    size: A4;
+    margin: 16mm 16mm 18mm;
+    @bottom-center {
+      content: "第 " counter(page) " 页";
+      color: #8a8a8a;
+      font-family: "Noto Sans CJK SC", sans-serif;
+      font-size: 9pt;
+    }
+  }
+  body {
+    color: #202124;
+    font-family: "Noto Sans CJK SC", sans-serif;
+    font-size: 12pt;
+    line-height: 1.75;
+  }
+  .header {
+    border-bottom: 2px solid #2f6f4e;
+    margin-bottom: 8mm;
+    padding-bottom: 5mm;
+    text-align: center;
+  }
+  .header h1 {
+    font-size: 20pt;
+    margin: 0 0 2mm;
+  }
+  .meta {
+    color: #5f6368;
+    font-size: 10.5pt;
+    margin: 0;
+  }
+  .question-group {
+    break-inside: avoid;
+    border: 1px solid #dfe5e1;
+    border-radius: 3mm;
+    margin: 0 0 7mm;
+    padding: 5mm 6mm;
+  }
+  .group-title {
+    color: #2f6f4e;
+    font-size: 11pt;
+    font-weight: 700;
+    margin-bottom: 2mm;
+  }
+  .question-content {
+    font-size: 13pt;
+    white-space: pre-line;
+  }
+  .derivatives {
+    border-top: 1px dashed #b8c5bd;
+    margin-top: 4mm;
+    padding-top: 3mm;
+  }
+  .derivative {
+    margin-top: 3mm;
+  }
+  .derivative-label {
+    color: #5f6368;
+    font-size: 10pt;
+    font-weight: 700;
+  }
 </style>
 </head>
 <body>
-<div class="header">
-  <h1>{{ student_name }} · {{ subject }} · {{ title }}</h1>
-  <p>日期: {{ date }}</p>
-</div>
-<div class="columns">
-  <div class="column">
-    <h2>一、原题重做</h2>
-    {% for item in original_items %}
-    <div class="question">
-      <span class="number">{{ loop.index }}.</span>
-      <div class="content">{{ item }}</div>
-      <div class="answer-line"></div>
+<header class="header">
+  <h1>{{ title }}</h1>
+  <p class="meta">学生：{{ student_name }}　科目：{{ subject }}　日期：{{ date }}</p>
+</header>
+
+<main>
+  {% for group in groups %}
+  <section class="question-group">
+    <div class="group-title">第 {{ loop.index }} 题 · 原题重做</div>
+    <div class="question-content">{{ group.original.display_text }}</div>
+    {% if group.derivatives %}
+    <div class="derivatives">
+      {% for item in group.derivatives %}
+      <div class="derivative">
+        <div class="derivative-label">强化练习 {{ loop.index }}</div>
+        <div class="question-content">{{ item.display_text }}</div>
+      </div>
+      {% endfor %}
     </div>
-    {% endfor %}
-  </div>
-  <div class="divider"></div>
-  <div class="column">
-    <h2>二、衍生题（难度提升）</h2>
-    {% for item in derived_items %}
-    <div class="question">
-      <span class="number">{{ loop.index }}.</span>
-      <div class="content">{{ item }}</div>
-      <div class="answer-line"></div>
-    </div>
-    {% endfor %}
-  </div>
-</div>
-<div class="footer">错题重练</div>
+    {% endif %}
+  </section>
+  {% endfor %}
+</main>
 </body>
 </html>
