@@ -76,6 +76,7 @@ def test_prompt_separates_student_answer_from_printable_prompt():
     assert '"instruction"' in RECOGNITION_PROMPT
     assert '"prompt_text"' in RECOGNITION_PROMPT
     assert "不得包含学生作答" in RECOGNITION_PROMPT
+    assert "difficulty 必须是 1 到 5 的整数" in RECOGNITION_PROMPT
 
 
 @pytest.mark.parametrize("missing_field", ["instruction", "prompt_text"])
@@ -102,6 +103,29 @@ def test_vision_item_accepts_live_minimax_corner_bbox(bbox):
     item = VisionItem(**{**_valid_payload()["items"][0], "bbox": bbox})
 
     assert item.bbox == bbox
+
+
+@pytest.mark.parametrize(
+    ("model_difficulty", "expected_difficulty"),
+    [
+        (0, 1),
+        (6, 5),
+    ],
+)
+def test_vision_item_clamps_out_of_range_integer_difficulty(
+    model_difficulty,
+    expected_difficulty,
+):
+    from app.services.vision_recognition import VisionItem
+
+    item = VisionItem(
+        **{
+            **_valid_payload()["items"][0],
+            "difficulty": model_difficulty,
+        }
+    )
+
+    assert item.difficulty == expected_difficulty
 
 
 def test_prepare_image_data_url_normalizes_and_limits_dimensions(tmp_path):
