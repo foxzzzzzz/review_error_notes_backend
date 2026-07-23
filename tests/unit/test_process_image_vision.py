@@ -1,4 +1,4 @@
-from app.services.vision_recognition import VisionItem
+from app.services.vision_recognition import LocalizationItem, VisionItem
 
 
 def test_worker_registers_complete_foreign_key_model_graph():
@@ -44,7 +44,19 @@ def _item(**overrides):
 def test_question_values_preserve_raw_writing_and_normalized_content():
     from app.services.vision_recognition import build_question_values
 
-    values = build_question_values(_item(), index=0, confidence_threshold=0.85)
+    localization = LocalizationItem(
+        index=0,
+        bbox=[0.05, 0.15, 0.45, 0.5],
+        confidence=0.93,
+    )
+    values = build_question_values(
+        _item(),
+        index=0,
+        confidence_threshold=0.85,
+        localization=localization,
+        localization_threshold=0.85,
+        normalized_tags=["拼音", "老师批改"],
+    )
 
     assert values["ocr_text"] == "qin tin\n蜻蜓"
     assert values["ocr_text"] != values["ocr_raw_json"]["normalized_text"]
@@ -58,30 +70,54 @@ def test_question_values_preserve_raw_writing_and_normalized_content():
     assert values["ocr_raw_json"]["subject"] == "chinese"
     assert values["ocr_raw_json"]["bbox"] == [0.1, 0.2, 0.4, 0.4]
     assert values["crop_region"] == {
-        "bbox": [0.1, 0.2, 0.4, 0.4],
+        "bbox": [0.05, 0.15, 0.45, 0.5],
         "bbox_format": "normalized_ltrb",
+        "bbox_source": "minimax_verified",
+        "bbox_confidence": 0.93,
+        "localization_status": "verified",
         "index": 0,
     }
+    assert values["tags"] == ["拼音", "老师批改"]
     assert values["status"] == "confirmed"
 
 
-def test_question_values_label_minimax_corner_bbox_format():
+def test_low_confidence_localization_discards_candidate_bbox():
     from app.services.vision_recognition import build_question_values
 
-    bbox = [0.0, 0.45, 1.0, 0.88]
-    values = build_question_values(_item(bbox=bbox), index=1, confidence_threshold=0.85)
+    localization = LocalizationItem(
+        index=1,
+        bbox=[0.0, 0.45, 1.0, 0.88],
+        confidence=0.7,
+    )
+    values = build_question_values(
+        _item(),
+        index=1,
+        confidence_threshold=0.85,
+        localization=localization,
+        localization_threshold=0.85,
+        normalized_tags=["拼音"],
+    )
 
     assert values["crop_region"] == {
-        "bbox": bbox,
-        "bbox_format": "normalized_ltrb",
+        "bbox_source": "unverified",
+        "localization_status": "needs_review",
         "index": 1,
     }
+    assert values["ocr_raw_json"]["bbox"] == [0.1, 0.2, 0.4, 0.4]
+    assert values["status"] == "needs_review"
 
 
 def test_low_confidence_item_requires_review():
     from app.services.vision_recognition import build_question_values
 
-    values = build_question_values(_item(confidence=0.7), index=1, confidence_threshold=0.85)
+    values = build_question_values(
+        _item(confidence=0.7),
+        index=1,
+        confidence_threshold=0.85,
+        localization=None,
+        localization_threshold=0.85,
+        normalized_tags=["拼音"],
+    )
 
     assert values["status"] == "needs_review"
 
@@ -93,6 +129,9 @@ def test_uncertain_segments_require_review_even_with_high_confidence():
         _item(confidence=0.99, uncertain_segments=["第一个拼音末尾"]),
         index=0,
         confidence_threshold=0.85,
+        localization=None,
+        localization_threshold=0.85,
+        normalized_tags=["拼音"],
     )
 
     assert values["status"] == "needs_review"
@@ -111,7 +150,7 @@ def test_task_claims_image_before_remote_call_and_resets_failed_claim():
     source = (Path(__file__).parents[2] / "app" / "tasks" / "process_image.py").read_text(encoding="utf-8")
 
     claim = source.index("with_for_update()")
-    remote_call = source.index(".recognize(")
+    remote_call = source.index("recognize_question_batch(")
     assert claim < remote_call
     assert 'image.status != "pending"' in source
     assert 'image.status = "segmented"' in source

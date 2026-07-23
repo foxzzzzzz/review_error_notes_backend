@@ -1,0 +1,15 @@
+{
+  "aliases": {
+    "pinyin": "拼音",
+    "teacher-marked": "老师批改",
+    "word": "词语",
+    "wrong-character": "错别字"
+  },
+  "question_type_defaults": {
+    "write_pinyin": "拼音",
+    "write_word": "词语",
+    "fill_blank": "填空",
+    "calculation": "计算",
+    "other": "其他"
+  }
+}

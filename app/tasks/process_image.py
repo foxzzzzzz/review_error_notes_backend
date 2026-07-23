@@ -12,8 +12,8 @@ from app.models.wrong_image import WrongImage
 from app.models.wrong_question import WrongQuestion
 from app.services.vision_recognition import (
     MiniMaxVisionClient,
-    build_question_values,
     image_status_for,
+    recognize_question_batch,
 )
 from app.tasks.celery_app import celery_app
 
@@ -42,18 +42,14 @@ def process_image(self, image_id: str, filepath: str):
             db.commit()
             claimed = True
 
-        result = MiniMaxVisionClient.from_settings().recognize(
-            filepath,
+        result, question_values = recognize_question_batch(
+            client=MiniMaxVisionClient.from_settings(),
+            image_path=filepath,
             subject_hint=subject_hint,
+            confidence_threshold=settings.MINIMAX_CONFIDENCE_THRESHOLD,
+            localization_threshold=settings.MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD,
+            tag_config_path=settings.TAG_ALIAS_CONFIG_PATH,
         )
-        question_values = [
-            build_question_values(
-                item,
-                index=index,
-                confidence_threshold=settings.MINIMAX_CONFIDENCE_THRESHOLD,
-            )
-            for index, item in enumerate(result.items)
-        ]
 
         with Session(engine) as db:
             image = db.scalar(
