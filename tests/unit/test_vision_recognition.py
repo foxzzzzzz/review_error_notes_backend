@@ -59,6 +59,17 @@ def test_prompt_splits_marked_worksheet_into_smallest_answerable_units():
     assert "识字、组词、图形、合唱" in RECOGNITION_PROMPT
 
 
+def test_prompt_expands_marked_fragment_to_complete_word_group():
+    from app.services.vision_recognition import RECOGNITION_PROMPT
+
+    assert "完整词语格组" in RECOGNITION_PROMPT
+    assert "完整词语优先于红色标记的像素覆盖范围" in RECOGNITION_PROMPT
+    assert "prompt_text=课文" in RECOGNITION_PROMPT
+    assert "raw_text=合做" in RECOGNITION_PROMPT
+    assert "answer=合作" in RECOGNITION_PROMPT
+    assert "不得只输出 kè、suàn 或 做" in RECOGNITION_PROMPT
+
+
 def test_prompt_separates_student_answer_from_printable_prompt():
     from app.services.vision_recognition import RECOGNITION_PROMPT
 
