@@ -42,3 +42,13 @@ def test_paddleocr_is_absent_from_runtime_and_production_task():
     assert "paddle" not in task
     assert "recognize_text" not in task
     assert "segment_questions" not in task
+
+
+def test_docker_uses_configurable_tsinghua_debian_mirror_before_apt_update():
+    dockerfile = (BACKEND_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    arg = "ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn"
+    replacement = 's|http://deb.debian.org|${DEBIAN_MIRROR}|g'
+    assert arg in dockerfile
+    assert replacement in dockerfile
+    assert dockerfile.index(arg) < dockerfile.index(replacement) < dockerfile.index("apt-get update")

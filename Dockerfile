@@ -1,5 +1,7 @@
 FROM python:3.11-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
+ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn
+RUN sed -i "s|http://deb.debian.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 libglib2.0-0 libsm6 libxext6 libxrender-dev libgl1 \
     libpango-1.0-0 libpangoft2-1.0-0 libgdk-pixbuf-2.0-0 \
     libffi-dev shared-mime-info fonts-noto-cjk \

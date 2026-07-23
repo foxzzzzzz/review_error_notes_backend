@@ -102,6 +102,14 @@ curl http://localhost:8000/health
 # → {"status": "ok"}
 ```
 
+Dockerfile 安装 Debian 系统包时默认使用清华镜像 `https://mirrors.tuna.tsinghua.edu.cn`。如需临时切换到其他兼容镜像，可在构建时覆盖 `DEBIAN_MIRROR`：
+
+```bash
+docker compose build --build-arg DEBIAN_MIRROR=https://mirrors.aliyun.com worker
+```
+
+镜像地址应提供标准的 `/debian` 和 `/debian-security` 仓库路径；覆盖参数只影响本次镜像构建。
+
 本版本的 PDF 镜像会安装 Noto CJK 中文字体。仅执行 `docker compose restart` 不会更新镜像；从 Git 拉取本次改动后必须重新执行上面的 `build` 和 `up -d`。历史错题如果没有 `instruction`、`prompt_text` 结构化字段，出卷接口会返回 422，需要重新上传识别后再生成错题集。
 
 ### 服务端口
