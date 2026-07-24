@@ -49,28 +49,53 @@ def filter_valid_error_marks(
     confidence_threshold: float,
     red_pixel_min_ratio: float,
     expansion_ratio: float,
-) -> tuple[List[ErrorMark], List[int]]:
-    """Keep only confident mark regions with enough local red-pixel evidence."""
+) -> tuple[List[ErrorMark], List[int], List[dict]]:
+    """Keep valid marks and report the pixel evidence used for each decision."""
     valid = []
     rejected = []
+    diagnostics = []
     try:
         with Image.open(image_path) as source:
             image = ImageOps.exif_transpose(source).convert("RGB")
             for mark in marks:
-                if mark.confidence < confidence_threshold:
-                    rejected.append(mark.mark_id)
-                    continue
-                crop = image.crop(
-                    _expanded_pixel_box(image.size, mark.bbox, expansion_ratio)
+                pixel_box = _expanded_pixel_box(
+                    image.size,
+                    mark.bbox,
+                    expansion_ratio,
                 )
+                crop = image.crop(pixel_box)
                 pixel_count = crop.width * crop.height
                 red_count = sum(
                     1 for pixel in crop.getdata() if _is_red_pixel(pixel)
                 )
-                if pixel_count and red_count / pixel_count >= red_pixel_min_ratio:
+                red_pixel_ratio = red_count / pixel_count if pixel_count else 0.0
+                if mark.confidence < confidence_threshold:
+                    accepted = False
+                    reason = "low_confidence"
+                elif red_pixel_ratio < red_pixel_min_ratio:
+                    accepted = False
+                    reason = "insufficient_red_pixels"
+                else:
+                    accepted = True
+                    reason = "accepted"
+                diagnostics.append(
+                    {
+                        "mark_id": mark.mark_id,
+                        "confidence": mark.confidence,
+                        "confidence_threshold": confidence_threshold,
+                        "pixel_box": list(pixel_box),
+                        "red_pixel_count": red_count,
+                        "pixel_count": pixel_count,
+                        "red_pixel_ratio": red_pixel_ratio,
+                        "red_pixel_min_ratio": red_pixel_min_ratio,
+                        "accepted": accepted,
+                        "reason": reason,
+                    }
+                )
+                if accepted:
                     valid.append(mark)
                 else:
                     rejected.append(mark.mark_id)
     except (Image.DecompressionBombError, OSError, ValueError) as exc:
         raise ErrorMarkImageInvalid("Error mark image is invalid") from exc
-    return valid, rejected
+    return valid, rejected, diagnostics

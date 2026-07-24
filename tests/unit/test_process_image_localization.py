@@ -202,6 +202,57 @@ def test_pipeline_rejects_model_marks_without_local_red_pixels(tmp_path):
     assert all(value["status"] == "needs_review" for value in values)
 
 
+def test_rejected_mark_does_not_invalidate_question_matched_to_valid_mark(tmp_path):
+    class PartiallyValidMarkClient(FakeClient):
+        def recognize(self, image_path, subject_hint=None):
+            result = _vision_result()
+            result.error_marks[1] = result.error_marks[1].model_copy(
+                update={"bbox": [0.8, 0.05, 0.9, 0.15]}
+            )
+            return result
+
+        def localize(self, image_path, items, error_marks):
+            self.localize_calls += 1
+            self.localized_marks = error_marks
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=0,
+                        matched=True,
+                        mark_ids=[0],
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        observed_prompt_text=items[0].prompt_text,
+                        observed_raw_text=items[0].raw_text,
+                        confidence=0.94,
+                    ),
+                    LocalizationItem(
+                        index=1,
+                        matched=False,
+                        mark_ids=[],
+                        bbox=None,
+                        observed_prompt_text=None,
+                        observed_raw_text=None,
+                        confidence=0.0,
+                    ),
+                ]
+            )
+
+    verifier = FakeOCRVerifier()
+    client = PartiallyValidMarkClient()
+    _result, values = _run_batch(
+        tmp_path,
+        client=client,
+        ocr_verifier=verifier,
+    )
+
+    assert [mark.mark_id for mark in client.localized_marks] == [0]
+    assert values[0]["crop_region"]["bbox"] == [0.15, 0.15, 0.4, 0.45]
+    assert values[0]["status"] == "confirmed"
+    assert verifier.calls == [([0.15, 0.15, 0.4, 0.45], 0)]
+    assert "bbox" not in values[1]["crop_region"]
+    assert values[1]["status"] == "needs_review"
+
+
 def test_ocr_contradiction_discards_localized_bbox(tmp_path):
     verifier = FakeOCRVerifier(
         {
@@ -243,5 +294,8 @@ def test_saved_diagnostics_separate_marks_localization_and_ocr(tmp_path):
 
     raw = values[0]["ocr_raw_json"]
     assert raw["error_marks"][0]["mark_id"] == 0
+    assert raw["error_mark_validation"][0]["mark_id"] == 0
+    assert raw["error_mark_validation"][0]["accepted"] is True
+    assert raw["error_mark_validation"][0]["red_pixel_ratio"] >= 0.01
     assert raw["localization"]["mark_ids"] == [0]
     assert raw["local_ocr"]["status"] == "support"

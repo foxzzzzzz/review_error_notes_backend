@@ -260,3 +260,33 @@ def test_task_claims_image_before_remote_call_and_resets_failed_claim():
     assert 'image.status != "pending"' in source
     assert 'image.status = "segmented"' in source
     assert 'claimed_image.status = "pending"' in source
+
+
+def test_task_logs_mark_validation_diagnostics(caplog):
+    import logging
+
+    from app.tasks.process_image import log_mark_validation_diagnostics
+
+    question_values = [
+        {
+            "ocr_raw_json": {
+                "error_mark_validation": [
+                    {
+                        "mark_id": 1,
+                        "red_pixel_ratio": 0.004,
+                        "red_pixel_min_ratio": 0.005,
+                        "accepted": False,
+                        "reason": "insufficient_red_pixels",
+                    }
+                ]
+            }
+        }
+    ]
+
+    with caplog.at_level(logging.INFO):
+        log_mark_validation_diagnostics("image-123", question_values)
+
+    assert "image_id=image-123" in caplog.text
+    assert '"mark_id":1' in caplog.text
+    assert '"red_pixel_ratio":0.004' in caplog.text
+    assert '"reason":"insufficient_red_pixels"' in caplog.text

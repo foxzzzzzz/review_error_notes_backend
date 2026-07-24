@@ -22,7 +22,7 @@ def test_accepts_mark_box_with_red_pixels(tmp_path):
     draw.ellipse((20, 20, 40, 40), outline=(220, 30, 30), width=5)
     image.save(image_path)
 
-    valid, rejected = filter_valid_error_marks(
+    valid, rejected, _diagnostics = filter_valid_error_marks(
         str(image_path),
         [_mark()],
         confidence_threshold=0.85,
@@ -34,13 +34,55 @@ def test_accepts_mark_box_with_red_pixels(tmp_path):
     assert rejected == []
 
 
+def test_reports_pixel_evidence_and_rejection_reason_for_each_mark(tmp_path):
+    from app.services.error_mark_validation import filter_valid_error_marks
+
+    image_path = tmp_path / "diagnostics.png"
+    image = Image.new("RGB", (100, 100), "white")
+    ImageDraw.Draw(image).rectangle((20, 20, 40, 40), fill=(220, 30, 30))
+    image.save(image_path)
+
+    valid, rejected, diagnostics = filter_valid_error_marks(
+        str(image_path),
+        [
+            _mark([0.2, 0.2, 0.4, 0.4]),
+            _mark([0.6, 0.6, 0.8, 0.8]).model_copy(update={"mark_id": 1}),
+            _mark([0.2, 0.2, 0.4, 0.4], confidence=0.5).model_copy(
+                update={"mark_id": 2}
+            ),
+        ],
+        confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        expansion_ratio=0.0,
+    )
+
+    assert [mark.mark_id for mark in valid] == [0]
+    assert rejected == [1, 2]
+    assert diagnostics[0] == {
+        "mark_id": 0,
+        "confidence": 0.95,
+        "confidence_threshold": 0.85,
+        "pixel_box": [20, 20, 40, 40],
+        "red_pixel_count": 400,
+        "pixel_count": 400,
+        "red_pixel_ratio": 1.0,
+        "red_pixel_min_ratio": 0.01,
+        "accepted": True,
+        "reason": "accepted",
+    }
+    assert diagnostics[1]["red_pixel_ratio"] == 0.0
+    assert diagnostics[1]["reason"] == "insufficient_red_pixels"
+    assert diagnostics[2]["red_pixel_ratio"] == 1.0
+    assert diagnostics[2]["reason"] == "low_confidence"
+
+
 def test_rejects_white_region_and_low_confidence_mark(tmp_path):
     from app.services.error_mark_validation import filter_valid_error_marks
 
     image_path = tmp_path / "white.png"
     Image.new("RGB", (100, 100), "white").save(image_path)
 
-    valid, rejected = filter_valid_error_marks(
+    valid, rejected, _diagnostics = filter_valid_error_marks(
         str(image_path),
         [_mark(), _mark(confidence=0.5).model_copy(update={"mark_id": 1})],
         confidence_threshold=0.85,
@@ -60,7 +102,7 @@ def test_expanded_mark_at_image_edge_is_clipped(tmp_path):
     ImageDraw.Draw(image).rectangle((0, 0, 4, 4), fill=(230, 20, 20))
     image.save(image_path)
 
-    valid, rejected = filter_valid_error_marks(
+    valid, rejected, _diagnostics = filter_valid_error_marks(
         str(image_path),
         [_mark([0.0, 0.0, 0.2, 0.2])],
         confidence_threshold=0.85,

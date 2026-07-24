@@ -368,7 +368,7 @@ def recognize_question_batch(
     """Recognize marks/content, independently localize, then OCR-check each crop."""
     result = client.recognize(image_path, subject_hint=subject_hint)
     try:
-        valid_marks, rejected_mark_ids = filter_valid_error_marks(
+        valid_marks, rejected_mark_ids, mark_diagnostics = filter_valid_error_marks(
             image_path,
             result.error_marks,
             confidence_threshold=mark_confidence_threshold,
@@ -378,6 +378,7 @@ def recognize_question_batch(
     except ErrorMarkImageInvalid:
         valid_marks = []
         rejected_mark_ids = [mark.mark_id for mark in result.error_marks]
+        mark_diagnostics = []
     marks_by_id = {mark.mark_id: mark for mark in valid_marks}
 
     localizations = {}
@@ -414,14 +415,6 @@ def recognize_question_batch(
             "text_summary": "",
             "confidence": None,
         }
-        if rejected_mark_ids:
-            question_values["crop_region"] = {
-                "bbox_source": "unverified",
-                "localization_status": "needs_review",
-                "index": index,
-            }
-            question_values["status"] = "needs_review"
-
         proposed_bbox = question_values["crop_region"].get("bbox")
         if proposed_bbox is not None:
             verification = ocr_verifier.verify(
@@ -444,6 +437,7 @@ def recognize_question_batch(
                 "error_marks": [
                     mark.model_dump(mode="json") for mark in result.error_marks
                 ],
+                "error_mark_validation": mark_diagnostics,
                 "valid_error_mark_ids": [mark.mark_id for mark in valid_marks],
                 "rejected_error_mark_ids": rejected_mark_ids,
                 "localization": (

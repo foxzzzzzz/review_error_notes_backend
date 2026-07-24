@@ -1,5 +1,8 @@
 """Celery task for MiniMax multimodal wrong-question recognition."""
 
+import json
+import logging
+
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
@@ -17,6 +20,24 @@ from app.services.vision_recognition import (
     recognize_question_batch,
 )
 from app.tasks.celery_app import celery_app
+
+logger = logging.getLogger(__name__)
+
+
+def log_mark_validation_diagnostics(
+    image_id: str,
+    question_values: list[dict],
+) -> None:
+    diagnostics = (
+        question_values[0]["ocr_raw_json"].get("error_mark_validation", [])
+        if question_values
+        else []
+    )
+    logger.info(
+        "error_mark_validation image_id=%s diagnostics=%s",
+        image_id,
+        json.dumps(diagnostics, ensure_ascii=False, separators=(",", ":")),
+    )
 
 
 @celery_app.task(bind=True)
@@ -68,6 +89,7 @@ def process_image(self, image_id: str, filepath: str):
                 contradiction_similarity_threshold=settings.LOCAL_OCR_CONTRADICTION_SIMILARITY_THRESHOLD,
             ),
         )
+        log_mark_validation_diagnostics(image_id, question_values)
 
         with Session(engine) as db:
             image = db.scalar(
