@@ -60,3 +60,14 @@ def test_initial_schema_contains_account_identity_and_mastery_fields():
     assert '"review_status",' in source
     assert '"mastery_status",' in source
     assert '"uq_wechat_identity_appid_openid"' in source
+
+
+def test_runtime_processes_leave_schema_management_to_alembic():
+    for runtime_file in (
+        ROOT / "app" / "main.py",
+        ROOT / "app" / "tasks" / "process_image.py",
+    ):
+        source = runtime_file.read_text(encoding="utf-8")
+        assert "create_all" not in source, (
+            f"{runtime_file.relative_to(ROOT)} must not create database tables at runtime"
+        )

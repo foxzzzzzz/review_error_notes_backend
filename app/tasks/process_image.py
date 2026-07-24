@@ -47,9 +47,6 @@ def process_image(self, image_id: str, filepath: str):
     sync_url = settings.DATABASE_URL.replace("+asyncpg", "")
     engine = create_engine(sync_url)
 
-    from app.models import Base
-    Base.metadata.create_all(engine, checkfirst=True)
-
     claimed = False
     try:
         with Session(engine) as db:

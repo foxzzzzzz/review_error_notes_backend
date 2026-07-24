@@ -11,7 +11,7 @@ from app.models.student import Student
 from app.utils.jwt import verify_token
 
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
 @dataclass(frozen=True)
@@ -21,9 +21,14 @@ class AccountContext:
 
 
 async def get_current_account(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: AsyncSession = Depends(get_db),
 ) -> AccountContext:
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
     claims = verify_token(credentials.credentials)
     if claims is None:
         raise HTTPException(

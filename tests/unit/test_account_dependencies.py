@@ -71,6 +71,20 @@ def test_current_account_rejects_stale_token_version(monkeypatch):
     assert exc_info.value.status_code == 401
 
 
+def test_current_account_rejects_missing_credentials_with_401():
+    from app.api import deps
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            deps.get_current_account(
+                credentials=None,
+                db=ResultDB(),
+            )
+        )
+
+    assert exc_info.value.status_code == 401
+
+
 def test_current_account_returns_active_account_context(monkeypatch):
     from app.api import deps
     from app.utils.jwt import TokenClaims

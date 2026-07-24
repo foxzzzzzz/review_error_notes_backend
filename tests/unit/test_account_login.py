@@ -18,8 +18,12 @@ class LoginDB:
         self.results = list(results)
         self.added = []
         self.flush_calls = 0
+        self.queries = []
 
-    async def execute(self, _query):
+    async def execute(self, query, *_args, **_kwargs):
+        self.queries.append(query)
+        if "pg_advisory_xact_lock" in str(query):
+            return ScalarResult(None)
         return ScalarResult(self.results.pop(0))
 
     def add_all(self, values):
@@ -131,6 +135,22 @@ def test_existing_identity_returns_same_account_and_default_student():
     assert result_account is account
     assert result_student is student
     assert identity.last_login_at is not None
+
+
+def test_login_serializes_the_same_wechat_identity_before_lookup():
+    from app.services.account_login import login_with_identity
+
+    db = LoginDB([None])
+    asyncio.run(
+        login_with_identity(
+            db,
+            appid="app-id",
+            openid="openid-1",
+        )
+    )
+
+    assert "pg_advisory_xact_lock" in str(db.queries[0])
+    assert "wechat_identities" in str(db.queries[1])
 
 
 def test_versioned_jwt_round_trip_and_rejects_legacy_token(monkeypatch):

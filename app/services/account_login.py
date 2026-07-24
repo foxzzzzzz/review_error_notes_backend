@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.models.account import Account
 from app.models.student import Student
@@ -17,6 +17,10 @@ async def login_with_identity(
     openid: str,
     unionid: str | None = None,
 ) -> tuple[Account, Student, bool]:
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:identity_key, 0))"),
+        {"identity_key": f"{len(appid)}:{appid}{openid}"},
+    )
     result = await db.execute(
         select(WeChatIdentity).where(
             WeChatIdentity.appid == appid,
@@ -29,7 +33,9 @@ async def login_with_identity(
     if identity is not None:
         identity.last_login_at = now
         account_result = await db.execute(
-            select(Account).where(Account.id == identity.account_id)
+            select(Account)
+            .where(Account.id == identity.account_id)
+            .with_for_update()
         )
         account = account_result.scalar_one_or_none()
         student_result = await db.execute(

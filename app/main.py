@@ -5,8 +5,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from app.api.router import api_router
 from app.config import settings
-from app.database import engine
-from app.models import Base
 
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 os.makedirs(settings.PDF_DIR, exist_ok=True)
@@ -22,14 +20,6 @@ app.add_middleware(
 app.include_router(api_router, prefix="/api")
 app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
 app.mount("/pdfs", StaticFiles(directory=settings.PDF_DIR), name="pdfs")
-
-
-@app.on_event("startup")
-async def startup():
-    """DEV_MODE: auto-create tables (skip Alembic for quick iteration)"""
-    if settings.DEV_MODE:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
 
 
 @app.get("/health")
