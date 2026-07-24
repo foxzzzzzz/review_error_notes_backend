@@ -10,7 +10,11 @@ class TestDevLogin:
         assert resp.status_code == 200
         data = resp.json()
         assert "token" in data
-        assert data["need_phone"] is True
+        assert data["is_new_account"] is True
+        assert data["profile_prompt_required"] is True
+        assert data["student_profile_required"] is True
+        assert data["account_status"] == "active"
+        assert "account_id" in data
         assert "student_id" in data
 
     def test_dev_login_returns_existing_user(self, client):
@@ -18,12 +22,15 @@ class TestDevLogin:
         openid = "test_repeat_user"
         r1 = client.post("/api/auth/dev-login", json={"code": openid})
         assert r1.status_code == 200
-        id1 = r1.json()["student_id"]
+        account_id_1 = r1.json()["account_id"]
+        student_id_1 = r1.json()["student_id"]
 
         r2 = client.post("/api/auth/dev-login", json={"code": openid})
         assert r2.status_code == 200
-        id2 = r2.json()["student_id"]
-        assert id1 == id2
+        account_id_2 = r2.json()["account_id"]
+        student_id_2 = r2.json()["student_id"]
+        assert account_id_1 == account_id_2
+        assert student_id_1 == student_id_2
 
     def test_dev_login_requires_code(self, client):
         resp = client.post("/api/auth/dev-login", json={"code": ""})
@@ -47,13 +54,13 @@ class TestTokenAuth:
 
 
 class TestBindPhone:
-    """Phone number binding."""
+    """Phone binding is introduced in the dedicated profile phase."""
 
-    def test_bind_phone(self, client, auth_header):
+    def test_bind_phone_is_not_available_in_phase_one(self, client, auth_header):
         resp = client.post(
             "/api/auth/bind-phone",
-            json={"encrypted_data": "13800138000", "iv": "test_iv"},
+            json={"code": "wechat-phone-code"},
             headers=auth_header,
         )
-        assert resp.status_code == 200
-        assert resp.json() == {"ok": True}
+        assert resp.status_code == 501
+        assert resp.json()["detail"]["code"] == "phone_binding_unavailable"

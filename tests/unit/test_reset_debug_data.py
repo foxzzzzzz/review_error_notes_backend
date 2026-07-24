@@ -1,3 +1,6 @@
+import pytest
+
+
 class FakeSession:
     def __init__(self):
         self.deleted_tables = []
@@ -10,21 +13,47 @@ class FakeSession:
         self.commits += 1
 
 
-def test_reset_business_records_preserves_students():
-    from app.maintenance.reset_debug_data import reset_business_records
+def test_full_reset_removes_business_and_account_records_in_fk_order():
+    from app.maintenance.reset_debug_data import reset_all_test_records
 
     session = FakeSession()
-
-    reset_business_records(session)
+    reset_all_test_records(session)
 
     assert session.deleted_tables == [
         "sheet_items",
         "practice_sheets",
         "wrong_questions",
         "wrong_images",
+        "students",
+        "wechat_identities",
+        "accounts",
     ]
-    assert "students" not in session.deleted_tables
     assert session.commits == 1
+
+
+@pytest.mark.parametrize("app_env", ["production", "staging", ""])
+def test_full_reset_requires_test_environment(app_env):
+    from app.maintenance.reset_debug_data import assert_reset_allowed
+
+    with pytest.raises(RuntimeError, match="test environment"):
+        assert_reset_allowed(
+            app_env,
+            "RESET_ALL_TEST_DATA",
+            "RESET_ALL_TEST_DATA",
+        )
+
+
+def test_full_reset_requires_exact_confirmation():
+    from app.maintenance.reset_debug_data import assert_reset_allowed
+
+    with pytest.raises(ValueError, match="confirmation phrase"):
+        assert_reset_allowed("development", "yes", "RESET_ALL_TEST_DATA")
+
+    assert_reset_allowed(
+        "test",
+        "RESET_ALL_TEST_DATA",
+        "RESET_ALL_TEST_DATA",
+    )
 
 
 def test_clear_storage_files_only_removes_files_in_target_directory(tmp_path):
@@ -44,24 +73,24 @@ def test_clear_storage_files_only_removes_files_in_target_directory(tmp_path):
     assert (nested / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
-def test_clear_storage_files_rejects_an_unexpected_directory(tmp_path):
-    import pytest
+@pytest.mark.parametrize("safe_name", ["uploads", "pdfs", "avatars"])
+def test_clear_storage_files_accepts_only_named_storage_roots(tmp_path, safe_name):
+    from app.maintenance.reset_debug_data import clear_storage_files
 
+    storage = tmp_path / safe_name
+    storage.mkdir()
+
+    assert clear_storage_files(str(storage)) == 0
+
+
+def test_clear_storage_files_rejects_an_unexpected_directory(tmp_path):
     from app.maintenance.reset_debug_data import clear_storage_files
 
     unsafe = tmp_path / "application"
     unsafe.mkdir()
     (unsafe / "keep.env").write_text("keep", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="uploads or pdfs"):
+    with pytest.raises(ValueError, match="uploads, pdfs, or avatars"):
         clear_storage_files(str(unsafe))
 
     assert (unsafe / "keep.env").read_text(encoding="utf-8") == "keep"
-
-
-def test_confirmation_must_match_configured_phrase():
-    from app.maintenance.reset_debug_data import confirmation_matches
-
-    assert confirmation_matches("CLEAR_DEBUG_BUSINESS_DATA", "CLEAR_DEBUG_BUSINESS_DATA")
-    assert not confirmation_matches("yes", "CLEAR_DEBUG_BUSINESS_DATA")
-    assert not confirmation_matches("", "CLEAR_DEBUG_BUSINESS_DATA")

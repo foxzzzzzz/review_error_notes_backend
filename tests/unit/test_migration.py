@@ -5,6 +5,8 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 VERSIONS = ROOT / "alembic" / "versions"
 EXPECTED_TABLES = {
+    "accounts",
+    "wechat_identities",
     "students",
     "wrong_images",
     "wrong_questions",
@@ -37,5 +39,24 @@ def test_initial_revision_creates_and_drops_every_model_table():
 def test_alembic_environment_imports_every_model_module():
     source = (ROOT / "alembic" / "env.py").read_text(encoding="utf-8")
 
-    for module in ("student", "wrong_image", "wrong_question", "practice_sheet", "sheet_item"):
+    for module in (
+        "account",
+        "wechat_identity",
+        "student",
+        "wrong_image",
+        "wrong_question",
+        "practice_sheet",
+        "sheet_item",
+    ):
         assert f"app.models.{module}" in source
+
+
+def test_initial_schema_contains_account_identity_and_mastery_fields():
+    source = (VERSIONS / "0001_initial_schema.py").read_text(encoding="utf-8")
+
+    assert 'op.create_table(\n        "accounts"' in source
+    assert 'op.create_table(\n        "wechat_identities"' in source
+    assert 'sa.Column("account_id"' in source
+    assert '"review_status",' in source
+    assert '"mastery_status",' in source
+    assert '"uq_wechat_identity_appid_openid"' in source

@@ -25,7 +25,7 @@ def test_question_image_route_filters_by_question_and_current_student():
     source = _source()
 
     assert "WrongQuestion.id == question_id" in source
-    assert "WrongQuestion.student_id == student_id" in source
+    assert "WrongQuestion.student_id == student.id" in source
     assert ".join(WrongImage, WrongImage.id == WrongQuestion.image_id)" in source
 
 

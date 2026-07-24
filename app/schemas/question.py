@@ -18,7 +18,8 @@ class QuestionOut(BaseModel):
     tags: list[str]
     difficulty: Optional[int]
     wrong_count: int
-    status: str
+    review_status: str
+    mastery_status: str
     created_at: datetime
 
     class Config:
@@ -30,4 +31,4 @@ class QuestionUpdate(BaseModel):
     question_type: Optional[str] = None
     tags: Optional[list[str]] = None
     difficulty: Optional[int] = None
-    status: Optional[str] = None
+    review_status: Optional[str] = None

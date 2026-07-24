@@ -140,7 +140,7 @@ def test_question_values_preserve_raw_writing_and_normalized_content():
         "index": 0,
     }
     assert values["tags"] == ["拼音", "老师批改"]
-    assert values["status"] == "confirmed"
+    assert values["review_status"] == "confirmed"
 
 
 def test_low_confidence_localization_discards_candidate_bbox():
@@ -171,7 +171,7 @@ def test_low_confidence_localization_discards_candidate_bbox():
         "localization_status": "needs_review",
         "index": 1,
     }
-    assert values["status"] == "needs_review"
+    assert values["review_status"] == "needs_review"
 
 
 def test_low_confidence_item_requires_review():
@@ -188,7 +188,7 @@ def test_low_confidence_item_requires_review():
         normalized_tags=["拼音"],
     )
 
-    assert values["status"] == "needs_review"
+    assert values["review_status"] == "needs_review"
 
 
 def test_uncertain_segments_require_review_even_with_high_confidence():
@@ -205,7 +205,7 @@ def test_uncertain_segments_require_review_even_with_high_confidence():
         normalized_tags=["拼音"],
     )
 
-    assert values["status"] == "needs_review"
+    assert values["review_status"] == "needs_review"
 
 
 def test_unmatched_localization_discards_bbox_even_with_high_confidence():
@@ -232,7 +232,7 @@ def test_unmatched_localization_discards_bbox_even_with_high_confidence():
     )
 
     assert "bbox" not in values["crop_region"]
-    assert values["status"] == "needs_review"
+    assert values["review_status"] == "needs_review"
 
 
 def test_localization_missing_assigned_mark_discards_bbox():
@@ -259,7 +259,7 @@ def test_localization_missing_assigned_mark_discards_bbox():
     )
 
     assert "bbox" not in values["crop_region"]
-    assert values["status"] == "needs_review"
+    assert values["review_status"] == "needs_review"
 
 
 def test_localization_with_mismatched_observed_content_discards_bbox():
@@ -286,14 +286,19 @@ def test_localization_with_mismatched_observed_content_discards_bbox():
     )
 
     assert "bbox" not in values["crop_region"]
-    assert values["status"] == "needs_review"
+    assert values["review_status"] == "needs_review"
 
 
 def test_image_status_requires_review_when_any_question_does():
     from app.services.vision_recognition import image_status_for
 
-    assert image_status_for([{"status": "confirmed"}, {"status": "needs_review"}]) == "needs_review"
-    assert image_status_for([{"status": "confirmed"}]) == "confirmed"
+    assert image_status_for(
+        [
+            {"review_status": "confirmed"},
+            {"review_status": "needs_review"},
+        ]
+    ) == "needs_review"
+    assert image_status_for([{"review_status": "confirmed"}]) == "confirmed"
 
 
 def test_task_claims_image_before_remote_call_and_resets_failed_claim():

@@ -140,6 +140,45 @@ WHERE id = '<question_id>'
 
 部署后至少验证：已出卷题目可软删除且历史错题集/PDF 仍可查看；删除题目不能通过列表、详情、图片或新出卷访问；`/api/questions/{question_id}/image` 已出现在 OpenAPI；有文件的图片能读取，缺失文件由接口返回 404，且小程序显示“原图文件不存在，请重新录入”。
 
+### 测试环境全量初始化
+
+当前数据库仅用于联调，不保留旧结构或测试数据。执行前必须确认当前目录、
+Compose 项目名和卷列表；生产环境禁止运行。
+
+```bash
+# 1. 拉取代码后先检查目标
+pwd
+git rev-parse --short HEAD
+docker compose ps
+docker volume ls | grep review_error_notes
+
+# 2. 经人工确认后，停止服务并删除当前 Compose 项目的数据库/文件卷
+docker compose down -v
+
+# 3. 重建镜像并初始化全新数据库
+docker compose build api worker beat
+docker compose up -d db redis
+docker compose run --rm api alembic upgrade head
+
+# 4. 启动应用并验证
+docker compose up -d api worker beat
+curl http://localhost:8000/health
+docker compose logs --tail=100 api worker beat
+```
+
+若只需清空当前测试环境的数据而不删除卷，可在确认
+`APP_ENV=development` 或 `APP_ENV=test` 后执行：
+
+```bash
+docker compose run --rm api \
+  python -m app.maintenance.reset_debug_data \
+  --confirm RESET_ALL_TEST_DATA
+```
+
+该命令会删除账户、微信身份、学生、错题、图片记录和错题集记录，并清理
+`uploads`、`pdfs`、`avatars` 中的文件。确认口令由
+`DEBUG_DATA_RESET_CONFIRMATION_PHRASE` 配置；其他环境或错误口令会直接拒绝。
+
 ### 服务端口
 
 | 服务 | 端口 | 用途 |

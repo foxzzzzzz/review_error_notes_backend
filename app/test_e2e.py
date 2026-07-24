@@ -60,7 +60,7 @@ async def main():
         elapsed = (i + 1) * 3
         print(f"  +{elapsed:2d}s | image_status={img.status} q_count={img.question_count} | questions={len(qs)}")
         for q in qs:
-            print(f"         q={str(q.id)[:8]} status={q.status} ocr={(q.ocr_text or '')[:50]} tags={q.tags} diff={q.difficulty}")
+            print(f"         q={str(q.id)[:8]} status={q.review_status} ocr={(q.ocr_text or '')[:50]} tags={q.tags} diff={q.difficulty}")
         if img.status == "confirmed" and len(qs) > 0:
             break
     else:
@@ -69,7 +69,7 @@ async def main():
     # ── Final check ──
     print("\n=== Final ===")
     img, qs = await db_status()
-    confirmed = [q for q in qs if q.status == "confirmed"]
+    confirmed = [q for q in qs if q.review_status == "confirmed"]
     print(f"  Image: status={img.status} q_count={img.question_count}")
     print(f"  Questions: total={len(qs)} confirmed={len(confirmed)}")
 

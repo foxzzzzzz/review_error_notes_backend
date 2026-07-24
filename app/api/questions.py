@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.config import settings
 from app.database import get_db
-from app.api.deps import get_current_student
+from app.api.deps import get_default_student
+from app.models.student import Student
 from app.models.wrong_question import WrongQuestion
 from app.models.wrong_image import WrongImage
 from app.schemas.question import QuestionOut, QuestionUpdate
@@ -36,11 +37,11 @@ async def list_questions(
     limit: int = Query(20, le=100),
     offset: int = 0,
     created_from: datetime = None,
-    student_id: str = Depends(get_current_student),
+    student: Student = Depends(get_default_student),
     db: AsyncSession = Depends(get_db),
 ):
     q = select(WrongQuestion).where(
-        WrongQuestion.student_id == student_id,
+        WrongQuestion.student_id == student.id,
         WrongQuestion.deleted_at.is_(None),
     )
     if subject:
@@ -50,7 +51,7 @@ async def list_questions(
     if semester:
         q = q.where(WrongQuestion.semester == semester)
     if status:
-        q = q.where(WrongQuestion.status == status)
+        q = q.where(WrongQuestion.review_status == status)
     if tag:
         q = q.where(WrongQuestion.tags.any(tag))
     if created_from:
@@ -61,13 +62,17 @@ async def list_questions(
 
 
 @router.get("/{question_id}", response_model=QuestionOut)
-async def get_question(question_id: str, student_id=Depends(get_current_student), db=Depends(get_db)):
+async def get_question(
+    question_id: str,
+    student: Student = Depends(get_default_student),
+    db=Depends(get_db),
+):
     result = await db.execute(
         select(WrongQuestion, WrongImage)
         .join(WrongImage, WrongImage.id == WrongQuestion.image_id)
         .where(
             WrongQuestion.id == question_id,
-            WrongQuestion.student_id == student_id,
+            WrongQuestion.student_id == student.id,
             WrongQuestion.deleted_at.is_(None),
         )
     )
@@ -87,7 +92,7 @@ async def get_question(question_id: str, student_id=Depends(get_current_student)
 async def get_question_image(
     question_id: str,
     view: Literal["crop", "original"] = "crop",
-    student_id=Depends(get_current_student),
+    student: Student = Depends(get_default_student),
     db=Depends(get_db),
 ):
     result = await db.execute(
@@ -95,7 +100,7 @@ async def get_question_image(
         .join(WrongImage, WrongImage.id == WrongQuestion.image_id)
         .where(
             WrongQuestion.id == question_id,
-            WrongQuestion.student_id == student_id,
+            WrongQuestion.student_id == student.id,
             WrongQuestion.deleted_at.is_(None),
         )
     )
@@ -125,20 +130,20 @@ async def get_question_image(
 async def update_question(
     question_id: str,
     data: QuestionUpdate,
-    student_id=Depends(get_current_student),
+    student: Student = Depends(get_default_student),
     db=Depends(get_db),
 ):
     result = await db.execute(
         select(WrongQuestion).where(
             WrongQuestion.id == question_id,
-            WrongQuestion.student_id == student_id,
+            WrongQuestion.student_id == student.id,
             WrongQuestion.deleted_at.is_(None),
         )
     )
     q = result.scalar_one_or_none()
     if not q:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
-    was_needs_review = q.status == "needs_review"
+    was_needs_review = q.review_status == "needs_review"
     image = None
     if was_needs_review:
         image = await db.scalar(
@@ -149,13 +154,13 @@ async def update_question(
     for k, v in data.model_dump(exclude_unset=True).items():
         setattr(q, k, v)
     if was_needs_review:
-        q.status = "confirmed"
+        q.review_status = "confirmed"
         await db.flush()
         remaining_review = await db.scalar(
             select(WrongQuestion.id)
             .where(
                 WrongQuestion.image_id == q.image_id,
-                WrongQuestion.status == "needs_review",
+                WrongQuestion.review_status == "needs_review",
                 WrongQuestion.deleted_at.is_(None),
             )
             .limit(1)
@@ -167,11 +172,15 @@ async def update_question(
 
 
 @router.delete("/{question_id}")
-async def delete_question(question_id: str, student_id=Depends(get_current_student), db=Depends(get_db)):
+async def delete_question(
+    question_id: str,
+    student: Student = Depends(get_default_student),
+    db=Depends(get_db),
+):
     result = await db.execute(
         select(WrongQuestion).where(
             WrongQuestion.id == question_id,
-            WrongQuestion.student_id == student_id,
+            WrongQuestion.student_id == student.id,
         )
     )
     q = result.scalar_one_or_none()

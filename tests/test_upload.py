@@ -26,6 +26,7 @@ class TestUploadImage:
         resp = client.post(
             "/api/upload/image",
             files={"file": (test_image.name, test_image, "image/jpeg")},
+            data={"grade": "1", "semester": "1"},
             headers=auth_header,
         )
         assert resp.status_code == 200
@@ -41,6 +42,7 @@ class TestUploadImage:
         resp = client.post(
             "/api/upload/image",
             files={"file": (test_image.name, test_image, "image/jpeg")},
+            data={"grade": "1", "semester": "1"},
             headers=auth_header,
         )
         assert resp.status_code == 200

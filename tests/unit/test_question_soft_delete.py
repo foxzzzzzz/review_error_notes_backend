@@ -89,7 +89,7 @@ def test_list_questions_excludes_soft_deleted_records():
             limit=20,
             offset=0,
             created_from=None,
-            student_id="student-id",
+            student=SimpleNamespace(id="student-id"),
             db=db,
         )
     )
@@ -109,7 +109,7 @@ def test_question_endpoints_exclude_soft_deleted_records(endpoint, args):
     db = CapturingDB()
 
     with pytest.raises(HTTPException):
-        asyncio.run(endpoint(*args, student_id="student-id", db=db))
+        asyncio.run(endpoint(*args, student=SimpleNamespace(id="student-id"), db=db))
 
     assert "wrong_questions.deleted_at IS NULL" in _compiled_sql(db.queries[0])
 
@@ -118,8 +118,6 @@ def test_create_sheet_rejects_soft_deleted_questions():
     class SheetDB(CapturingDB):
         async def execute(self, query):
             self.queries.append(query)
-            if len(self.queries) == 1:
-                return SimpleNamespace(scalar_one=lambda: SimpleNamespace(nickname="student"))
             return EmptyRows()
 
     db = SheetDB()
@@ -128,12 +126,12 @@ def test_create_sheet_rejects_soft_deleted_questions():
         asyncio.run(
             create_sheet(
                 SheetCreate(question_ids=["question-id"]),
-                student_id="student-id",
+                student=SimpleNamespace(id="student-id", display_name="student"),
                 db=db,
             )
         )
 
-    assert "wrong_questions.deleted_at IS NULL" in _compiled_sql(db.queries[1])
+    assert "wrong_questions.deleted_at IS NULL" in _compiled_sql(db.queries[0])
 
 
 class DeletionDB:
@@ -160,7 +158,13 @@ def test_delete_question_marks_record_deleted_instead_of_deleting_row():
     question_id = str(uuid4())
     student_id = str(uuid4())
 
-    asyncio.run(delete_question(question_id, student_id=student_id, db=db))
+    asyncio.run(
+        delete_question(
+            question_id,
+            student=SimpleNamespace(id=student_id),
+            db=db,
+        )
+    )
 
     assert isinstance(question.deleted_at, datetime)
     assert question.deleted_at.tzinfo is None
@@ -178,7 +182,13 @@ def test_delete_question_returns_404_when_no_owned_question_is_found():
     db = DeletionDB(None)
 
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(delete_question(str(uuid4()), student_id=str(uuid4()), db=db))
+        asyncio.run(
+            delete_question(
+                str(uuid4()),
+                student=SimpleNamespace(id=str(uuid4())),
+                db=db,
+            )
+        )
 
     assert exc_info.value.status_code == 404
     assert db.commit_calls == 0
@@ -189,14 +199,24 @@ def test_repeated_delete_keeps_existing_soft_delete_timestamp_and_succeeds():
     question = SimpleNamespace(deleted_at=deleted_at)
     db = DeletionDB(question)
 
-    assert asyncio.run(delete_question("question-id", student_id="student-id", db=db)) == {"ok": True}
+    assert asyncio.run(
+        delete_question(
+            "question-id",
+            student=SimpleNamespace(id="student-id"),
+            db=db,
+        )
+    ) == {"ok": True}
     assert question.deleted_at == deleted_at
     assert db.delete_calls == 0
     assert db.commit_calls == 1
 
 
 def test_confirming_reviewed_question_ignores_soft_deleted_siblings():
-    question = SimpleNamespace(status="needs_review", image_id=str(uuid4()), difficulty=None)
+    question = SimpleNamespace(
+        review_status="needs_review",
+        image_id=str(uuid4()),
+        difficulty=None,
+    )
     image = SimpleNamespace(status="needs_review")
 
     class ReviewUpdateDB:
@@ -224,7 +244,7 @@ def test_confirming_reviewed_question_ignores_soft_deleted_siblings():
         update_question(
             str(uuid4()),
             QuestionUpdate(difficulty=2),
-            student_id=str(uuid4()),
+            student=SimpleNamespace(id=str(uuid4())),
             db=db,
         )
     )

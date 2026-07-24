@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 # Register the complete SQLAlchemy foreign-key graph before sync-session flushes.
+from app.models.account import Account
 from app.models.practice_sheet import PracticeSheet  # noqa: F401
 from app.models.sheet_item import SheetItem  # noqa: F401
 from app.models.student import Student  # noqa: F401
@@ -54,7 +55,10 @@ def process_image(self, image_id: str, filepath: str):
         with Session(engine) as db:
             image = db.scalar(
                 select(WrongImage)
+                .join(Student, Student.id == WrongImage.student_id)
+                .join(Account, Account.id == Student.account_id)
                 .where(WrongImage.id == image_id)
+                .where(Account.status == "active")
                 .with_for_update()
             )
             if not image or image.status != "pending":
@@ -95,7 +99,10 @@ def process_image(self, image_id: str, filepath: str):
         with Session(engine) as db:
             image = db.scalar(
                 select(WrongImage)
+                .join(Student, Student.id == WrongImage.student_id)
+                .join(Account, Account.id == Student.account_id)
                 .where(WrongImage.id == image_id)
+                .where(Account.status == "active")
                 .with_for_update()
             )
             if not image or image.status != "segmented":

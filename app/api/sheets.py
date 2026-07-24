@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_student
+from app.api.deps import get_default_student
 from app.config import settings
 from app.database import get_db
 from app.models.practice_sheet import PracticeSheet
@@ -28,7 +28,7 @@ router = APIRouter(prefix="/sheets", tags=["sheets"])
 @router.post("", response_model=SheetOut)
 async def create_sheet(
     data: SheetCreate,
-    student_id: str = Depends(get_current_student),
+    student: Student = Depends(get_default_student),
     db: AsyncSession = Depends(get_db),
 ):
     if not data.question_ids:
@@ -36,12 +36,10 @@ async def create_sheet(
     if len(set(data.question_ids)) != len(data.question_ids):
         raise HTTPException(status_code=400, detail="Duplicate question IDs are not allowed")
 
-    student_result = await db.execute(select(Student).where(Student.id == student_id))
-    student = student_result.scalar_one()
     question_result = await db.execute(
         select(WrongQuestion).where(
             WrongQuestion.id.in_(data.question_ids),
-            WrongQuestion.student_id == student_id,
+            WrongQuestion.student_id == student.id,
             WrongQuestion.deleted_at.is_(None),
         )
     )
@@ -96,7 +94,7 @@ async def create_sheet(
 
     subject = questions[0].subject or "math"
     sheet = PracticeSheet(
-        student_id=student_id,
+        student_id=student.id,
         title=data.title,
         config_json=data.model_dump(),
     )
@@ -135,7 +133,7 @@ async def create_sheet(
 
         await db.flush()
         pdf_url = generate_sheet_pdf(
-            student_name=student.nickname or "学生",
+            student_name=student.display_name or "学生",
             subject=subject,
             title=data.title,
             groups=groups,
@@ -154,12 +152,12 @@ async def create_sheet(
 
 @router.get("", response_model=list[SheetOut])
 async def list_sheets(
-    student_id: str = Depends(get_current_student),
+    student: Student = Depends(get_default_student),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
         select(PracticeSheet)
-        .where(PracticeSheet.student_id == student_id)
+        .where(PracticeSheet.student_id == student.id)
         .order_by(PracticeSheet.created_at.desc())
         .limit(20)
     )

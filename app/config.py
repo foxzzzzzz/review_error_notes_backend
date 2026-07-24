@@ -59,9 +59,13 @@ class Settings(BaseSettings):
     )
     UPLOAD_DIR: str = "./uploads"
     PDF_DIR: str = "./pdfs"
+    AVATAR_DIR: str = "./avatars"
     WECHAT_APP_ID: str = ""
     WECHAT_APP_SECRET: str = ""
     DEV_MODE: bool = False
+    APP_ENV: str = "development"
+    DEV_LOGIN_IDENTITY: str = "dev-local-account"
+    DEV_LOGIN_ALLOWED_ENVIRONMENT: str = "development"
 
     class Config:
         env_file = ".env"

@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -22,11 +23,15 @@ def test_wechat_phone_flow_uses_stable_token_and_returns_verified_number():
         requests.append(request)
         if request.url.path == "/cgi-bin/stable_token":
             assert request.method == "POST"
-            assert request.content == b'{"grant_type":"client_credential","appid":"app-id","secret":"app-secret"}'
+            assert json.loads(request.content) == {
+                "grant_type": "client_credential",
+                "appid": "app-id",
+                "secret": "app-secret",
+            }
             return httpx.Response(200, json={"access_token": "access-token", "expires_in": 7200})
         assert request.url.path == "/wxa/business/getuserphonenumber"
         assert request.url.params["access_token"] == "access-token"
-        assert request.content == b'{"code":"phone-code"}'
+        assert json.loads(request.content) == {"code": "phone-code"}
         return httpx.Response(200, json={
             "errcode": 0,
             "errmsg": "ok",

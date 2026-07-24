@@ -1,3 +1,6 @@
+from typing import Literal
+from uuid import UUID
+
 from pydantic import BaseModel, Field
 
 
@@ -7,8 +10,12 @@ class LoginRequest(BaseModel):
 
 class LoginResponse(BaseModel):
     token: str
-    need_phone: bool
-    student_id: str
+    account_id: UUID
+    student_id: UUID
+    is_new_account: bool
+    profile_prompt_required: bool
+    student_profile_required: bool
+    account_status: Literal["active", "pending_deletion"]
 
 
 class BindPhoneRequest(BaseModel):

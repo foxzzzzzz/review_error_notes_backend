@@ -4,11 +4,10 @@ from typing import Literal
 from fastapi import APIRouter, UploadFile, File, Form, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
-from app.api.deps import get_current_student
+from app.api.deps import get_default_student
 from app.models.wrong_image import WrongImage
 from app.models.student import Student
 from app.tasks.process_image import process_image
-from sqlalchemy import select
 from app.config import settings
 
 router = APIRouter(prefix="/upload", tags=["upload"])
@@ -20,7 +19,7 @@ async def upload_image(
     subject: Literal["math", "chinese", "english"] | None = Form(None),
     grade: int | None = Form(None, ge=1, le=6),
     semester: int | None = Form(None, ge=1, le=2),
-    student_id: str = Depends(get_current_student),
+    student: Student = Depends(get_default_student),
     db: AsyncSession = Depends(get_db),
 ):
     # 保存文件
@@ -32,12 +31,9 @@ async def upload_image(
         await f.write(await file.read())
 
     # 获取学生默认年级/册别
-    result = await db.execute(select(Student).where(Student.id == student_id))
-    student = result.scalar_one()
-
     # 创建 wrong_image 记录
     image = WrongImage(
-        student_id=student_id,
+        student_id=student.id,
         original_url=f"/uploads/{filename}",
         subject=subject,
         grade=grade or student.grade,

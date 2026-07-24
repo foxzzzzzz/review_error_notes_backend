@@ -23,7 +23,19 @@ class WrongQuestion(Base, TimestampMixin):
     difficulty = Column(SmallInteger, nullable=True)
     wrong_count = Column(Integer, default=1)
     deleted_at = Column(DateTime, nullable=True, index=True)
-    status = Column(
-        ENUM("pending", "ocr_done", "needs_review", "confirmed", "mastered", name="question_status_enum"),
+    review_status = Column(
+        ENUM(
+            "pending",
+            "processing",
+            "needs_review",
+            "confirmed",
+            name="question_review_status_enum",
+        ),
         default="pending"
     )
+    mastery_status = Column(
+        ENUM("learning", "mastered", name="question_mastery_status_enum"),
+        default="learning",
+    )
+    mastered_at = Column(DateTime, nullable=True)
+    last_practiced_at = Column(DateTime, nullable=True)

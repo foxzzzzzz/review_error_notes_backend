@@ -26,9 +26,13 @@ services:
       JWT_SECRET: change-me-in-production
       AES_KEY: change-me-32bytes-secret-key-ok!
       DEV_MODE: "true"
-      DEBUG_DATA_RESET_CONFIRMATION_PHRASE: ${DEBUG_DATA_RESET_CONFIRMATION_PHRASE:-CLEAR_DEBUG_BUSINESS_DATA}
+      APP_ENV: ${APP_ENV:-development}
+      DEV_LOGIN_IDENTITY: ${DEV_LOGIN_IDENTITY:-dev-local-account}
+      DEV_LOGIN_ALLOWED_ENVIRONMENT: ${DEV_LOGIN_ALLOWED_ENVIRONMENT:-development}
+      DEBUG_DATA_RESET_CONFIRMATION_PHRASE: ${DEBUG_DATA_RESET_CONFIRMATION_PHRASE:-RESET_ALL_TEST_DATA}
       UPLOAD_DIR: /app/uploads
       PDF_DIR: /app/pdfs
+      AVATAR_DIR: /app/avatars
       PIP_CACHE_DIR: /root/.cache/pip
     volumes:
       - pip_cache:/root/.cache/pip
@@ -39,6 +43,7 @@ services:
       - ./tests:/app/tests
       - uploads:/app/uploads
       - pdfs:/app/pdfs
+      - avatars:/app/avatars
 
   worker:
     build:
@@ -107,4 +112,5 @@ volumes:
   pgdata:
   uploads:
   pdfs:
+  avatars:
   pip_cache:

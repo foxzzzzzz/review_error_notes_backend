@@ -188,7 +188,7 @@ def test_pipeline_falls_back_without_candidate_bbox_when_localization_fails(tmp_
 
     assert client.localize_calls == 1
     assert all("bbox" not in value["crop_region"] for value in values)
-    assert all(value["status"] == "needs_review" for value in values)
+    assert all(value["review_status"] == "needs_review" for value in values)
 
 
 def test_pipeline_rejects_model_marks_without_local_red_pixels(tmp_path):
@@ -206,7 +206,7 @@ def test_pipeline_rejects_model_marks_without_local_red_pixels(tmp_path):
 
     assert client.localize_calls == 0
     assert all("bbox" not in value["crop_region"] for value in values)
-    assert all(value["status"] == "needs_review" for value in values)
+    assert all(value["review_status"] == "needs_review" for value in values)
 
 
 def test_rejected_mark_does_not_invalidate_question_matched_to_valid_mark(tmp_path):
@@ -254,10 +254,10 @@ def test_rejected_mark_does_not_invalidate_question_matched_to_valid_mark(tmp_pa
 
     assert [mark.mark_id for mark in client.localized_marks] == [0]
     assert values[0]["crop_region"]["bbox"] == [0.15, 0.15, 0.4, 0.45]
-    assert values[0]["status"] == "confirmed"
+    assert values[0]["review_status"] == "confirmed"
     assert verifier.calls == [([0.15, 0.15, 0.4, 0.45], 0)]
     assert "bbox" not in values[1]["crop_region"]
-    assert values[1]["status"] == "needs_review"
+    assert values[1]["review_status"] == "needs_review"
 
 
 def test_empty_mark_ids_use_local_red_evidence_for_trusted_localization(tmp_path):
@@ -302,7 +302,7 @@ def test_empty_mark_ids_use_local_red_evidence_for_trusted_localization(tmp_path
         ocr_verifier=verifier,
     )
 
-    assert values[1]["status"] == "confirmed"
+    assert values[1]["review_status"] == "confirmed"
     assert values[1]["crop_region"]["bbox"] == [0.55, 0.5, 0.8, 0.8]
     assert values[1]["crop_region"]["bbox_source"] == "local_red_verified"
     assert values[1]["crop_region"]["mark_ids"] == []
@@ -349,7 +349,7 @@ def test_empty_mark_ids_without_local_red_evidence_still_need_review(tmp_path):
         client=MissingMarkAndRedClient(),
     )
 
-    assert values[1]["status"] == "needs_review"
+    assert values[1]["review_status"] == "needs_review"
     assert "bbox" not in values[1]["crop_region"]
     diagnostic = values[1]["ocr_raw_json"]["localization_red_validation"]
     assert diagnostic["accepted"] is False
@@ -371,14 +371,14 @@ def test_ocr_contradiction_discards_localized_bbox(tmp_path):
     _result, values = _run_batch(tmp_path, ocr_verifier=verifier)
 
     assert "bbox" not in values[0]["crop_region"]
-    assert values[0]["status"] == "needs_review"
+    assert values[0]["review_status"] == "needs_review"
 
 
 def test_ocr_inconclusive_keeps_otherwise_valid_bbox(tmp_path):
     _result, values = _run_batch(tmp_path, ocr_verifier=FakeOCRVerifier())
 
     assert values[0]["crop_region"]["bbox"] == [0.15, 0.15, 0.4, 0.45]
-    assert values[0]["status"] == "confirmed"
+    assert values[0]["review_status"] == "confirmed"
 
 
 def test_pipeline_expands_display_bbox_but_ocr_uses_localization_bbox(tmp_path):

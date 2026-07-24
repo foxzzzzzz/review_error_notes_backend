@@ -1,12 +1,55 @@
+from dataclasses import dataclass
+
 import httpx
 
 
+JSCODE2SESSION_URL = "https://api.weixin.qq.com/sns/jscode2session"
 STABLE_TOKEN_URL = "https://api.weixin.qq.com/cgi-bin/stable_token"
 PHONE_NUMBER_URL = "https://api.weixin.qq.com/wxa/business/getuserphonenumber"
 
 
 class WeChatAPIError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class WeChatSession:
+    openid: str
+    unionid: str | None = None
+
+
+async def exchange_login_code(
+    code: str,
+    app_id: str,
+    app_secret: str,
+    client: httpx.AsyncClient = None,
+) -> WeChatSession:
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=15)
+
+    try:
+        response = await client.get(
+            JSCODE2SESSION_URL,
+            params={
+                "appid": app_id,
+                "secret": app_secret,
+                "js_code": code,
+                "grant_type": "authorization_code",
+            },
+        )
+        data = _response_json(response, "Unable to complete WeChat login")
+        if data.get("errcode") not in (None, 0) or not data.get("openid"):
+            raise WeChatAPIError("Unable to complete WeChat login")
+        return WeChatSession(
+            openid=data["openid"],
+            unionid=data.get("unionid"),
+        )
+    except httpx.HTTPError as exc:
+        raise WeChatAPIError("Unable to contact WeChat") from exc
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 async def get_phone_number(

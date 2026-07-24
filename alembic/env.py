@@ -7,6 +7,8 @@ from sqlalchemy import pool
 from alembic import context
 
 from app.models import Base
+import app.models.account
+import app.models.wechat_identity
 import app.models.student
 import app.models.wrong_image
 import app.models.wrong_question

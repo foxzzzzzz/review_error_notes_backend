@@ -6,8 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field
 class ProfileOut(BaseModel):
     nickname: Optional[str]
     avatar_url: Optional[str]
-    grade: int
-    semester: int
+    grade: Optional[int]
+    semester: Optional[int]
     phone_bound: bool
     phone_masked: str = ""
 

@@ -54,14 +54,14 @@ def test_list_route_hides_soft_deleted_question_without_postgres():
             )
 
     async def current_student():
-        return str(uuid4())
+        return SimpleNamespace(id=uuid4())
 
     async def get_db():
         yield SoftDeletedOnlyDB()
 
     app = FastAPI()
     app.include_router(question_api.router)
-    app.dependency_overrides[question_api.get_current_student] = current_student
+    app.dependency_overrides[question_api.get_default_student] = current_student
     app.dependency_overrides[question_api.get_db] = get_db
 
     with TestClient(app) as client:
@@ -133,7 +133,7 @@ class TestListQuestions:
                 limit=20,
                 offset=0,
                 created_from=created_from,
-                student_id="student-id",
+                student=SimpleNamespace(id="student-id"),
                 db=db,
             )
         )

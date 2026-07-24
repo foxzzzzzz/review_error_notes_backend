@@ -419,7 +419,7 @@ def build_question_values(
         "question_type": item.question_type,
         "tags": normalized_tags,
         "difficulty": item.difficulty,
-        "status": "needs_review" if needs_review else "confirmed",
+        "review_status": "needs_review" if needs_review else "confirmed",
     }
 
 
@@ -539,7 +539,7 @@ def recognize_question_batch(
                     "localization_status": "needs_review",
                     "index": index,
                 }
-                question_values["status"] = "needs_review"
+                question_values["review_status"] = "needs_review"
 
         question_values["ocr_raw_json"].update(
             {
@@ -564,7 +564,10 @@ def recognize_question_batch(
 
 def image_status_for(question_values: List[dict]) -> str:
     """An image needs review when any recognized item needs review."""
-    if any(values["status"] == "needs_review" for values in question_values):
+    if any(
+        values["review_status"] == "needs_review"
+        for values in question_values
+    ):
         return "needs_review"
     return "confirmed"
 
