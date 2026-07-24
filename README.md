@@ -246,15 +246,15 @@ cd miniprogram
 
 ## API 接口一览
 
-### 多模态识别坐标格式
+### 错题区域定位坐标格式
 
-MiniMax 每个识别项的 `bbox` 使用归一化角点坐标：
+第一阶段只为独立红色错误标记返回 `error_marks[].bbox`，题目内容本身不返回坐标。第二阶段根据整图、题目内容和已验证红标独立返回完整作答单元的 `bbox`，统一使用归一化角点坐标：
 
 ```text
 [left, top, right, bottom]
 ```
 
-坐标必须满足 `0 <= left < right <= 1` 和 `0 <= top < bottom <= 1`。后端不转换该数组，写入 `crop_region.bbox` 时同时记录 `bbox_format: "normalized_ltrb"`。现有业务尚未使用该字段裁图；未来消费者必须根据 `bbox_format` 解释坐标。
+坐标必须满足 `0 <= left < right <= 1` 和 `0 <= top < bottom <= 1`。后端还会校验红色像素、标记归属、标记中心、最大面积和区域内文字证据；RapidOCR 仅在高置信文字明确匹配另一道题时否决坐标。通过验证后写入 `crop_region.bbox` 和 `bbox_format: "normalized_ltrb"`，错题详情使用该坐标裁图。
 
 ### 红色批改标记与错题粒度
 
@@ -319,8 +319,23 @@ student (学生)
 | `MINIMAX_VISION_MAX_RETRIES` | 瞬时错误最大重试次数 | `2` |
 | `MINIMAX_VISION_RETRY_DELAY_SECONDS` | 重试等待秒数 | `1` |
 | `MINIMAX_CONFIDENCE_THRESHOLD` | 自动确认最低置信度 | `0.85` |
+| `MINIMAX_MARK_CONFIDENCE_THRESHOLD` | 红色错误标记最低模型置信度 | `0.85` |
+| `MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD` | 独立二次定位最低置信度 | `0.85` |
+| `MINIMAX_LOCALIZATION_MAX_AREA_RATIO` | 单题 bbox 占整图最大面积比例 | `0.35` |
+| `MARK_RED_PIXEL_MIN_RATIO` | 标记框内最低红色像素比例 | `0.005` |
+| `MARK_RED_PIXEL_EXPANSION_RATIO` | 红色像素检查框向外扩展比例 | `0.08` |
 | `MINIMAX_IMAGE_MAX_EDGE` | 预处理图片最长边像素数 | `2048` |
 | `MINIMAX_IMAGE_JPEG_QUALITY` | 预处理 JPEG 质量 | `90` |
+| `LOCAL_OCR_ENABLED` | 启用 RapidOCR 反证复核 | `true` |
+| `LOCAL_OCR_ENGINE` | RapidOCR 推理引擎 | `onnxruntime` |
+| `LOCAL_OCR_VERSION` | RapidOCR 固定版本 | `3.9.1` |
+| `LOCAL_OCR_MODEL_VERSION` | OCR 模型版本 | `PP-OCRv5` |
+| `LOCAL_OCR_MODEL_TYPE` | OCR 模型规格 | `mobile` |
+| `LOCAL_OCR_MODEL_PATH` | Docker 构建时预下载的模型目录 | `./models/rapidocr` |
+| `LOCAL_OCR_LINE_CONFIDENCE_THRESHOLD` | 参与反证的文本行最低置信度 | `0.85` |
+| `LOCAL_OCR_MIN_EFFECTIVE_CHARACTERS` | 参与反证的最少有效字符数 | `2` |
+| `LOCAL_OCR_SUPPORT_SIMILARITY_THRESHOLD` | OCR 支持当前题目的相似度阈值 | `0.8` |
+| `LOCAL_OCR_CONTRADICTION_SIMILARITY_THRESHOLD` | OCR 明确匹配另一题的否决阈值 | `0.9` |
 | `QUESTION_SOFT_DELETE_RETENTION_DAYS` | 软删除错题和无引用图片在物理清理前的保留天数 | `30` |
 | `QUESTION_CLEANUP_INTERVAL_SECONDS` | Beat 投递周期清理任务的间隔秒数 | `86400` |
 | `QUESTION_CLEANUP_BATCH_SIZE` | Worker 单次清理最多锁定和处理的记录数 | `100` |

@@ -1,4 +1,8 @@
+from PIL import Image, ImageDraw
+
+from app.services.local_ocr_verification import OCRVerification
 from app.services.vision_recognition import (
+    ErrorMark,
     LocalizationItem,
     LocalizationResult,
     VisionItem,
@@ -29,6 +33,16 @@ def _write_tag_config(tmp_path):
     return str(config_path)
 
 
+def _write_source_image(tmp_path):
+    image_path = tmp_path / "question.jpg"
+    image = Image.new("RGB", (400, 300), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((80, 70, 120, 100), fill=(220, 30, 30))
+    draw.rectangle((250, 180, 290, 215), fill=(220, 30, 30))
+    image.save(image_path)
+    return str(image_path)
+
+
 def _vision_result():
     return VisionResult(
         items=[
@@ -44,10 +58,9 @@ def _vision_result():
                 difficulty=2,
                 confidence=0.95,
                 uncertain_segments=[],
-                bbox=[0.48, 0.26, 0.62, 0.36],
             ),
             VisionItem(
-                raw_text="hé zuò",
+                raw_text="合做",
                 instruction="看拼音写词语",
                 prompt_text="hé zuò",
                 normalized_text="合作",
@@ -58,7 +71,20 @@ def _vision_result():
                 difficulty=2,
                 confidence=0.92,
                 uncertain_segments=[],
-                bbox=[0.04, 0.66, 0.25, 0.77],
+            ),
+        ],
+        error_marks=[
+            ErrorMark(
+                mark_id=0,
+                mark_type="circle",
+                bbox=[0.2, 0.23, 0.3, 0.34],
+                confidence=0.96,
+            ),
+            ErrorMark(
+                mark_id=1,
+                mark_type="cross",
+                bbox=[0.62, 0.6, 0.73, 0.72],
+                confidence=0.95,
             ),
         ],
         ignored_text=[],
@@ -70,13 +96,15 @@ class FakeClient:
         self.recognize_calls = 0
         self.localize_calls = 0
         self.localization_error = localization_error
+        self.localized_marks = None
 
     def recognize(self, image_path, subject_hint=None):
         self.recognize_calls += 1
         return _vision_result()
 
-    def localize(self, image_path, items):
+    def localize(self, image_path, items, error_marks):
         self.localize_calls += 1
+        self.localized_marks = error_marks
         if self.localization_error:
             raise VisionRecognitionError("localization failed")
         return LocalizationResult(
@@ -84,55 +112,136 @@ class FakeClient:
                 LocalizationItem(
                     index=0,
                     matched=True,
-                    bbox=[0.45, 0.23, 0.66, 0.4],
+                    mark_ids=[0],
+                    bbox=[0.15, 0.15, 0.4, 0.45],
+                    observed_prompt_text="课文",
+                    observed_raw_text="kè wén",
                     confidence=0.94,
                 ),
                 LocalizationItem(
                     index=1,
                     matched=True,
-                    bbox=[0.02, 0.63, 0.28, 0.8],
+                    mark_ids=[1],
+                    bbox=[0.55, 0.5, 0.8, 0.8],
+                    observed_prompt_text="hé zuò",
+                    observed_raw_text="合做",
                     confidence=0.91,
                 ),
             ]
         )
 
 
-def test_pipeline_recognizes_and_localizes_once_per_image(tmp_path):
+class FakeOCRVerifier:
+    def __init__(self, results=None):
+        self.results = results or {}
+        self.calls = []
+
+    def verify(self, image_path, bbox, target_index, items):
+        self.calls.append((bbox, target_index))
+        return self.results.get(
+            target_index,
+            OCRVerification(status="inconclusive"),
+        )
+
+
+def _run_batch(tmp_path, client=None, ocr_verifier=None):
     from app.services.vision_recognition import recognize_question_batch
 
-    client = FakeClient()
-    result, values = recognize_question_batch(
-        client=client,
-        image_path="question.jpg",
+    return recognize_question_batch(
+        client=client or FakeClient(),
+        image_path=_write_source_image(tmp_path),
         subject_hint="chinese",
         confidence_threshold=0.85,
+        mark_confidence_threshold=0.85,
         localization_threshold=0.85,
-        localization_min_iou=0.1,
+        localization_max_area_ratio=0.35,
+        red_pixel_min_ratio=0.01,
+        red_pixel_expansion_ratio=0.05,
         tag_config_path=_write_tag_config(tmp_path),
+        ocr_verifier=ocr_verifier or FakeOCRVerifier(),
     )
+
+
+def test_pipeline_recognizes_and_localizes_once_per_image(tmp_path):
+    client = FakeClient()
+    result, values = _run_batch(tmp_path, client=client)
 
     assert result.items[0].prompt_text == "课文"
     assert client.recognize_calls == 1
     assert client.localize_calls == 1
+    assert [mark.mark_id for mark in client.localized_marks] == [0, 1]
     assert values[0]["tags"] == ["拼音", "老师批改"]
     assert values[1]["tags"] == ["词语", "错别字"]
-    assert values[0]["crop_region"]["bbox"] == [0.45, 0.23, 0.66, 0.4]
+    assert values[0]["crop_region"]["bbox"] == [0.15, 0.15, 0.4, 0.45]
 
 
 def test_pipeline_falls_back_without_candidate_bbox_when_localization_fails(tmp_path):
-    from app.services.vision_recognition import recognize_question_batch
-
     client = FakeClient(localization_error=True)
-    _result, values = recognize_question_batch(
-        client=client,
-        image_path="question.jpg",
-        subject_hint="chinese",
-        confidence_threshold=0.85,
-        localization_threshold=0.85,
-        localization_min_iou=0.1,
-        tag_config_path=_write_tag_config(tmp_path),
-    )
+    _result, values = _run_batch(tmp_path, client=client)
 
     assert client.localize_calls == 1
     assert all("bbox" not in value["crop_region"] for value in values)
     assert all(value["status"] == "needs_review" for value in values)
+
+
+def test_pipeline_rejects_model_marks_without_local_red_pixels(tmp_path):
+    class InvalidMarkClient(FakeClient):
+        def recognize(self, image_path, subject_hint=None):
+            result = _vision_result()
+            result.error_marks = [
+                mark.model_copy(update={"bbox": [0.8, 0.05, 0.9, 0.15]})
+                for mark in result.error_marks
+            ]
+            return result
+
+    client = InvalidMarkClient()
+    _result, values = _run_batch(tmp_path, client=client)
+
+    assert client.localize_calls == 0
+    assert all("bbox" not in value["crop_region"] for value in values)
+    assert all(value["status"] == "needs_review" for value in values)
+
+
+def test_ocr_contradiction_discards_localized_bbox(tmp_path):
+    verifier = FakeOCRVerifier(
+        {
+            0: OCRVerification(
+                status="contradict",
+                matched_index=1,
+                text_summary="算式",
+                confidence=0.98,
+            )
+        }
+    )
+
+    _result, values = _run_batch(tmp_path, ocr_verifier=verifier)
+
+    assert "bbox" not in values[0]["crop_region"]
+    assert values[0]["status"] == "needs_review"
+
+
+def test_ocr_inconclusive_keeps_otherwise_valid_bbox(tmp_path):
+    _result, values = _run_batch(tmp_path, ocr_verifier=FakeOCRVerifier())
+
+    assert values[0]["crop_region"]["bbox"] == [0.15, 0.15, 0.4, 0.45]
+    assert values[0]["status"] == "confirmed"
+
+
+def test_saved_diagnostics_separate_marks_localization_and_ocr(tmp_path):
+    verifier = FakeOCRVerifier(
+        {
+            0: OCRVerification(
+                status="support",
+                matched_index=0,
+                text_summary="课文",
+                confidence=0.98,
+            )
+        }
+    )
+
+    _result, values = _run_batch(tmp_path, ocr_verifier=verifier)
+
+    raw = values[0]["ocr_raw_json"]
+    assert raw["error_marks"][0]["mark_id"] == 0
+    assert raw["localization"]["mark_ids"] == [0]
+    assert raw["local_ocr"]["status"] == "support"

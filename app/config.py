@@ -17,10 +17,27 @@ class Settings(BaseSettings):
     MINIMAX_VISION_MAX_RETRIES: int = 2
     MINIMAX_VISION_RETRY_DELAY_SECONDS: float = 1
     MINIMAX_CONFIDENCE_THRESHOLD: float = 0.85
+    MINIMAX_MARK_CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0, le=1)
     MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0, le=1)
-    MINIMAX_LOCALIZATION_MIN_IOU: float = Field(default=0.1, ge=0, le=1)
+    MINIMAX_LOCALIZATION_MAX_AREA_RATIO: float = Field(default=0.35, gt=0, le=1)
+    MARK_RED_PIXEL_MIN_RATIO: float = Field(default=0.005, ge=0, le=1)
+    MARK_RED_PIXEL_EXPANSION_RATIO: float = Field(default=0.08, ge=0, le=1)
     MINIMAX_IMAGE_MAX_EDGE: int = 2048
     MINIMAX_IMAGE_JPEG_QUALITY: int = 90
+    LOCAL_OCR_ENABLED: bool = True
+    LOCAL_OCR_ENGINE: str = "onnxruntime"
+    LOCAL_OCR_VERSION: str = "3.9.1"
+    LOCAL_OCR_MODEL_VERSION: str = "PP-OCRv5"
+    LOCAL_OCR_MODEL_TYPE: str = "mobile"
+    LOCAL_OCR_MODEL_PATH: str = "./models/rapidocr"
+    LOCAL_OCR_LINE_CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0, le=1)
+    LOCAL_OCR_MIN_EFFECTIVE_CHARACTERS: int = Field(default=2, ge=1)
+    LOCAL_OCR_SUPPORT_SIMILARITY_THRESHOLD: float = Field(default=0.8, ge=0, le=1)
+    LOCAL_OCR_CONTRADICTION_SIMILARITY_THRESHOLD: float = Field(
+        default=0.9,
+        ge=0,
+        le=1,
+    )
     TAG_ALIAS_CONFIG_PATH: str = "./config/tag-aliases.json"
     DEBUG_DATA_RESET_CONFIRMATION_PHRASE: str = "CLEAR_DEBUG_BUSINESS_DATA"
     QUESTION_IMAGE_MAX_PIXELS: int = 40_000_000

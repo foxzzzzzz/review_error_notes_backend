@@ -14,10 +14,23 @@ def test_worker_receives_every_minimax_setting_without_a_secret_value():
         "MINIMAX_VISION_MAX_RETRIES",
         "MINIMAX_VISION_RETRY_DELAY_SECONDS",
         "MINIMAX_CONFIDENCE_THRESHOLD",
+        "MINIMAX_MARK_CONFIDENCE_THRESHOLD",
         "MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD",
-        "MINIMAX_LOCALIZATION_MIN_IOU",
+        "MINIMAX_LOCALIZATION_MAX_AREA_RATIO",
+        "MARK_RED_PIXEL_MIN_RATIO",
+        "MARK_RED_PIXEL_EXPANSION_RATIO",
         "MINIMAX_IMAGE_MAX_EDGE",
         "MINIMAX_IMAGE_JPEG_QUALITY",
+        "LOCAL_OCR_ENABLED",
+        "LOCAL_OCR_ENGINE",
+        "LOCAL_OCR_VERSION",
+        "LOCAL_OCR_MODEL_VERSION",
+        "LOCAL_OCR_MODEL_TYPE",
+        "LOCAL_OCR_MODEL_PATH",
+        "LOCAL_OCR_LINE_CONFIDENCE_THRESHOLD",
+        "LOCAL_OCR_MIN_EFFECTIVE_CHARACTERS",
+        "LOCAL_OCR_SUPPORT_SIMILARITY_THRESHOLD",
+        "LOCAL_OCR_CONTRADICTION_SIMILARITY_THRESHOLD",
         "TAG_ALIAS_CONFIG_PATH",
     ]
     worker = compose.split("  worker:", 1)[1]
@@ -39,14 +52,22 @@ def test_api_receives_deepseek_settings_for_synchronous_derivative_generation():
     assert "LLM_MODEL: ${LLM_MODEL:-deepseek-v4-pro}" in api
 
 
-def test_paddleocr_is_absent_from_runtime_and_production_task():
+def test_rapidocr_and_onnxruntime_are_pinned_without_paddlepaddle():
     heavy_requirements = (BACKEND_ROOT / "requirements-heavy.txt").read_text(encoding="utf-8").lower()
     task = (BACKEND_ROOT / "app" / "tasks" / "process_image.py").read_text(encoding="utf-8").lower()
 
-    assert "paddle" not in heavy_requirements
+    assert "rapidocr==3.9.1" in heavy_requirements
+    assert "onnxruntime==1.27.0" in heavy_requirements
+    assert "paddlepaddle" not in heavy_requirements
     assert "paddle" not in task
-    assert "recognize_text" not in task
-    assert "segment_questions" not in task
+    assert "rapidocrverifier" in task
+
+
+def test_docker_build_warms_the_configured_ocr_models():
+    dockerfile = (BACKEND_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "LOCAL_OCR_MODEL_PATH" in dockerfile
+    assert "warm_local_ocr_models.py" in dockerfile
 
 
 def test_docker_uses_configurable_tsinghua_debian_mirror_before_apt_update():

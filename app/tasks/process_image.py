@@ -10,6 +10,7 @@ from app.models.sheet_item import SheetItem  # noqa: F401
 from app.models.student import Student  # noqa: F401
 from app.models.wrong_image import WrongImage
 from app.models.wrong_question import WrongQuestion
+from app.services.local_ocr_verification import RapidOCRVerifier
 from app.services.vision_recognition import (
     MiniMaxVisionClient,
     image_status_for,
@@ -47,9 +48,25 @@ def process_image(self, image_id: str, filepath: str):
             image_path=filepath,
             subject_hint=subject_hint,
             confidence_threshold=settings.MINIMAX_CONFIDENCE_THRESHOLD,
+            mark_confidence_threshold=settings.MINIMAX_MARK_CONFIDENCE_THRESHOLD,
             localization_threshold=settings.MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD,
-            localization_min_iou=settings.MINIMAX_LOCALIZATION_MIN_IOU,
+            localization_max_area_ratio=settings.MINIMAX_LOCALIZATION_MAX_AREA_RATIO,
+            red_pixel_min_ratio=settings.MARK_RED_PIXEL_MIN_RATIO,
+            red_pixel_expansion_ratio=settings.MARK_RED_PIXEL_EXPANSION_RATIO,
             tag_config_path=settings.TAG_ALIAS_CONFIG_PATH,
+            ocr_verifier=RapidOCRVerifier(
+                enabled=settings.LOCAL_OCR_ENABLED,
+                library_version=settings.LOCAL_OCR_VERSION,
+                engine_name=settings.LOCAL_OCR_ENGINE,
+                model_version=settings.LOCAL_OCR_MODEL_VERSION,
+                model_type=settings.LOCAL_OCR_MODEL_TYPE,
+                model_path=settings.LOCAL_OCR_MODEL_PATH,
+                max_pixels=settings.QUESTION_IMAGE_MAX_PIXELS,
+                line_confidence_threshold=settings.LOCAL_OCR_LINE_CONFIDENCE_THRESHOLD,
+                min_effective_characters=settings.LOCAL_OCR_MIN_EFFECTIVE_CHARACTERS,
+                support_similarity_threshold=settings.LOCAL_OCR_SUPPORT_SIMILARITY_THRESHOLD,
+                contradiction_similarity_threshold=settings.LOCAL_OCR_CONTRADICTION_SIMILARITY_THRESHOLD,
+            ),
         )
 
         with Session(engine) as db:

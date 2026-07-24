@@ -43,7 +43,7 @@ def _pixel_crop_box(image_size, crop_region):
     return pixel_left, pixel_top, pixel_right, pixel_bottom
 
 
-def render_question_image(image_path, crop_region, view, jpeg_quality, max_pixels):
+def _load_rgb_image(image_path, max_pixels):
     path = Path(image_path)
     if not path.is_file():
         raise QuestionImageNotFound("Question image does not exist")
@@ -52,16 +52,35 @@ def render_question_image(image_path, crop_region, view, jpeg_quality, max_pixel
         with Image.open(path) as source:
             if source.width * source.height > max_pixels:
                 raise QuestionImageInvalid("Question image exceeds the pixel limit")
-            image = ImageOps.exif_transpose(source).convert("RGB")
-            if view == "crop":
-                crop_box = _pixel_crop_box(image.size, crop_region)
-                if crop_box:
-                    image = image.crop(crop_box)
-
-            output = BytesIO()
-            image.save(output, format="JPEG", quality=jpeg_quality)
-            return output.getvalue()
+            return ImageOps.exif_transpose(source).convert("RGB")
     except Image.DecompressionBombError as exc:
         raise QuestionImageInvalid("Question image exceeds the pixel limit") from exc
+    except (OSError, ValueError) as exc:
+        raise QuestionImageInvalid("Question image is invalid") from exc
+
+
+def load_cropped_rgb_image(image_path, bbox, max_pixels):
+    """Load the exact normalized crop used by the question image endpoint."""
+    image = _load_rgb_image(image_path, max_pixels)
+    crop_box = _pixel_crop_box(
+        image.size,
+        {"bbox": bbox, "bbox_format": "normalized_ltrb"},
+    )
+    if crop_box is None:
+        raise QuestionImageInvalid("Question crop bbox is invalid")
+    return image.crop(crop_box)
+
+
+def render_question_image(image_path, crop_region, view, jpeg_quality, max_pixels):
+    image = _load_rgb_image(image_path, max_pixels)
+    if view == "crop":
+        crop_box = _pixel_crop_box(image.size, crop_region)
+        if crop_box:
+            image = image.crop(crop_box)
+
+    try:
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=jpeg_quality)
+        return output.getvalue()
     except (OSError, ValueError) as exc:
         raise QuestionImageInvalid("Question image is invalid") from exc

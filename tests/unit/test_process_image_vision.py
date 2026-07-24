@@ -1,6 +1,4 @@
-import pytest
-
-from app.services.vision_recognition import LocalizationItem, VisionItem
+from app.services.vision_recognition import ErrorMark, LocalizationItem, VisionItem
 
 
 def test_worker_registers_complete_foreign_key_model_graph():
@@ -37,10 +35,18 @@ def _item(**overrides):
         "difficulty": 2,
         "confidence": 0.92,
         "uncertain_segments": [],
-        "bbox": [0.1, 0.2, 0.4, 0.4],
     }
     data.update(overrides)
     return VisionItem(**data)
+
+
+def _mark():
+    return ErrorMark(
+        mark_id=0,
+        mark_type="circle",
+        bbox=[0.2, 0.25, 0.3, 0.35],
+        confidence=0.96,
+    )
 
 
 def test_question_values_preserve_raw_writing_and_normalized_content():
@@ -49,7 +55,10 @@ def test_question_values_preserve_raw_writing_and_normalized_content():
     localization = LocalizationItem(
         index=0,
         matched=True,
+        mark_ids=[0],
         bbox=[0.05, 0.15, 0.45, 0.5],
+        observed_prompt_text="蜻蜓",
+        observed_raw_text="qin tin\n蜻蜓",
         confidence=0.93,
     )
     values = build_question_values(
@@ -58,7 +67,8 @@ def test_question_values_preserve_raw_writing_and_normalized_content():
         confidence_threshold=0.85,
         localization=localization,
         localization_threshold=0.85,
-        localization_min_iou=0.1,
+        localization_max_area_ratio=0.35,
+        marks={0: _mark()},
         normalized_tags=["拼音", "老师批改"],
     )
 
@@ -72,13 +82,14 @@ def test_question_values_preserve_raw_writing_and_normalized_content():
     assert values["ocr_raw_json"]["prompt_text"] == "蜻蜓"
     assert values["ocr_raw_json"]["answer"] == values["ocr_answer"]
     assert values["ocr_raw_json"]["subject"] == "chinese"
-    assert values["ocr_raw_json"]["bbox"] == [0.1, 0.2, 0.4, 0.4]
+    assert "bbox" not in values["ocr_raw_json"]
     assert values["crop_region"] == {
         "bbox": [0.05, 0.15, 0.45, 0.5],
         "bbox_format": "normalized_ltrb",
-        "bbox_source": "minimax_verified",
+        "bbox_source": "minimax_marker_anchored",
         "bbox_confidence": 0.93,
         "localization_status": "verified",
+        "mark_ids": [0],
         "index": 0,
     }
     assert values["tags"] == ["拼音", "老师批改"]
@@ -91,7 +102,10 @@ def test_low_confidence_localization_discards_candidate_bbox():
     localization = LocalizationItem(
         index=1,
         matched=True,
+        mark_ids=[0],
         bbox=[0.0, 0.45, 1.0, 0.88],
+        observed_prompt_text="蜻蜓",
+        observed_raw_text="qin tin\n蜻蜓",
         confidence=0.7,
     )
     values = build_question_values(
@@ -100,7 +114,8 @@ def test_low_confidence_localization_discards_candidate_bbox():
         confidence_threshold=0.85,
         localization=localization,
         localization_threshold=0.85,
-        localization_min_iou=0.1,
+        localization_max_area_ratio=0.35,
+        marks={0: _mark()},
         normalized_tags=["拼音"],
     )
 
@@ -109,7 +124,6 @@ def test_low_confidence_localization_discards_candidate_bbox():
         "localization_status": "needs_review",
         "index": 1,
     }
-    assert values["ocr_raw_json"]["bbox"] == [0.1, 0.2, 0.4, 0.4]
     assert values["status"] == "needs_review"
 
 
@@ -122,7 +136,8 @@ def test_low_confidence_item_requires_review():
         confidence_threshold=0.85,
         localization=None,
         localization_threshold=0.85,
-        localization_min_iou=0.1,
+        localization_max_area_ratio=0.35,
+        marks={0: _mark()},
         normalized_tags=["拼音"],
     )
 
@@ -138,7 +153,8 @@ def test_uncertain_segments_require_review_even_with_high_confidence():
         confidence_threshold=0.85,
         localization=None,
         localization_threshold=0.85,
-        localization_min_iou=0.1,
+        localization_max_area_ratio=0.35,
+        marks={0: _mark()},
         normalized_tags=["拼音"],
     )
 
@@ -151,7 +167,10 @@ def test_unmatched_localization_discards_bbox_even_with_high_confidence():
     localization = LocalizationItem(
         index=0,
         matched=False,
+        mark_ids=[],
         bbox=None,
+        observed_prompt_text=None,
+        observed_raw_text=None,
         confidence=0.99,
     )
     values = build_question_values(
@@ -160,7 +179,8 @@ def test_unmatched_localization_discards_bbox_even_with_high_confidence():
         confidence_threshold=0.85,
         localization=localization,
         localization_threshold=0.85,
-        localization_min_iou=0.1,
+        localization_max_area_ratio=0.35,
+        marks={0: _mark()},
         normalized_tags=["拼音"],
     )
 
@@ -168,13 +188,16 @@ def test_unmatched_localization_discards_bbox_even_with_high_confidence():
     assert values["status"] == "needs_review"
 
 
-def test_distant_localization_discards_bbox_even_with_high_confidence():
+def test_localization_missing_assigned_mark_discards_bbox():
     from app.services.vision_recognition import build_question_values
 
     localization = LocalizationItem(
         index=0,
         matched=True,
+        mark_ids=[],
         bbox=[0.7, 0.7, 0.9, 0.9],
+        observed_prompt_text="蜻蜓",
+        observed_raw_text="qin tin\n蜻蜓",
         confidence=0.99,
     )
     values = build_question_values(
@@ -183,7 +206,8 @@ def test_distant_localization_discards_bbox_even_with_high_confidence():
         confidence_threshold=0.85,
         localization=localization,
         localization_threshold=0.85,
-        localization_min_iou=0.1,
+        localization_max_area_ratio=0.35,
+        marks={0: _mark()},
         normalized_tags=["拼音"],
     )
 
@@ -191,33 +215,26 @@ def test_distant_localization_discards_bbox_even_with_high_confidence():
     assert values["status"] == "needs_review"
 
 
-@pytest.mark.parametrize(
-    ("recognition_bbox", "localization_bbox"),
-    [
-        ([0.04, 0.7, 0.31, 0.83], [0.144, 0.661, 0.33, 0.762]),
-        ([0.46, 0.32, 0.65, 0.42], [0.337, 0.475, 0.498, 0.62]),
-        ([0.42, 0.22, 0.6, 0.3], [0.359, 0.296, 0.501, 0.396]),
-    ],
-)
-def test_live_mismatched_localizations_fall_back_to_original_image(
-    recognition_bbox,
-    localization_bbox,
-):
+def test_localization_with_mismatched_observed_content_discards_bbox():
     from app.services.vision_recognition import build_question_values
 
     localization = LocalizationItem(
         index=0,
         matched=True,
-        bbox=localization_bbox,
+        mark_ids=[0],
+        bbox=[0.1, 0.2, 0.4, 0.5],
+        observed_prompt_text="算式",
+        observed_raw_text="suàn shì",
         confidence=0.95,
     )
     values = build_question_values(
-        _item(bbox=recognition_bbox),
+        _item(),
         index=0,
         confidence_threshold=0.85,
         localization=localization,
         localization_threshold=0.85,
-        localization_min_iou=0.1,
+        localization_max_area_ratio=0.35,
+        marks={0: _mark()},
         normalized_tags=["拼音"],
     )
 

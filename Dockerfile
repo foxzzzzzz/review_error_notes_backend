@@ -12,6 +12,20 @@ WORKDIR /app
 COPY requirements-heavy.txt .
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-heavy.txt
 
+# Prepare PP-OCRv5 Chinese Mobile ONNX models while network is available.
+ARG LOCAL_OCR_ENGINE=onnxruntime
+ARG LOCAL_OCR_MODEL_VERSION=PP-OCRv5
+ARG LOCAL_OCR_MODEL_TYPE=mobile
+ARG LOCAL_OCR_MODEL_PATH=/opt/rapidocr-models
+ENV LOCAL_OCR_MODEL_PATH=${LOCAL_OCR_MODEL_PATH}
+COPY scripts/warm_local_ocr_models.py /tmp/warm_local_ocr_models.py
+RUN python /tmp/warm_local_ocr_models.py \
+    --engine "${LOCAL_OCR_ENGINE}" \
+    --model-version "${LOCAL_OCR_MODEL_VERSION}" \
+    --model-type "${LOCAL_OCR_MODEL_TYPE}" \
+    --model-path "${LOCAL_OCR_MODEL_PATH}" \
+    && rm /tmp/warm_local_ocr_models.py
+
 # Light deps (frequently change — fast rebuild)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt

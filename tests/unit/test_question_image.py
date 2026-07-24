@@ -6,6 +6,7 @@ from PIL import Image
 from app.services.question_image import (
     QuestionImageInvalid,
     QuestionImageNotFound,
+    load_cropped_rgb_image,
     render_question_image,
 )
 
@@ -32,6 +33,20 @@ def test_crop_uses_normalized_ltrb_coordinates(tmp_path):
     )
 
     assert _rendered_size(content) == (50, 40)
+
+
+def test_in_memory_crop_uses_the_same_normalized_coordinates(tmp_path):
+    source = tmp_path / "source.jpg"
+    _save_image(source)
+
+    crop = load_cropped_rgb_image(
+        source,
+        [0.25, 0.25, 0.75, 0.75],
+        max_pixels=40_000_000,
+    )
+
+    assert crop.mode == "RGB"
+    assert crop.size == (50, 40)
 
 
 def test_original_view_returns_the_complete_image(tmp_path):

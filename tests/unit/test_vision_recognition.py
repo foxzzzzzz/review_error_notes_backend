@@ -28,7 +28,14 @@ def _valid_payload():
                 "difficulty": 2,
                 "confidence": 0.91,
                 "uncertain_segments": [],
-                "bbox": [0.1, 0.2, 0.4, 0.4],
+            }
+        ],
+        "error_marks": [
+            {
+                "mark_id": 0,
+                "mark_type": "circle",
+                "bbox": [0.1, 0.2, 0.3, 0.4],
+                "confidence": 0.95,
             }
         ],
         "ignored_text": ["Date:"],
@@ -94,19 +101,23 @@ def test_vision_item_requires_clean_practice_prompt_fields(missing_field):
         VisionItem(**item)
 
 
-@pytest.mark.parametrize(
-    "bbox",
-    [
-        [0.0, 0.45, 1.0, 0.88],
-        [0.0, 0.85, 1.0, 1.0],
-    ],
-)
-def test_vision_item_accepts_live_minimax_corner_bbox(bbox):
-    from app.services.vision_recognition import VisionItem
+def test_first_stage_returns_error_marks_but_question_items_have_no_bbox():
+    from app.services.vision_recognition import ErrorMark, VisionItem, VisionResult
 
-    item = VisionItem(**{**_valid_payload()["items"][0], "bbox": bbox})
+    item = VisionItem(**_valid_payload()["items"][0])
+    mark = ErrorMark(**_valid_payload()["error_marks"][0])
+    result = VisionResult(items=[item], error_marks=[mark], ignored_text=[])
 
-    assert item.bbox == bbox
+    assert "bbox" not in result.items[0].model_dump()
+    assert result.error_marks[0].mark_id == 0
+
+
+def test_recognition_prompt_separates_question_content_from_error_mark_coordinates():
+    from app.services.vision_recognition import RECOGNITION_PROMPT
+
+    assert '"error_marks"' in RECOGNITION_PROMPT
+    assert "题目 item 不得输出 bbox" in RECOGNITION_PROMPT
+    assert "不得预先绑定" in RECOGNITION_PROMPT
 
 
 @pytest.mark.parametrize(
@@ -259,13 +270,29 @@ def test_client_rejects_prose_around_json(tmp_path, content):
 @pytest.mark.parametrize(
     "payload",
     [
-        {"items": []},
-        {"items": [{**_valid_payload()["items"][0], "raw_text": ""}]},
-        {"items": [{**_valid_payload()["items"][0], "confidence": 1.5}]},
-        {"items": [{**_valid_payload()["items"][0], "confidence": "0.9"}]},
-        {"items": [{**_valid_payload()["items"][0], "unexpected": "value"}]},
-        {"items": [{**_valid_payload()["items"][0], "bbox": [0.9, 0.2, 0.2, 0.8]}]},
-        {"items": [{**_valid_payload()["items"][0], "bbox": [0.1, 0.2, 0.1, 0.4]}]},
+        {**_valid_payload(), "items": []},
+        {**_valid_payload(), "items": [{**_valid_payload()["items"][0], "raw_text": ""}]},
+        {**_valid_payload(), "items": [{**_valid_payload()["items"][0], "confidence": 1.5}]},
+        {**_valid_payload(), "items": [{**_valid_payload()["items"][0], "confidence": "0.9"}]},
+        {**_valid_payload(), "items": [{**_valid_payload()["items"][0], "unexpected": "value"}]},
+        {
+            **_valid_payload(),
+            "error_marks": [
+                {
+                    **_valid_payload()["error_marks"][0],
+                    "bbox": [0.9, 0.2, 0.2, 0.8],
+                }
+            ],
+        },
+        {
+            **_valid_payload(),
+            "error_marks": [
+                {
+                    **_valid_payload()["error_marks"][0],
+                    "bbox": [0.1, 0.2, 0.1, 0.4],
+                }
+            ],
+        },
     ],
 )
 def test_client_rejects_invalid_recognition_contract(tmp_path, payload):
