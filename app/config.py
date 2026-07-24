@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     MINIMAX_MARK_CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0, le=1)
     MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0, le=1)
     MINIMAX_LOCALIZATION_MAX_AREA_RATIO: float = Field(default=0.35, gt=0, le=1)
+    QUESTION_CROP_CONTEXT_PADDING_RATIO: float = Field(default=0.15, ge=0, le=1)
     MARK_RED_PIXEL_MIN_RATIO: float = Field(default=0.005, ge=0, le=1)
     MARK_RED_PIXEL_EXPANSION_RATIO: float = Field(default=0.08, ge=0, le=1)
     MINIMAX_IMAGE_MAX_EDGE: int = 2048

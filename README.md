@@ -322,6 +322,7 @@ student (学生)
 | `MINIMAX_MARK_CONFIDENCE_THRESHOLD` | 红色错误标记最低模型置信度 | `0.85` |
 | `MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD` | 独立二次定位最低置信度 | `0.85` |
 | `MINIMAX_LOCALIZATION_MAX_AREA_RATIO` | 单题 bbox 占整图最大面积比例 | `0.35` |
+| `QUESTION_CROP_CONTEXT_PADDING_RATIO` | 详情展示框每侧上下文扩展比例，并在包含完整题目的前提下向红标中心移动 | `0.15` |
 | `MARK_RED_PIXEL_MIN_RATIO` | 标记框内最低红色像素比例 | `0.005` |
 | `MARK_RED_PIXEL_EXPANSION_RATIO` | 红色像素检查框向外扩展比例 | `0.08` |
 | `MINIMAX_IMAGE_MAX_EDGE` | 预处理图片最长边像素数 | `2048` |

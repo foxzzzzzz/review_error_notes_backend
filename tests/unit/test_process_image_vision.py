@@ -1,3 +1,5 @@
+import pytest
+
 from app.services.vision_recognition import ErrorMark, LocalizationItem, VisionItem
 
 
@@ -47,6 +49,51 @@ def _mark():
         bbox=[0.2, 0.25, 0.3, 0.35],
         confidence=0.96,
     )
+
+
+def test_display_bbox_expands_and_moves_toward_assigned_mark():
+    from app.services.vision_recognition import marker_focused_display_bbox
+
+    mark = ErrorMark(
+        mark_id=0,
+        mark_type="circle",
+        bbox=[0.55, 0.42, 0.59, 0.46],
+        confidence=0.96,
+    )
+
+    display_bbox = marker_focused_display_bbox(
+        localization_bbox=[0.4, 0.4, 0.6, 0.6],
+        mark_ids=[0],
+        marks={0: mark},
+        padding_ratio=0.15,
+    )
+
+    assert display_bbox == pytest.approx([0.4, 0.34, 0.66, 0.6])
+    assert display_bbox[0] <= 0.4
+    assert display_bbox[1] <= 0.4
+    assert display_bbox[2] >= 0.6
+    assert display_bbox[3] >= 0.6
+
+
+def test_display_bbox_stays_in_image_at_edge():
+    from app.services.vision_recognition import marker_focused_display_bbox
+
+    mark = ErrorMark(
+        mark_id=0,
+        mark_type="circle",
+        bbox=[0.01, 0.12, 0.05, 0.16],
+        confidence=0.96,
+    )
+
+    display_bbox = marker_focused_display_bbox(
+        localization_bbox=[0.0, 0.1, 0.2, 0.3],
+        mark_ids=[0],
+        marks={0: mark},
+        padding_ratio=0.15,
+    )
+
+    assert display_bbox == pytest.approx([0.0, 0.04, 0.26, 0.3])
+    assert all(0 <= coordinate <= 1 for coordinate in display_bbox)
 
 
 def test_question_values_preserve_raw_writing_and_normalized_content():

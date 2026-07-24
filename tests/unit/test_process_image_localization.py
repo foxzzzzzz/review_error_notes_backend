@@ -1,3 +1,4 @@
+import pytest
 from PIL import Image, ImageDraw
 
 from app.services.local_ocr_verification import OCRVerification
@@ -144,7 +145,12 @@ class FakeOCRVerifier:
         )
 
 
-def _run_batch(tmp_path, client=None, ocr_verifier=None):
+def _run_batch(
+    tmp_path,
+    client=None,
+    ocr_verifier=None,
+    crop_context_padding_ratio=0.0,
+):
     from app.services.vision_recognition import recognize_question_batch
 
     return recognize_question_batch(
@@ -159,6 +165,7 @@ def _run_batch(tmp_path, client=None, ocr_verifier=None):
         red_pixel_expansion_ratio=0.05,
         tag_config_path=_write_tag_config(tmp_path),
         ocr_verifier=ocr_verifier or FakeOCRVerifier(),
+        crop_context_padding_ratio=crop_context_padding_ratio,
     )
 
 
@@ -276,6 +283,28 @@ def test_ocr_inconclusive_keeps_otherwise_valid_bbox(tmp_path):
 
     assert values[0]["crop_region"]["bbox"] == [0.15, 0.15, 0.4, 0.45]
     assert values[0]["status"] == "confirmed"
+
+
+def test_pipeline_expands_display_bbox_but_ocr_uses_localization_bbox(tmp_path):
+    verifier = FakeOCRVerifier()
+
+    _result, values = _run_batch(
+        tmp_path,
+        ocr_verifier=verifier,
+        crop_context_padding_ratio=0.15,
+    )
+
+    assert values[0]["crop_region"]["bbox"] == pytest.approx(
+        [0.0875, 0.09, 0.4125, 0.48]
+    )
+    assert values[0]["crop_region"]["localization_bbox"] == [
+        0.15,
+        0.15,
+        0.4,
+        0.45,
+    ]
+    assert values[0]["crop_region"]["display_context_padding_ratio"] == 0.15
+    assert verifier.calls[0] == ([0.15, 0.15, 0.4, 0.45], 0)
 
 
 def test_saved_diagnostics_separate_marks_localization_and_ocr(tmp_path):

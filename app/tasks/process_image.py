@@ -72,6 +72,7 @@ def process_image(self, image_id: str, filepath: str):
             mark_confidence_threshold=settings.MINIMAX_MARK_CONFIDENCE_THRESHOLD,
             localization_threshold=settings.MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD,
             localization_max_area_ratio=settings.MINIMAX_LOCALIZATION_MAX_AREA_RATIO,
+            crop_context_padding_ratio=settings.QUESTION_CROP_CONTEXT_PADDING_RATIO,
             red_pixel_min_ratio=settings.MARK_RED_PIXEL_MIN_RATIO,
             red_pixel_expansion_ratio=settings.MARK_RED_PIXEL_EXPANSION_RATIO,
             tag_config_path=settings.TAG_ALIAS_CONFIG_PATH,

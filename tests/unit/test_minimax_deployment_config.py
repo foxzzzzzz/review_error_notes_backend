@@ -1,5 +1,10 @@
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
+from app.config import Settings
+
 
 BACKEND_ROOT = Path(__file__).parents[2]
 
@@ -17,6 +22,7 @@ def test_worker_receives_every_minimax_setting_without_a_secret_value():
         "MINIMAX_MARK_CONFIDENCE_THRESHOLD",
         "MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD",
         "MINIMAX_LOCALIZATION_MAX_AREA_RATIO",
+        "QUESTION_CROP_CONTEXT_PADDING_RATIO",
         "MARK_RED_PIXEL_MIN_RATIO",
         "MARK_RED_PIXEL_EXPANSION_RATIO",
         "MINIMAX_IMAGE_MAX_EDGE",
@@ -41,6 +47,26 @@ def test_worker_receives_every_minimax_setting_without_a_secret_value():
     assert "secret-token" not in compose
     assert "./config:/app/config:ro" in worker
     assert "TAG_ALIAS_CONFIG_PATH: ${TAG_ALIAS_CONFIG_PATH:-/app/config/tag-aliases.json}" in worker
+
+
+def test_marker_focused_crop_padding_is_external_and_validated():
+    settings = Settings(_env_file=None)
+
+    assert settings.QUESTION_CROP_CONTEXT_PADDING_RATIO == 0.15
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, QUESTION_CROP_CONTEXT_PADDING_RATIO=-0.01)
+
+    env_example = (BACKEND_ROOT / ".env.example").read_text(encoding="utf-8")
+    readme = (BACKEND_ROOT / "README.md").read_text(encoding="utf-8")
+    task = (BACKEND_ROOT / "app" / "tasks" / "process_image.py").read_text(
+        encoding="utf-8"
+    )
+    assert "QUESTION_CROP_CONTEXT_PADDING_RATIO=0.15" in env_example
+    assert "QUESTION_CROP_CONTEXT_PADDING_RATIO" in readme
+    assert (
+        "crop_context_padding_ratio=settings.QUESTION_CROP_CONTEXT_PADDING_RATIO"
+        in task
+    )
 
 
 def test_api_receives_deepseek_settings_for_synchronous_derivative_generation():

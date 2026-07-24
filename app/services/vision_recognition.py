@@ -256,6 +256,48 @@ def bbox_contains_center(container: List[float], candidate: List[float]) -> bool
     )
 
 
+def marker_focused_display_bbox(
+    localization_bbox: List[float],
+    mark_ids: List[int],
+    marks: dict[int, ErrorMark],
+    padding_ratio: float,
+) -> List[float]:
+    if padding_ratio == 0:
+        return list(localization_bbox)
+
+    left, top, right, bottom = localization_bbox
+    content_width = right - left
+    content_height = bottom - top
+    display_width = min(1.0, content_width * (1 + 2 * padding_ratio))
+    display_height = min(1.0, content_height * (1 + 2 * padding_ratio))
+
+    assigned_marks = [marks[mark_id] for mark_id in mark_ids if mark_id in marks]
+    if assigned_marks:
+        focus_x = sum(
+            (mark.bbox[0] + mark.bbox[2]) / 2 for mark in assigned_marks
+        ) / len(assigned_marks)
+        focus_y = sum(
+            (mark.bbox[1] + mark.bbox[3]) / 2 for mark in assigned_marks
+        ) / len(assigned_marks)
+    else:
+        focus_x = (left + right) / 2
+        focus_y = (top + bottom) / 2
+
+    min_center_x = max(display_width / 2, right - display_width / 2)
+    max_center_x = min(1 - display_width / 2, left + display_width / 2)
+    min_center_y = max(display_height / 2, bottom - display_height / 2)
+    max_center_y = min(1 - display_height / 2, top + display_height / 2)
+    center_x = min(max(focus_x, min_center_x), max_center_x)
+    center_y = min(max(focus_y, min_center_y), max_center_y)
+
+    return [
+        max(0.0, center_x - display_width / 2),
+        max(0.0, center_y - display_height / 2),
+        min(1.0, center_x + display_width / 2),
+        min(1.0, center_y + display_height / 2),
+    ]
+
+
 def localization_passes_geometry(
     localization: LocalizationItem,
     marks: dict[int, ErrorMark],
@@ -305,6 +347,7 @@ def build_question_values(
     localization_max_area_ratio: float,
     marks: dict[int, ErrorMark],
     normalized_tags: List[str],
+    crop_context_padding_ratio: float = 0.0,
 ) -> dict:
     """Map a validated vision item to the existing question persistence contract."""
     localization_verified = (
@@ -330,8 +373,14 @@ def build_question_values(
         "index": index,
     }
     if localization_verified:
+        display_bbox = marker_focused_display_bbox(
+            localization_bbox=localization.bbox,
+            mark_ids=localization.mark_ids,
+            marks=marks,
+            padding_ratio=crop_context_padding_ratio,
+        )
         crop_region = {
-            "bbox": localization.bbox,
+            "bbox": display_bbox,
             "bbox_format": "normalized_ltrb",
             "bbox_source": "minimax_marker_anchored",
             "bbox_confidence": localization.confidence,
@@ -339,6 +388,14 @@ def build_question_values(
             "mark_ids": localization.mark_ids,
             "index": index,
         }
+        if crop_context_padding_ratio > 0:
+            crop_region.update(
+                {
+                    "localization_bbox": localization.bbox,
+                    "bbox_source": "marker_focused_context",
+                    "display_context_padding_ratio": crop_context_padding_ratio,
+                }
+            )
     return {
         "crop_region": crop_region,
         "subject": item.subject,
@@ -364,6 +421,7 @@ def recognize_question_batch(
     red_pixel_expansion_ratio: float,
     tag_config_path: str,
     ocr_verifier,
+    crop_context_padding_ratio: float = 0.0,
 ) -> tuple[VisionResult, List[dict]]:
     """Recognize marks/content, independently localize, then OCR-check each crop."""
     result = client.recognize(image_path, subject_hint=subject_hint)
@@ -408,6 +466,7 @@ def recognize_question_batch(
                 item.question_type,
                 tag_config_path,
             ),
+            crop_context_padding_ratio=crop_context_padding_ratio,
         )
         local_ocr = {
             "status": "unavailable",
@@ -415,7 +474,12 @@ def recognize_question_batch(
             "text_summary": "",
             "confidence": None,
         }
-        proposed_bbox = question_values["crop_region"].get("bbox")
+        proposed_bbox = (
+            localization.bbox
+            if localization is not None
+            and question_values["crop_region"].get("bbox") is not None
+            else None
+        )
         if proposed_bbox is not None:
             verification = ocr_verifier.verify(
                 image_path,
