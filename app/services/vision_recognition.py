@@ -24,6 +24,7 @@ from app.config import settings
 from app.services.error_mark_validation import (
     ErrorMarkImageInvalid,
     filter_valid_error_marks,
+    validate_localization_red_evidence,
 )
 from app.services.tag_normalization import normalize_tags
 
@@ -302,12 +303,13 @@ def localization_passes_geometry(
     localization: LocalizationItem,
     marks: dict[int, ErrorMark],
     max_area_ratio: float,
+    allow_unassigned_marks: bool = False,
 ) -> bool:
     if not localization.matched or localization.bbox is None:
         return False
     if bbox_area(localization.bbox) > max_area_ratio:
         return False
-    if marks and not localization.mark_ids:
+    if marks and not localization.mark_ids and not allow_unassigned_marks:
         return False
     return all(
         mark_id in marks
@@ -348,6 +350,7 @@ def build_question_values(
     marks: dict[int, ErrorMark],
     normalized_tags: List[str],
     crop_context_padding_ratio: float = 0.0,
+    localization_red_verified: bool = False,
 ) -> dict:
     """Map a validated vision item to the existing question persistence contract."""
     localization_verified = (
@@ -359,6 +362,7 @@ def build_question_values(
             localization,
             marks=marks,
             max_area_ratio=localization_max_area_ratio,
+            allow_unassigned_marks=localization_red_verified,
         )
         and localization_matches_evidence(localization, item)
     )
@@ -373,6 +377,11 @@ def build_question_values(
         "index": index,
     }
     if localization_verified:
+        bbox_source = (
+            "local_red_verified"
+            if localization_red_verified and not localization.mark_ids
+            else "minimax_marker_anchored"
+        )
         display_bbox = marker_focused_display_bbox(
             localization_bbox=localization.bbox,
             mark_ids=localization.mark_ids,
@@ -382,7 +391,7 @@ def build_question_values(
         crop_region = {
             "bbox": display_bbox,
             "bbox_format": "normalized_ltrb",
-            "bbox_source": "minimax_marker_anchored",
+            "bbox_source": bbox_source,
             "bbox_confidence": localization.confidence,
             "localization_status": "verified",
             "mark_ids": localization.mark_ids,
@@ -392,7 +401,12 @@ def build_question_values(
             crop_region.update(
                 {
                     "localization_bbox": localization.bbox,
-                    "bbox_source": "marker_focused_context",
+                    "bbox_source": (
+                        "local_red_verified_context"
+                        if localization_red_verified
+                        and not localization.mark_ids
+                        else "marker_focused_context"
+                    ),
                     "display_context_padding_ratio": crop_context_padding_ratio,
                 }
             )
@@ -453,6 +467,36 @@ def recognize_question_batch(
     values = []
     for index, item in enumerate(result.items):
         localization = localizations.get(index)
+        localization_red_validation = None
+        localization_red_verified = False
+        should_validate_local_red_evidence = (
+            localization is not None
+            and localization.matched
+            and localization.bbox is not None
+            and localization.confidence >= localization_threshold
+            and bbox_area(localization.bbox) <= localization_max_area_ratio
+            and localization_matches_evidence(localization, item)
+            and bool(marks_by_id)
+            and not localization.mark_ids
+        )
+        if should_validate_local_red_evidence:
+            try:
+                localization_red_validation = (
+                    validate_localization_red_evidence(
+                        image_path,
+                        localization.bbox,
+                        red_pixel_min_ratio=red_pixel_min_ratio,
+                        expansion_ratio=red_pixel_expansion_ratio,
+                    )
+                )
+                localization_red_verified = localization_red_validation[
+                    "accepted"
+                ]
+            except ErrorMarkImageInvalid:
+                localization_red_validation = {
+                    "accepted": False,
+                    "reason": "image_invalid",
+                }
         question_values = build_question_values(
             item,
             index=index,
@@ -467,6 +511,7 @@ def recognize_question_batch(
                 tag_config_path,
             ),
             crop_context_padding_ratio=crop_context_padding_ratio,
+            localization_red_verified=localization_red_verified,
         )
         local_ocr = {
             "status": "unavailable",
@@ -509,6 +554,7 @@ def recognize_question_batch(
                     if localization is not None
                     else None
                 ),
+                "localization_red_validation": localization_red_validation,
                 "local_ocr": local_ocr,
             }
         )

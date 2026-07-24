@@ -43,6 +43,56 @@ def _is_red_pixel(pixel) -> bool:
     )
 
 
+def _red_pixel_evidence(
+    image: Image.Image,
+    bbox,
+    red_pixel_min_ratio: float,
+    expansion_ratio: float,
+) -> dict:
+    pixel_box = _expanded_pixel_box(image.size, bbox, expansion_ratio)
+    crop = image.crop(pixel_box)
+    pixel_count = crop.width * crop.height
+    red_count = sum(1 for pixel in crop.getdata() if _is_red_pixel(pixel))
+    red_pixel_ratio = red_count / pixel_count if pixel_count else 0.0
+    accepted = red_pixel_ratio >= red_pixel_min_ratio
+    return {
+        "pixel_box": list(pixel_box),
+        "red_pixel_count": red_count,
+        "pixel_count": pixel_count,
+        "red_pixel_ratio": red_pixel_ratio,
+        "red_pixel_min_ratio": red_pixel_min_ratio,
+        "accepted": accepted,
+        "reason": "accepted" if accepted else "insufficient_red_pixels",
+    }
+
+
+def validate_localization_red_evidence(
+    image_path: str,
+    bbox,
+    red_pixel_min_ratio: float,
+    expansion_ratio: float,
+) -> dict:
+    """Report whether a trusted localization bbox contains visible red evidence."""
+    try:
+        with Image.open(image_path) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            diagnostic = _red_pixel_evidence(
+                image,
+                bbox,
+                red_pixel_min_ratio=red_pixel_min_ratio,
+                expansion_ratio=expansion_ratio,
+            )
+            diagnostic.update(
+                {
+                    "bbox": list(bbox),
+                    "expansion_ratio": expansion_ratio,
+                }
+            )
+            return diagnostic
+    except (Image.DecompressionBombError, OSError, ValueError) as exc:
+        raise ErrorMarkImageInvalid("Error mark image is invalid") from exc
+
+
 def filter_valid_error_marks(
     image_path: str,
     marks: Sequence[ErrorMark],
@@ -58,36 +108,30 @@ def filter_valid_error_marks(
         with Image.open(image_path) as source:
             image = ImageOps.exif_transpose(source).convert("RGB")
             for mark in marks:
-                pixel_box = _expanded_pixel_box(
-                    image.size,
+                diagnostic = _red_pixel_evidence(
+                    image,
                     mark.bbox,
-                    expansion_ratio,
+                    red_pixel_min_ratio=red_pixel_min_ratio,
+                    expansion_ratio=expansion_ratio,
                 )
-                crop = image.crop(pixel_box)
-                pixel_count = crop.width * crop.height
-                red_count = sum(
-                    1 for pixel in crop.getdata() if _is_red_pixel(pixel)
-                )
-                red_pixel_ratio = red_count / pixel_count if pixel_count else 0.0
                 if mark.confidence < confidence_threshold:
                     accepted = False
                     reason = "low_confidence"
-                elif red_pixel_ratio < red_pixel_min_ratio:
-                    accepted = False
-                    reason = "insufficient_red_pixels"
                 else:
-                    accepted = True
-                    reason = "accepted"
+                    accepted = diagnostic["accepted"]
+                    reason = diagnostic["reason"]
                 diagnostics.append(
                     {
                         "mark_id": mark.mark_id,
                         "confidence": mark.confidence,
                         "confidence_threshold": confidence_threshold,
-                        "pixel_box": list(pixel_box),
-                        "red_pixel_count": red_count,
-                        "pixel_count": pixel_count,
-                        "red_pixel_ratio": red_pixel_ratio,
-                        "red_pixel_min_ratio": red_pixel_min_ratio,
+                        "pixel_box": diagnostic["pixel_box"],
+                        "red_pixel_count": diagnostic["red_pixel_count"],
+                        "pixel_count": diagnostic["pixel_count"],
+                        "red_pixel_ratio": diagnostic["red_pixel_ratio"],
+                        "red_pixel_min_ratio": diagnostic[
+                            "red_pixel_min_ratio"
+                        ],
                         "accepted": accepted,
                         "reason": reason,
                     }

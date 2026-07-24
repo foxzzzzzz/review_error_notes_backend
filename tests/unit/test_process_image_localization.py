@@ -260,6 +260,102 @@ def test_rejected_mark_does_not_invalidate_question_matched_to_valid_mark(tmp_pa
     assert values[1]["status"] == "needs_review"
 
 
+def test_empty_mark_ids_use_local_red_evidence_for_trusted_localization(tmp_path):
+    class MissingMarkAnchorClient(FakeClient):
+        def recognize(self, image_path, subject_hint=None):
+            result = _vision_result()
+            result.error_marks[1] = result.error_marks[1].model_copy(
+                update={"bbox": [0.8, 0.05, 0.9, 0.15]}
+            )
+            return result
+
+        def localize(self, image_path, items, error_marks):
+            self.localize_calls += 1
+            self.localized_marks = error_marks
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=0,
+                        matched=True,
+                        mark_ids=[0],
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        observed_prompt_text=items[0].prompt_text,
+                        observed_raw_text=items[0].raw_text,
+                        confidence=0.94,
+                    ),
+                    LocalizationItem(
+                        index=1,
+                        matched=True,
+                        mark_ids=[],
+                        bbox=[0.55, 0.5, 0.8, 0.8],
+                        observed_prompt_text=items[1].prompt_text,
+                        observed_raw_text=items[1].raw_text,
+                        confidence=0.91,
+                    ),
+                ]
+            )
+
+    verifier = FakeOCRVerifier()
+    _result, values = _run_batch(
+        tmp_path,
+        client=MissingMarkAnchorClient(),
+        ocr_verifier=verifier,
+    )
+
+    assert values[1]["status"] == "confirmed"
+    assert values[1]["crop_region"]["bbox"] == [0.55, 0.5, 0.8, 0.8]
+    assert values[1]["crop_region"]["bbox_source"] == "local_red_verified"
+    assert values[1]["crop_region"]["mark_ids"] == []
+    assert values[1]["ocr_raw_json"]["localization_red_validation"]["accepted"] is True
+    assert verifier.calls[-1] == ([0.55, 0.5, 0.8, 0.8], 1)
+
+
+def test_empty_mark_ids_without_local_red_evidence_still_need_review(tmp_path):
+    class MissingMarkAndRedClient(FakeClient):
+        def recognize(self, image_path, subject_hint=None):
+            result = _vision_result()
+            result.error_marks[1] = result.error_marks[1].model_copy(
+                update={"bbox": [0.8, 0.05, 0.9, 0.15]}
+            )
+            return result
+
+        def localize(self, image_path, items, error_marks):
+            self.localize_calls += 1
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=0,
+                        matched=True,
+                        mark_ids=[0],
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        observed_prompt_text=items[0].prompt_text,
+                        observed_raw_text=items[0].raw_text,
+                        confidence=0.94,
+                    ),
+                    LocalizationItem(
+                        index=1,
+                        matched=True,
+                        mark_ids=[],
+                        bbox=[0.75, 0.75, 0.95, 0.95],
+                        observed_prompt_text=items[1].prompt_text,
+                        observed_raw_text=items[1].raw_text,
+                        confidence=0.91,
+                    ),
+                ]
+            )
+
+    _result, values = _run_batch(
+        tmp_path,
+        client=MissingMarkAndRedClient(),
+    )
+
+    assert values[1]["status"] == "needs_review"
+    assert "bbox" not in values[1]["crop_region"]
+    diagnostic = values[1]["ocr_raw_json"]["localization_red_validation"]
+    assert diagnostic["accepted"] is False
+    assert diagnostic["reason"] == "insufficient_red_pixels"
+
+
 def test_ocr_contradiction_discards_localized_bbox(tmp_path):
     verifier = FakeOCRVerifier(
         {

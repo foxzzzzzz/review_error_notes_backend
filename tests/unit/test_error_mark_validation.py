@@ -114,6 +114,52 @@ def test_expanded_mark_at_image_edge_is_clipped(tmp_path):
     assert rejected == []
 
 
+def test_localization_bbox_with_red_pixels_is_accepted(tmp_path):
+    from app.services.error_mark_validation import (
+        validate_localization_red_evidence,
+    )
+
+    image_path = tmp_path / "localization-red.png"
+    image = Image.new("RGB", (100, 100), "white")
+    ImageDraw.Draw(image).rectangle((20, 20, 40, 40), fill=(220, 30, 30))
+    image.save(image_path)
+
+    diagnostic = validate_localization_red_evidence(
+        str(image_path),
+        bbox=[0.15, 0.15, 0.45, 0.45],
+        red_pixel_min_ratio=0.01,
+        expansion_ratio=0.0,
+    )
+
+    assert diagnostic["accepted"] is True
+    assert diagnostic["reason"] == "accepted"
+    assert diagnostic["bbox"] == [0.15, 0.15, 0.45, 0.45]
+    assert diagnostic["pixel_box"] == [15, 15, 45, 45]
+    assert diagnostic["expansion_ratio"] == 0.0
+    assert diagnostic["red_pixel_count"] > 0
+    assert diagnostic["red_pixel_ratio"] >= 0.01
+
+
+def test_localization_bbox_without_red_pixels_is_rejected(tmp_path):
+    from app.services.error_mark_validation import (
+        validate_localization_red_evidence,
+    )
+
+    image_path = tmp_path / "localization-white.png"
+    Image.new("RGB", (100, 100), "white").save(image_path)
+
+    diagnostic = validate_localization_red_evidence(
+        str(image_path),
+        bbox=[0.15, 0.15, 0.45, 0.45],
+        red_pixel_min_ratio=0.01,
+        expansion_ratio=0.05,
+    )
+
+    assert diagnostic["accepted"] is False
+    assert diagnostic["reason"] == "insufficient_red_pixels"
+    assert diagnostic["red_pixel_count"] == 0
+
+
 def test_invalid_image_raises_safe_error(tmp_path):
     from app.services.error_mark_validation import (
         ErrorMarkImageInvalid,
