@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "./uploads"
     PDF_DIR: str = "./pdfs"
     AVATAR_DIR: str = "./avatars"
+    AVATAR_MAX_BYTES: int = Field(default=5_242_880, gt=0)
+    AVATAR_MAX_EDGE: int = Field(default=512, gt=0)
+    AVATAR_JPEG_QUALITY: int = Field(default=88, ge=1, le=100)
     WECHAT_APP_ID: str = ""
     WECHAT_APP_SECRET: str = ""
     DEV_MODE: bool = False

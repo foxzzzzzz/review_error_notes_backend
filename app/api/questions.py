@@ -33,6 +33,7 @@ async def list_questions(
     grade: int = None,
     semester: int = None,
     status: str = None,
+    mastery_status: Literal["learning", "mastered"] | None = Query(None),
     tag: str = None,
     limit: int = Query(20, le=100),
     offset: int = 0,
@@ -52,6 +53,8 @@ async def list_questions(
         q = q.where(WrongQuestion.semester == semester)
     if status:
         q = q.where(WrongQuestion.review_status == status)
+    if mastery_status:
+        q = q.where(WrongQuestion.mastery_status == mastery_status)
     if tag:
         q = q.where(WrongQuestion.tags.any(tag))
     if created_from:

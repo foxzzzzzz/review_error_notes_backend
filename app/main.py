@@ -8,6 +8,7 @@ from app.config import settings
 
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 os.makedirs(settings.PDF_DIR, exist_ok=True)
+os.makedirs(settings.AVATAR_DIR, exist_ok=True)
 
 app = FastAPI(title="Wrong Book API", version="0.1.0")
 app.add_middleware(
@@ -20,6 +21,7 @@ app.add_middleware(
 app.include_router(api_router, prefix="/api")
 app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
 app.mount("/pdfs", StaticFiles(directory=settings.PDF_DIR), name="pdfs")
+app.mount("/avatars", StaticFiles(directory=settings.AVATAR_DIR), name="avatars")
 
 
 @app.get("/health")

@@ -53,6 +53,8 @@ def test_public_api_contract_contains_every_miniprogram_endpoint():
         ("GET", "/api/sheets"),
         ("GET", "/api/profile"),
         ("PATCH", "/api/profile"),
+        ("POST", "/api/profile/prompt/skip"),
+        ("POST", "/api/profile/avatar"),
     }
 
     assert actual >= expected

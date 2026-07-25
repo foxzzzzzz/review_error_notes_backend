@@ -33,6 +33,9 @@ services:
       UPLOAD_DIR: /app/uploads
       PDF_DIR: /app/pdfs
       AVATAR_DIR: /app/avatars
+      AVATAR_MAX_BYTES: ${AVATAR_MAX_BYTES:-5242880}
+      AVATAR_MAX_EDGE: ${AVATAR_MAX_EDGE:-512}
+      AVATAR_JPEG_QUALITY: ${AVATAR_JPEG_QUALITY:-88}
       PIP_CACHE_DIR: /root/.cache/pip
     volumes:
       - pip_cache:/root/.cache/pip
