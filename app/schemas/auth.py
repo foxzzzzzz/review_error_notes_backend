@@ -20,3 +20,12 @@ class LoginResponse(BaseModel):
 
 class BindPhoneRequest(BaseModel):
     code: str = Field(min_length=1)
+
+
+class BindPhoneResponse(BaseModel):
+    status: Literal["bound"]
+    phone_masked: str
+
+
+class RecoverAccountRequest(BaseModel):
+    recovery_token: str = Field(min_length=1)

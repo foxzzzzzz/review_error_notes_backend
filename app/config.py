@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     JWT_EXPIRE_DAYS: int = 7
     AES_KEY: str = "change-me-32bytes-secret-key-ok!"
     PHONE_HMAC_SECRET: str = "change-me-phone-hmac-secret"
+    ACCOUNT_RECOVERY_TOKEN_EXPIRE_MINUTES: int = Field(default=10, gt=0)
     LLM_API_KEY: str = ""
     LLM_API_BASE: str = "https://api.openai.com/v1"
     LLM_MODEL: str = "gpt-4o-mini"

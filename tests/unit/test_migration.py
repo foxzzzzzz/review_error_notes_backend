@@ -80,3 +80,19 @@ def test_runtime_processes_leave_schema_management_to_alembic():
         assert "create_all" not in source, (
             f"{runtime_file.relative_to(ROOT)} must not create database tables at runtime"
         )
+
+
+def test_phase_four_recovery_support_revision_adds_audit_and_cleanup_tables():
+    revision = VERSIONS / "0002_phase4_recovery_support.py"
+
+    assert revision.exists()
+    source = revision.read_text(encoding="utf-8")
+    assert 'op.create_table(\n        "account_recovery_conflicts"' in source
+    assert 'op.create_table(\n        "file_cleanup_jobs"' in source
+    assert 'down_revision: Union[str, None] = "0001"' in source
+
+
+def test_alembic_environment_imports_phase_four_recovery_models():
+    source = (ROOT / "alembic" / "env.py").read_text(encoding="utf-8")
+
+    assert "app.models.account_recovery" in source

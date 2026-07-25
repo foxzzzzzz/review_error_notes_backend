@@ -20,9 +20,19 @@ from app.services.avatar_storage import (
     AvatarTooLarge,
     save_avatar_image,
 )
+from app.utils.crypto import decrypt_phone, mask_phone
 
 
 router = APIRouter(prefix="/profile", tags=["profile"])
+
+
+def _masked_phone(account: Account) -> str:
+    if not account.phone_ciphertext:
+        return ""
+    try:
+        return mask_phone(decrypt_phone(account.phone_ciphertext))
+    except ValueError:
+        return "****"
 
 
 def _profile_out(
@@ -45,7 +55,7 @@ def _profile_out(
             student.grade is None or student.semester is None
         ),
         phone_bound=account.phone_ciphertext is not None,
-        phone_masked="****" if account.phone_ciphertext else "",
+        phone_masked=_masked_phone(account),
         stats=stats,
     )
 

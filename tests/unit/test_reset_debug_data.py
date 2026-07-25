@@ -20,6 +20,8 @@ def test_full_reset_removes_business_and_account_records_in_fk_order():
     reset_all_test_records(session)
 
     assert session.deleted_tables == [
+        "file_cleanup_jobs",
+        "account_recovery_conflicts",
         "practice_results",
         "practice_attempts",
         "sheet_items",

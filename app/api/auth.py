@@ -1,11 +1,31 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import AccountContext, get_current_account
 from app.config import settings
 from app.database import get_db
-from app.schemas.auth import BindPhoneRequest, LoginRequest, LoginResponse
+from app.schemas.auth import (
+    BindPhoneRequest,
+    BindPhoneResponse,
+    LoginRequest,
+    LoginResponse,
+    RecoverAccountRequest,
+)
 from app.services.account_login import login_with_identity
-from app.services.wechat import WeChatAPIError, exchange_login_code
+from app.services.account_recovery import (
+    AccountMergeRequired,
+    AccountRecoveryAvailable,
+    InvalidAccountRecovery,
+    TargetAccountPendingDeletion,
+    bind_phone_to_account,
+    recover_empty_account,
+)
+from app.services.file_cleanup import attempt_file_cleanup
+from app.services.wechat import (
+    WeChatAPIError,
+    exchange_login_code,
+    get_phone_number,
+)
 from app.utils.jwt import create_token
 
 
@@ -96,12 +116,115 @@ async def dev_login(
     )
 
 
-@router.post("/bind-phone")
-async def bind_phone(_req: BindPhoneRequest):
-    raise HTTPException(
-        status_code=501,
-        detail={
-            "code": "phone_binding_unavailable",
-            "message": "手机号绑定将在账户安全阶段开放",
-        },
-    )
+@router.post("/bind-phone", response_model=BindPhoneResponse)
+async def bind_phone(
+    req: BindPhoneRequest,
+    context: AccountContext = Depends(get_current_account),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        phone = await get_phone_number(
+            req.code,
+            settings.WECHAT_APP_ID,
+            settings.WECHAT_APP_SECRET,
+        )
+        result = await bind_phone_to_account(
+            db,
+            context.account_id,
+            phone,
+        )
+        await db.commit()
+        return BindPhoneResponse(
+            status="bound",
+            phone_masked=result.phone_masked,
+        )
+    except WeChatAPIError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "phone_verification_failed",
+                "message": "手机号验证失败，请重试",
+            },
+        ) from exc
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "phone_verification_failed",
+                "message": "手机号格式无效，请重试",
+            },
+        ) from exc
+    except AccountRecoveryAvailable as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "account_recovery_available",
+                "message": "该手机号关联了已有账户，是否恢复原账户？",
+                "phone_masked": exc.phone_masked,
+                "recovery_token": exc.recovery_token,
+            },
+        ) from exc
+    except AccountMergeRequired as exc:
+        await db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "account_merge_required",
+                "message": "两个账户均有数据，请联系人工处理",
+                "support_reference": exc.support_reference,
+            },
+        ) from exc
+    except TargetAccountPendingDeletion as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "account_pending_deletion",
+                "message": "原账户正在注销流程中，请先恢复原账户",
+            },
+        ) from exc
+    except InvalidAccountRecovery as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "phone_binding_conflict",
+                "message": "账户状态已变化，请重新操作",
+            },
+        ) from exc
+
+
+@router.post("/recover-account", response_model=LoginResponse)
+async def recover_account(
+    req: RecoverAccountRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        result = await recover_empty_account(
+            db,
+            req.recovery_token,
+        )
+        response = _login_response(
+            result.account,
+            result.student,
+            False,
+        )
+        await db.commit()
+        if result.cleanup_job is not None:
+            try:
+                await attempt_file_cleanup(db, result.cleanup_job.id)
+            except Exception:
+                await db.rollback()
+        return response
+    except InvalidAccountRecovery as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "account_recovery_invalid",
+                "message": "恢复凭证已失效，请重新绑定手机号",
+            },
+        ) from exc

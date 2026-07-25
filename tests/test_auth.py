@@ -54,13 +54,12 @@ class TestTokenAuth:
 
 
 class TestBindPhone:
-    """Phone binding is introduced in the dedicated profile phase."""
+    """Phone binding uses a WeChat one-time phone authorization code."""
 
-    def test_bind_phone_is_not_available_in_phase_one(self, client, auth_header):
+    def test_bind_phone_requires_a_non_empty_code(self, client, auth_header):
         resp = client.post(
             "/api/auth/bind-phone",
-            json={"code": "wechat-phone-code"},
+            json={"code": ""},
             headers=auth_header,
         )
-        assert resp.status_code == 501
-        assert resp.json()["detail"]["code"] == "phone_binding_unavailable"
+        assert resp.status_code == 422

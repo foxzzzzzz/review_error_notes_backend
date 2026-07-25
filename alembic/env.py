@@ -16,6 +16,7 @@ import app.models.practice_sheet
 import app.models.sheet_item
 import app.models.practice_attempt
 import app.models.practice_result
+import app.models.account_recovery
 
 config = context.config
 if config.config_file_name is not None:

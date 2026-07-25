@@ -174,3 +174,50 @@ def test_profile_update_reloads_and_locks_student_before_computing_completion(
     assert locked_student.semester == 1
     assert locked_student.profile_completed is True
     assert result.student_profile_required is False
+
+
+def test_profile_returns_masked_bound_phone():
+    from app.api.profile import _profile_out
+    from app.utils.crypto import encrypt_phone
+
+    account = SimpleNamespace(
+        nickname=None,
+        avatar_object_key=None,
+        phone_ciphertext=encrypt_phone("13800138000"),
+        profile_prompted_at=None,
+        profile_completed_at=None,
+    )
+    student = SimpleNamespace(
+        id=uuid4(),
+        display_name=None,
+        grade=1,
+        semester=1,
+    )
+
+    result = _profile_out(account, student, ProfileStats())
+
+    assert result.phone_bound is True
+    assert result.phone_masked == "138****8000"
+
+
+def test_profile_handles_invalid_stored_phone_ciphertext():
+    from app.api.profile import _profile_out
+
+    account = SimpleNamespace(
+        nickname=None,
+        avatar_object_key=None,
+        phone_ciphertext="invalid-ciphertext",
+        profile_prompted_at=None,
+        profile_completed_at=None,
+    )
+    student = SimpleNamespace(
+        id=uuid4(),
+        display_name=None,
+        grade=1,
+        semester=1,
+    )
+
+    result = _profile_out(account, student, ProfileStats())
+
+    assert result.phone_bound is True
+    assert result.phone_masked == "****"
