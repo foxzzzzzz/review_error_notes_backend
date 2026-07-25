@@ -1,5 +1,5 @@
 from sqlalchemy import Column, String, Integer, Text, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID, ENUM
+from sqlalchemy.dialects.postgresql import UUID, ENUM, JSONB
 from app.models import Base, gen_uuid
 
 
@@ -15,5 +15,6 @@ class SheetItem(Base):
         UUID(as_uuid=True), ForeignKey("wrong_questions.id", ondelete="SET NULL"), nullable=True
     )
     question_text = Column(Text, nullable=False)
+    question_snapshot = Column(JSONB, nullable=False)
     sort_order = Column(Integer, default=0)
     generation_method = Column(String(20), nullable=True)

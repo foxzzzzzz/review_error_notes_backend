@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional
 from datetime import datetime
 from uuid import UUID
@@ -12,6 +12,7 @@ class SheetCreate(BaseModel):
 
 
 class SheetItemOut(BaseModel):
+    id: UUID
     question_type: str
     question_text: str
     sort_order: int
@@ -27,6 +28,76 @@ class SheetOut(BaseModel):
     pdf_url: Optional[str]
     created_at: datetime
     items: list[SheetItemOut] = []
+    latest_accuracy: Optional[float] = None
+    attempt_count: int = 0
+    practice_status: str = "unpracticed"
 
     class Config:
         from_attributes = True
+
+
+class AttemptItemInput(BaseModel):
+    sheet_item_id: UUID
+    is_correct: bool
+
+
+class AttemptCreate(BaseModel):
+    idempotency_key: str = Field(min_length=1, max_length=64)
+    completed_at: datetime
+    items: list[AttemptItemInput] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_items(self):
+        item_ids = [item.sheet_item_id for item in self.items]
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("duplicate sheet item IDs")
+        return self
+
+
+class AttemptUpdate(BaseModel):
+    updated_at: datetime
+    items: list[AttemptItemInput] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_items(self):
+        item_ids = [item.sheet_item_id for item in self.items]
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("duplicate sheet item IDs")
+        return self
+
+
+class AttemptResultOut(BaseModel):
+    sheet_item_id: UUID
+    is_correct: bool
+
+
+class AttemptOut(BaseModel):
+    id: UUID
+    sheet_id: UUID
+    attempt_no: int
+    correct_count: int
+    total_count: int
+    accuracy: float
+    completed_at: datetime
+    updated_at: datetime
+    items: list[AttemptResultOut]
+
+
+class ReviewItemOut(BaseModel):
+    sheet_item_id: UUID
+    question_type: str
+    question_text: str
+    sort_order: int
+    is_correct: bool
+
+
+class ReviewGroupOut(BaseModel):
+    wrong_question_id: Optional[UUID]
+    items: list[ReviewItemOut]
+
+
+class SheetReviewOut(BaseModel):
+    sheet_id: UUID
+    title: Optional[str]
+    latest_attempt: Optional[AttemptOut]
+    groups: list[ReviewGroupOut]

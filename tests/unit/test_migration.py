@@ -12,6 +12,8 @@ EXPECTED_TABLES = {
     "wrong_questions",
     "practice_sheets",
     "sheet_items",
+    "practice_attempts",
+    "practice_results",
 }
 
 
@@ -47,6 +49,8 @@ def test_alembic_environment_imports_every_model_module():
         "wrong_question",
         "practice_sheet",
         "sheet_item",
+        "practice_attempt",
+        "practice_result",
     ):
         assert f"app.models.{module}" in source
 
@@ -60,6 +64,11 @@ def test_initial_schema_contains_account_identity_and_mastery_fields():
     assert '"review_status",' in source
     assert '"mastery_status",' in source
     assert '"uq_wechat_identity_appid_openid"' in source
+    assert '"uq_attempt_student_key"' in source
+    assert '"uq_attempt_sheet_number"' in source
+    assert '"uq_result_attempt_item"' in source
+    assert 'sa.Column("question_snapshot", postgresql.JSONB' in source
+    assert '"ix_practice_results_wrong_question_id"' in source
 
 
 def test_runtime_processes_leave_schema_management_to_alembic():

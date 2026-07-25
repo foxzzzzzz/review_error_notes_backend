@@ -32,6 +32,8 @@ def test_sheet_api_uses_clean_builder_grouped_pdf_and_explicit_errors():
     assert "len(set(data.question_ids)) != len(data.question_ids)" in source
     assert "groups=groups" in source
     assert "remove_generated_pdf(" in source
+    assert '"source_wrong_question_id": str(question.id)' in source
+    assert 'question_snapshot={' in source
     assert "original_items=" not in source
     assert "derived_items=" not in source
 
@@ -43,3 +45,15 @@ def test_sheet_api_renders_before_committing_database_rows():
     commit_position = source.index("await db.commit()")
 
     assert render_position < commit_position
+
+
+def test_sheet_api_exposes_transactional_practice_result_routes():
+    source = SHEETS_API.read_text(encoding="utf-8")
+
+    assert '@router.get("/{sheet_id}/review"' in source
+    assert '@router.get("/{sheet_id}/attempts"' in source
+    assert '@router.post("/{sheet_id}/attempts"' in source
+    assert '"/{sheet_id}/attempts/{attempt_id}"' in source
+    assert "with_for_update()" in source
+    assert "PracticeResultValidationError" in source
+    assert "attempt_conflict" in source

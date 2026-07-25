@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.account import Account
 from app.models.practice_sheet import PracticeSheet
+from app.models.practice_attempt import PracticeAttempt
+from app.models.practice_result import PracticeResult
 from app.models.sheet_item import SheetItem
 from app.models.student import Student
 from app.models.wechat_identity import WeChatIdentity
@@ -17,6 +19,8 @@ from app.models.wrong_question import WrongQuestion
 
 
 TEST_MODELS_IN_DELETE_ORDER = (
+    PracticeResult,
+    PracticeAttempt,
     SheetItem,
     PracticeSheet,
     WrongQuestion,

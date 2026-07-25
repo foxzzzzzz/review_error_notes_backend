@@ -14,6 +14,8 @@ import app.models.wrong_image
 import app.models.wrong_question
 import app.models.practice_sheet
 import app.models.sheet_item
+import app.models.practice_attempt
+import app.models.practice_result
 
 config = context.config
 if config.config_file_name is not None:

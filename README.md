@@ -320,6 +320,10 @@ cd miniprogram
 | DELETE | `/api/questions/{id}` | 删除错题 | ✅ |
 | POST | `/api/sheets` | 生成错题集 | ✅ |
 | GET | `/api/sheets` | 历史错题集列表 | ✅ |
+| GET | `/api/sheets/{id}/review` | 读取错题集题目与最新练习结果 | ✅ |
+| GET | `/api/sheets/{id}/attempts?limit=20&offset=0` | 分页查询错题集练习历史 | ✅ |
+| POST | `/api/sheets/{id}/attempts` | 幂等记录一次练习结果 | ✅ |
+| PATCH | `/api/sheets/{id}/attempts/{attempt_id}` | 修改最新一次练习结果 | ✅ |
 
 ---
 

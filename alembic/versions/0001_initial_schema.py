@@ -292,6 +292,7 @@ def upgrade() -> None:
         sa.Column("question_type", item_type_enum, nullable=False),
         sa.Column("derived_from", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("question_text", sa.Text(), nullable=False),
+        sa.Column("question_snapshot", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("sort_order", sa.Integer(), server_default="0", nullable=False),
         sa.Column("generation_method", sa.String(length=20), nullable=True),
         sa.ForeignKeyConstraint(
@@ -314,8 +315,97 @@ def upgrade() -> None:
         unique=False,
     )
 
+    op.create_table(
+        "practice_attempts",
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("sheet_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("student_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("attempt_no", sa.Integer(), nullable=False),
+        sa.Column("idempotency_key", sa.String(length=64), nullable=False),
+        sa.Column("correct_count", sa.Integer(), nullable=False),
+        sa.Column("total_count", sa.Integer(), nullable=False),
+        sa.Column("accuracy", sa.Numeric(precision=5, scale=4), nullable=False),
+        sa.Column("completed_at", sa.DateTime(), nullable=False),
+        *_timestamps(),
+        sa.ForeignKeyConstraint(["sheet_id"], ["practice_sheets.id"]),
+        sa.ForeignKeyConstraint(["student_id"], ["students.id"]),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "student_id",
+            "idempotency_key",
+            name="uq_attempt_student_key",
+        ),
+        sa.UniqueConstraint(
+            "sheet_id",
+            "attempt_no",
+            name="uq_attempt_sheet_number",
+        ),
+    )
+    op.create_index(
+        "ix_practice_attempts_sheet_id",
+        "practice_attempts",
+        ["sheet_id"],
+        unique=False,
+    )
+    op.create_index(
+        "ix_practice_attempts_student_id",
+        "practice_attempts",
+        ["student_id"],
+        unique=False,
+    )
+
+    op.create_table(
+        "practice_results",
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("attempt_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("sheet_item_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("wrong_question_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("is_correct", sa.Boolean(), nullable=False),
+        sa.Column("derived_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("question_snapshot", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        *_timestamps(),
+        sa.ForeignKeyConstraint(
+            ["attempt_id"],
+            ["practice_attempts.id"],
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(["sheet_item_id"], ["sheet_items.id"]),
+        sa.ForeignKeyConstraint(
+            ["wrong_question_id"],
+            ["wrong_questions.id"],
+            ondelete="SET NULL",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "attempt_id",
+            "sheet_item_id",
+            name="uq_result_attempt_item",
+        ),
+    )
+    op.create_index(
+        "ix_practice_results_attempt_id",
+        "practice_results",
+        ["attempt_id"],
+        unique=False,
+    )
+    op.create_index(
+        "ix_practice_results_wrong_question_id",
+        "practice_results",
+        ["wrong_question_id"],
+        unique=False,
+    )
+
 
 def downgrade() -> None:
+    op.drop_index(
+        "ix_practice_results_wrong_question_id",
+        table_name="practice_results",
+    )
+    op.drop_index("ix_practice_results_attempt_id", table_name="practice_results")
+    op.drop_table("practice_results")
+    op.drop_index("ix_practice_attempts_student_id", table_name="practice_attempts")
+    op.drop_index("ix_practice_attempts_sheet_id", table_name="practice_attempts")
+    op.drop_table("practice_attempts")
     op.drop_index("ix_sheet_items_sheet_id", table_name="sheet_items")
     op.drop_table("sheet_items")
     op.drop_index(
