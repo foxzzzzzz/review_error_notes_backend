@@ -63,6 +63,32 @@ def test_deletion_request_requires_a_fresh_login_code():
         AccountDeletionRequest(code="")
 
 
+def test_identity_lookup_queries_wechat_identity_model():
+    from app.services.account_deletion import (
+        _identity_belongs_to_account,
+    )
+
+    class IdentityDB:
+        def __init__(self):
+            self.statement = None
+
+        async def scalar(self, statement):
+            self.statement = statement
+            return uuid4()
+
+    db = IdentityDB()
+
+    assert asyncio.run(
+        _identity_belongs_to_account(
+            db,
+            uuid4(),
+            "app-id",
+            "openid-1",
+        )
+    )
+    assert "wechat_identities" in str(db.statement)
+
+
 def test_scoped_tokens_cannot_be_used_for_the_wrong_purpose(monkeypatch):
     from app.config import settings
     from app.utils.jwt import (

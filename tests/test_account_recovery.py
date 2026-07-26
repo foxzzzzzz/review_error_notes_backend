@@ -342,7 +342,7 @@ def test_confirmed_recovery_moves_identity_and_deletes_empty_placeholder(
     assert identity.account_id == target.id
     assert target.token_version == 8
     assert current.token_version == 3
-    assert db.deleted == [current_student, current]
+    assert db.deleted == [current]
     assert db.flush_calls == 2
     assert events.index("has_data") > events.index(
         f"lock_students:{current.id}"

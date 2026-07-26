@@ -40,10 +40,10 @@ async def _identity_belongs_to_account(
     openid: str,
 ) -> bool:
     identity_id = await db.scalar(
-        select(WechatIdentity.id).where(
-            WechatIdentity.account_id == account_id,
-            WechatIdentity.appid == appid,
-            WechatIdentity.openid == openid,
+        select(WeChatIdentity.id).where(
+            WeChatIdentity.account_id == account_id,
+            WeChatIdentity.appid == appid,
+            WeChatIdentity.openid == openid,
         )
     )
     return identity_id is not None

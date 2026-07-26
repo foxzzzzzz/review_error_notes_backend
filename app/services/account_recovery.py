@@ -344,7 +344,6 @@ async def recover_empty_account(
         )
         db.add(cleanup_job)
     await db.flush()
-    await db.delete(current_students[0])
     await db.delete(current_account)
     await db.flush()
     return AccountRecoveryResult(
