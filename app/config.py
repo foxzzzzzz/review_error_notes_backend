@@ -11,6 +11,16 @@ class Settings(BaseSettings):
     PHONE_HMAC_SECRET: str = "change-me-phone-hmac-secret"
     ACCOUNT_RECOVERY_TOKEN_EXPIRE_MINUTES: int = Field(default=10, gt=0)
     ACCOUNT_DELETION_RETENTION_DAYS: int = Field(default=30, ge=1)
+    ACCOUNT_CLEANUP_INTERVAL_SECONDS: int = Field(
+        default=86_400,
+        gt=0,
+        description="Seconds between expired account cleanup runs.",
+    )
+    ACCOUNT_CLEANUP_BATCH_SIZE: int = Field(
+        default=50,
+        gt=0,
+        description="Maximum accounts or file jobs claimed per cleanup query.",
+    )
     LLM_API_KEY: str = ""
     LLM_API_BASE: str = "https://api.openai.com/v1"
     LLM_MODEL: str = "gpt-4o-mini"

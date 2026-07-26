@@ -15,11 +15,16 @@ celery_app.conf.update(
     imports=[
         "app.tasks.process_image",
         "app.tasks.cleanup_questions",
+        "app.tasks.cleanup_accounts",
     ],
     beat_schedule={
         "cleanup-expired-questions": {
             "task": "app.tasks.cleanup_questions.cleanup_expired_questions_task",
             "schedule": settings.QUESTION_CLEANUP_INTERVAL_SECONDS,
+        },
+        "cleanup-expired-accounts": {
+            "task": "app.tasks.cleanup_accounts.cleanup_expired_accounts_task",
+            "schedule": settings.ACCOUNT_CLEANUP_INTERVAL_SECONDS,
         },
     },
 )

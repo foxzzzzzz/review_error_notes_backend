@@ -314,6 +314,25 @@ def test_task_claims_image_before_remote_call_and_resets_failed_claim():
     assert 'claimed_image.status = "pending"' in source
 
 
+def test_task_rechecks_account_status_after_recognition_before_persistence():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[2] / "app" / "tasks" / "process_image.py"
+    ).read_text(encoding="utf-8")
+
+    remote_call = source.index("recognize_question_batch(")
+    persistence = source.index("for values in question_values")
+    active_checks = [
+        index
+        for index in range(len(source))
+        if source.startswith('Account.status == "active"', index)
+    ]
+
+    assert len(active_checks) >= 2
+    assert remote_call < active_checks[-1] < persistence
+
+
 def test_task_logs_mark_validation_diagnostics(caplog):
     import logging
 
