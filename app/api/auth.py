@@ -63,6 +63,7 @@ def _login_response(account, student, is_new_account: bool) -> LoginResponse:
             profile_prompt_required=False,
             student_profile_required=False,
             account_status=account.status,
+            deletion_due_at=deletion_due_at,
         )
     return LoginResponse(
         token=create_token(str(account.id), account.token_version),

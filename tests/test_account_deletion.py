@@ -304,6 +304,7 @@ def test_pending_login_returns_only_recovery_token(monkeypatch):
     assert response.token is None
     assert response.recovery_token
     assert response.account_status == "pending_deletion"
+    assert response.deletion_due_at == due_at.replace(tzinfo=timezone.utc)
     assert verify_token(
         response.recovery_token,
         required_scope=ACCOUNT_RECOVERY_TOKEN_SCOPE,

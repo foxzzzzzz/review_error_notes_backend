@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal, Optional
 from uuid import UUID
 
@@ -17,6 +18,7 @@ class LoginResponse(BaseModel):
     profile_prompt_required: bool
     student_profile_required: bool
     account_status: Literal["active", "pending_deletion"]
+    deletion_due_at: Optional[datetime] = None
 
 
 class BindPhoneRequest(BaseModel):
