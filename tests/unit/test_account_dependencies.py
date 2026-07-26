@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -140,6 +141,77 @@ def test_current_account_rejects_pending_deletion(monkeypatch):
 
     assert exc_info.value.status_code == 403
     assert exc_info.value.detail["code"] == "account_pending_deletion"
+
+
+def test_deletion_retry_accepts_previous_normal_token_for_pending_account(
+    monkeypatch,
+):
+    from app.api import deps
+    from app.utils.jwt import NORMAL_TOKEN_SCOPE, TokenClaims
+
+    dependency = getattr(deps, "get_deletion_account", None)
+    assert dependency is not None
+
+    monkeypatch.setattr(
+        deps,
+        "verify_token",
+        lambda _token, required_scope=NORMAL_TOKEN_SCOPE: (
+            TokenClaims(
+                account_id="account-1",
+                token_version=2,
+                scope=NORMAL_TOKEN_SCOPE,
+            )
+            if required_scope == NORMAL_TOKEN_SCOPE
+            else None
+        ),
+    )
+    db = ResultDB(
+        SimpleNamespace(
+            id="account-1",
+            token_version=3,
+            status="pending_deletion",
+        )
+    )
+
+    context = asyncio.run(
+        dependency(
+            credentials=SimpleNamespace(credentials="previous-normal-token"),
+            db=db,
+        )
+    )
+
+    assert context.account_id == "account-1"
+    assert context.token_version == 3
+
+
+def test_recovery_dependency_defers_expiry_to_account_deadline(monkeypatch):
+    from app.api import deps
+    from app.config import settings
+    from app.utils.jwt import create_account_recovery_token
+
+    monkeypatch.setattr(settings, "JWT_SECRET", "expired-recovery-secret")
+    token = create_account_recovery_token(
+        "account-1",
+        3,
+        datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    db = ResultDB(
+        SimpleNamespace(
+            id="account-1",
+            token_version=3,
+            status="pending_deletion",
+        )
+    )
+
+    context = asyncio.run(
+        deps.get_recovery_account(
+            credentials=SimpleNamespace(credentials=token),
+            db=db,
+        )
+    )
+
+    assert context.account_id == "account-1"
+    assert context.token_version == 3
 
 
 def test_default_student_is_scoped_to_account():

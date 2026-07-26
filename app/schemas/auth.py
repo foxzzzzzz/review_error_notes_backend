@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -9,7 +9,8 @@ class LoginRequest(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    token: str
+    token: Optional[str] = None
+    recovery_token: Optional[str] = None
     account_id: UUID
     student_id: UUID
     is_new_account: bool

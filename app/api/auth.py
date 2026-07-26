@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,15 +28,45 @@ from app.services.wechat import (
     exchange_login_code,
     get_phone_number,
 )
-from app.utils.jwt import create_token
+from app.utils.jwt import create_account_recovery_token, create_token
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _login_response(account, student, is_new_account: bool) -> LoginResponse:
+    if account.status == "pending_deletion":
+        recovery_token = None
+        if account.deletion_due_at is not None:
+            deletion_due_at = account.deletion_due_at
+            if deletion_due_at.tzinfo is None:
+                deletion_due_at = deletion_due_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= deletion_due_at:
+                raise HTTPException(
+                    status_code=410,
+                    detail={
+                        "code": "account_deletion_expired",
+                        "message": "账户恢复期限已过",
+                    },
+                )
+            recovery_token = create_account_recovery_token(
+                str(account.id),
+                account.token_version,
+                deletion_due_at,
+            )
+        return LoginResponse(
+            token=None,
+            recovery_token=recovery_token,
+            account_id=account.id,
+            student_id=student.id,
+            is_new_account=False,
+            profile_prompt_required=False,
+            student_profile_required=False,
+            account_status=account.status,
+        )
     return LoginResponse(
         token=create_token(str(account.id), account.token_version),
+        recovery_token=None,
         account_id=account.id,
         student_id=student.id,
         is_new_account=is_new_account,
