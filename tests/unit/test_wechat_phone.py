@@ -1,9 +1,21 @@
 import asyncio
 import json
+from pathlib import Path
 
 import httpx
 import pytest
 from pydantic import ValidationError
+
+
+BACKEND_ROOT = Path(__file__).parents[2]
+
+
+def test_api_compose_injects_wechat_credentials():
+    compose = (BACKEND_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    api = compose.split("  api:", 1)[1].split("  worker:", 1)[0]
+
+    assert "WECHAT_APP_ID: ${WECHAT_APP_ID}" in api
+    assert "WECHAT_APP_SECRET: ${WECHAT_APP_SECRET}" in api
 
 
 def test_bind_phone_request_requires_one_time_code():
