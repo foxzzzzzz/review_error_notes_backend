@@ -23,12 +23,12 @@ services:
       LLM_API_KEY: ${LLM_API_KEY}
       LLM_API_BASE: ${LLM_API_BASE:-https://api.deepseek.com/v1}
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-pro}
-      JWT_SECRET: change-me-in-production
+      JWT_SECRET: ${JWT_SECRET}
       AES_KEY: ${AES_KEY:-change-me-32bytes-secret-key-ok!}
       PHONE_HMAC_SECRET: ${PHONE_HMAC_SECRET:-change-me-phone-hmac-secret}
       ACCOUNT_RECOVERY_TOKEN_EXPIRE_MINUTES: ${ACCOUNT_RECOVERY_TOKEN_EXPIRE_MINUTES:-10}
       ACCOUNT_DELETION_RETENTION_DAYS: ${ACCOUNT_DELETION_RETENTION_DAYS:-30}
-      DEV_MODE: "true"
+      DEV_MODE: "${DEV_MODE:-false}"
       APP_ENV: ${APP_ENV:-development}
       DEV_LOGIN_IDENTITY: ${DEV_LOGIN_IDENTITY:-dev-local-account}
       DEV_LOGIN_ALLOWED_ENVIRONMENT: ${DEV_LOGIN_ALLOWED_ENVIRONMENT:-development}

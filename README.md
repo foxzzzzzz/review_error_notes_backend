@@ -72,13 +72,58 @@ review_error_notes/
 
 ### 环境要求
 
-- Docker + Docker Compose
+- Git
+- Docker + Docker Compose v2
+- curl
 - 可访问 MiniMax API 的服务器
 
-### 快速启动
+### Ubuntu 一键部署（推荐）
+
+代码同步完成后执行：
 
 ```bash
+git pull
 cd backend
+bash scripts/deploy.sh
+```
+
+首次运行发现 `.env` 不存在时，脚本会自动复制 `.env.example` 为
+`.env`，打印待配置项并停止，不会启动 Docker。编辑 `.env` 后再次运行
+同一命令。生产部署必须配置：
+
+- `APP_ENV=production`
+- `DEV_MODE=false`
+- `LLM_API_KEY`、`MINIMAX_API_KEY`、`MINIMAX_API_HOST`
+- `WECHAT_APP_ID`、`WECHAT_APP_SECRET`
+- 随机且互不共用的 `JWT_SECRET`、`AES_KEY`、`PHONE_HMAC_SECRET`
+
+脚本会拒绝空值、示例 API Key、示例微信配置和默认安全密钥，然后依次
+校验 Compose、构建镜像、启动 PostgreSQL/Redis、等待 PostgreSQL
+就绪、执行 Alembic 迁移、启动 API/Worker/Beat 并检查 `/health`。
+它不会安装 Docker、执行 `git pull`、删除卷或清空数据。
+
+数据库就绪与 API 健康检查可在 `.env` 中调整：
+
+```dotenv
+DEPLOY_DATABASE_ATTEMPTS=30
+DEPLOY_DATABASE_INTERVAL_SECONDS=2
+DEPLOY_HEALTH_URL=http://127.0.0.1:8000/health
+DEPLOY_HEALTH_ATTEMPTS=30
+DEPLOY_HEALTH_INTERVAL_SECONDS=2
+```
+
+失败时脚本会停止并输出相关服务日志。可通过以下命令继续检查：
+
+```bash
+docker compose ps
+docker compose logs --tail=100 api worker beat
+```
+
+### 手动部署与排错
+
+如果需要逐步执行或定位脚本失败，可使用等价的手动流程：
+
+```bash
 
 # 1. 配置环境变量
 cp .env.example .env
