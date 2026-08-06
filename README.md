@@ -77,7 +77,29 @@ review_error_notes/
 - curl
 - 可访问 MiniMax API 的服务器
 
-### Ubuntu 一键部署（推荐）
+### Ubuntu 开发环境一键部署（新服务器联调）
+
+在后端仓库根目录同步代码后执行：
+
+```bash
+git pull
+bash scripts/dev_deploy.sh
+```
+
+首次运行发现 `.env` 不存在时，脚本会复制 `.env.example` 为 `.env`，
+打印待配置项并停止。开发部署必须配置：
+
+- `APP_ENV=development`、`DEV_MODE=true`
+- 稳定且非空的 `DEV_LOGIN_IDENTITY`
+- `MINIMAX_API_KEY`、`MINIMAX_API_HOST`
+- 随机且互不共用的 `JWT_SECRET`、`AES_KEY`、`PHONE_HMAC_SECRET`
+
+`LLM_API_KEY` 可暂时留空，但衍生题功能不可用。`WECHAT_APP_ID` 或
+`WECHAT_APP_SECRET` 缺失时，真实微信登录和手机号能力不可用，可先使用
+开发登录验证基础流程。补齐配置后再次运行同一命令即可构建镜像、迁移数据库、
+启动全部服务并执行健康检查。
+
+### Ubuntu 生产环境一键部署
 
 代码同步完成后执行：
 
@@ -89,7 +111,7 @@ bash scripts/deploy.sh
 
 首次运行发现 `.env` 不存在时，脚本会自动复制 `.env.example` 为
 `.env`，打印待配置项并停止，不会启动 Docker。编辑 `.env` 后再次运行
-同一命令。生产部署必须配置：
+同一命令。`scripts/deploy.sh` 仅用于生产部署，必须配置：
 
 - `APP_ENV=production`
 - `DEV_MODE=false`
