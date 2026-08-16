@@ -13,6 +13,15 @@ class WrongImage(Base, TimestampMixin):
     semester = Column(SmallInteger, nullable=False)
     question_count = Column(Integer, default=0)
     status = Column(
-        ENUM("pending", "segmented", "needs_review", "confirmed", name="image_status_enum"),
+        ENUM(
+            "pending",
+            "segmented",
+            "needs_review",
+            "confirmed",
+            "failed",
+            name="image_status_enum",
+        ),
         default="pending",
     )
+    error_code = Column(String(64), nullable=True)
+    error_message = Column(String(255), nullable=True)

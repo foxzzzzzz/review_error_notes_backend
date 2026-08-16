@@ -25,6 +25,10 @@ from app.tasks.celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 
+def processing_failure_for(_error: Exception) -> tuple[str, str]:
+    return "recognition_failed", "图片识别失败，请重试"
+
+
 def log_mark_validation_diagnostics(
     image_id: str,
     question_values: list[dict],
@@ -122,7 +126,7 @@ def process_image(self, image_id: str, filepath: str):
                 image.subject = result.items[0].subject
             db.commit()
             claimed = False
-    except Exception:
+    except Exception as exc:
         if claimed:
             with Session(engine) as db:
                 claimed_image = db.scalar(
@@ -131,8 +135,12 @@ def process_image(self, image_id: str, filepath: str):
                     .with_for_update()
                 )
                 if claimed_image and claimed_image.status == "segmented":
-                    claimed_image.status = "pending"
+                    claimed_image.status = "failed"
+                    (
+                        claimed_image.error_code,
+                        claimed_image.error_message,
+                    ) = processing_failure_for(exc)
                     db.commit()
-        raise
+        logger.exception("image recognition failed image_id=%s", image_id)
     finally:
         engine.dispose()

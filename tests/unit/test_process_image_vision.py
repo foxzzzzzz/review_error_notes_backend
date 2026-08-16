@@ -301,7 +301,7 @@ def test_image_status_requires_review_when_any_question_does():
     assert image_status_for([{"review_status": "confirmed"}]) == "confirmed"
 
 
-def test_task_claims_image_before_remote_call_and_resets_failed_claim():
+def test_task_claims_image_before_remote_call_and_marks_failed_claim():
     from pathlib import Path
 
     source = (Path(__file__).parents[2] / "app" / "tasks" / "process_image.py").read_text(encoding="utf-8")
@@ -311,7 +311,8 @@ def test_task_claims_image_before_remote_call_and_resets_failed_claim():
     assert claim < remote_call
     assert 'image.status != "pending"' in source
     assert 'image.status = "segmented"' in source
-    assert 'claimed_image.status = "pending"' in source
+    assert 'claimed_image.status = "failed"' in source
+    assert 'claimed_image.error_code' in source
 
 
 def test_task_rechecks_account_status_after_recognition_before_persistence():
