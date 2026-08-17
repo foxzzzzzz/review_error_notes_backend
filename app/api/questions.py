@@ -59,7 +59,10 @@ async def list_questions(
         q = q.where(WrongQuestion.tags.any(tag))
     if created_from:
         q = q.where(WrongQuestion.created_at >= _normalize_created_from(created_from))
-    q = q.order_by(WrongQuestion.created_at.desc()).offset(offset).limit(limit)
+    q = q.order_by(
+        WrongQuestion.created_at.desc(),
+        WrongQuestion.id.desc(),
+    ).offset(offset).limit(limit)
     result = await db.execute(q)
     return result.scalars().all()
 
