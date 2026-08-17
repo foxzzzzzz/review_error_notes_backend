@@ -1,4 +1,5 @@
 import uuid, os, aiofiles
+from io import BytesIO
 from pathlib import Path
 from typing import Literal
 
@@ -11,8 +12,22 @@ from app.models.wrong_image import WrongImage
 from app.models.student import Student
 from app.tasks.process_image import process_image
 from app.config import settings
+from PIL import Image, UnidentifiedImageError
 
 router = APIRouter(prefix="/upload", tags=["upload"])
+
+
+def _validated_image_upload(file_data: bytes) -> str:
+    try:
+        with Image.open(BytesIO(file_data)) as image:
+            image.verify()
+            image_format = image.format
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="上传文件不是有效图片") from exc
+    extensions = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}
+    if image_format not in extensions:
+        raise HTTPException(status_code=422, detail="仅支持 JPEG、PNG 或 WebP 图片")
+    return extensions[image_format]
 
 
 def serialize_image_status(image: WrongImage) -> dict:
@@ -96,7 +111,10 @@ async def upload_image(
         )
 
     # 保存文件
-    ext = os.path.splitext(file.filename)[1] or ".jpg"
+    file_data = await file.read(settings.UPLOAD_MAX_BYTES + 1)
+    if len(file_data) > settings.UPLOAD_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="图片文件过大")
+    ext = _validated_image_upload(file_data)
     filename = f"{uuid.uuid4()}{ext}"
     filepath = os.path.join(settings.UPLOAD_DIR, filename)
     image = None
@@ -104,7 +122,7 @@ async def upload_image(
     try:
         os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
         async with aiofiles.open(filepath, "wb") as f:
-            await f.write(await file.read())
+            await f.write(file_data)
 
         # 获取学生默认年级/册别
         # 创建 wrong_image 记录

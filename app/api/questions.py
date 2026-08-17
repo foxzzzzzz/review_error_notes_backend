@@ -181,10 +181,7 @@ async def get_question(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
     q, image = row
     data = QuestionOut.model_validate(q).model_dump()
-    data.update({
-        "crop_region": q.crop_region,
-        "image_url": image.original_url,
-    })
+    data["crop_region"] = q.crop_region
     return data
 
 

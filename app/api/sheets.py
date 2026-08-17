@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import FileResponse
+from pathlib import Path
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -286,6 +288,22 @@ async def get_sheet_generation(
     db: AsyncSession = Depends(get_db),
 ):
     return await _owned_sheet(db, student.id, sheet_id)
+
+
+@router.get("/{sheet_id}/pdf")
+async def download_sheet_pdf(
+    sheet_id: str,
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    sheet = await _owned_sheet(db, student.id, sheet_id)
+    _require_completed(sheet)
+    if not sheet.pdf_url:
+        raise HTTPException(status_code=404, detail="错题集文件不存在")
+    pdf_path = Path(settings.PDF_DIR) / Path(sheet.pdf_url).name
+    if not pdf_path.is_file():
+        raise HTTPException(status_code=404, detail="错题集文件不存在")
+    return FileResponse(pdf_path, media_type="application/pdf", filename="错题集.pdf")
 
 
 @router.post("/{sheet_id}/retry", response_model=SheetGenerationOut)

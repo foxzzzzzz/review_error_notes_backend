@@ -1,8 +1,10 @@
 import asyncio
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from PIL import Image
 
 
 @pytest.fixture(autouse=True)
@@ -15,8 +17,17 @@ def disable_real_task_dispatch(monkeypatch):
 class MemoryUpload:
     filename = "question.jpg"
 
-    async def read(self):
-        return b"test-image"
+    async def read(self, _size=None):
+        output = BytesIO()
+        Image.new("RGB", (1, 1), "white").save(output, format="JPEG")
+        return output.getvalue()
+
+
+class OversizedUpload:
+    filename = "question.jpg"
+
+    async def read(self, _size=None):
+        return b"x" * 11
 
 
 class UploadDB:
@@ -75,6 +86,31 @@ def test_upload_rejects_unset_grade_and_semester_before_writing(tmp_path, monkey
         )
 
     assert exc_info.value.status_code == 422
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_upload_rejects_files_larger_than_configured_limit(tmp_path, monkeypatch):
+    from app.api import upload as upload_api
+
+    monkeypatch.setattr(
+        upload_api,
+        "settings",
+        SimpleNamespace(UPLOAD_DIR=str(tmp_path), UPLOAD_MAX_BYTES=10),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            upload_api.upload_image(
+                file=OversizedUpload(),
+                subject=None,
+                grade=1,
+                semester=1,
+                student=SimpleNamespace(id="student-id", grade=1, semester=1),
+                db=UploadDB(),
+            )
+        )
+
+    assert exc_info.value.status_code == 413
     assert list(tmp_path.iterdir()) == []
 
 

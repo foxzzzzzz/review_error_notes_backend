@@ -5,7 +5,7 @@ from pathlib import Path
 MAIN_FILE = Path(__file__).parents[2] / "app" / "main.py"
 
 
-def test_upload_pdf_and_avatar_directories_are_mounted():
+def test_private_file_directories_are_not_mounted_as_public_static_files():
     tree = ast.parse(MAIN_FILE.read_text(encoding="utf-8"))
     mounts = []
 
@@ -17,10 +17,10 @@ def test_upload_pdf_and_avatar_directories_are_mounted():
         if isinstance(node.args[0], ast.Constant):
             mounts.append(node.args[0].value)
 
-    assert set(mounts) >= {"/uploads", "/pdfs", "/avatars"}
+    assert not set(mounts).intersection({"/uploads", "/pdfs", "/avatars"})
 
 
-def test_static_directories_are_created_before_mounting():
+def test_private_file_directories_are_created_for_authenticated_downloads():
     source = MAIN_FILE.read_text(encoding="utf-8")
 
     for setting_name, mount_path in (
@@ -29,7 +29,4 @@ def test_static_directories_are_created_before_mounting():
         ("AVATAR_DIR", "/avatars"),
     ):
         mkdir = f"os.makedirs(settings.{setting_name}, exist_ok=True)"
-        mount = f'app.mount("{mount_path}"'
         assert mkdir in source
-        assert mount in source
-        assert source.index(mkdir) < source.index(mount)

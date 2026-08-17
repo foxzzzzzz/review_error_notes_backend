@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +25,20 @@ from app.utils.crypto import decrypt_phone, mask_phone
 
 
 router = APIRouter(prefix="/profile", tags=["profile"])
+
+
+@router.get("/avatar")
+async def download_avatar(
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    account = await db.scalar(select(Account).where(Account.id == student.account_id))
+    if account is None or not account.avatar_object_key:
+        raise HTTPException(status_code=404, detail="头像不存在")
+    avatar_path = Path(settings.AVATAR_DIR) / Path(account.avatar_object_key).name
+    if not avatar_path.is_file():
+        raise HTTPException(status_code=404, detail="头像不存在")
+    return FileResponse(avatar_path, media_type="image/jpeg")
 
 
 def _masked_phone(account: Account) -> str:

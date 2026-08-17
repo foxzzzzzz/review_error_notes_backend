@@ -2,7 +2,6 @@ import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from app.api.router import api_router
 from app.config import settings
 
@@ -19,9 +18,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(api_router, prefix="/api")
-app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
-app.mount("/pdfs", StaticFiles(directory=settings.PDF_DIR), name="pdfs")
-app.mount("/avatars", StaticFiles(directory=settings.AVATAR_DIR), name="avatars")
 
 
 @app.get("/health")
