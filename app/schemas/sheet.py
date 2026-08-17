@@ -27,10 +27,30 @@ class SheetOut(BaseModel):
     config_json: Optional[dict]
     pdf_url: Optional[str]
     created_at: datetime
+    updated_at: datetime
+    generation_status: str = "completed"
+    generation_total: int = 0
+    generation_completed: int = 0
+    generation_error_code: Optional[str] = None
+    generation_error_message: Optional[str] = None
     items: list[SheetItemOut] = []
     latest_accuracy: Optional[float] = None
     attempt_count: int = 0
     practice_status: str = "unpracticed"
+
+    class Config:
+        from_attributes = True
+
+
+class SheetGenerationOut(BaseModel):
+    id: UUID
+    generation_status: str
+    generation_total: int
+    generation_completed: int
+    generation_error_code: Optional[str] = None
+    generation_error_message: Optional[str] = None
+    pdf_url: Optional[str]
+    updated_at: datetime
 
     class Config:
         from_attributes = True

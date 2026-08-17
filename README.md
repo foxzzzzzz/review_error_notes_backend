@@ -372,7 +372,9 @@ cd miniprogram
 
 `POST /api/sheets` 的 `derived_per_original` 支持 0 至 3，默认 0。值为 0 时仅生成原题且不依赖 LLM；值为 1 至 3 时需要配置 `LLM_API_KEY`，并对结构化衍生题执行非空、非原题复制和同组去重校验。PDF 使用单栏分组布局，不生成答案页。
 
-衍生题在 API 请求内同步生成，因此 `LLM_API_KEY`、`LLM_API_BASE`、`LLM_MODEL` 必须注入 `api` 容器；项目的 Docker Compose 已同时向 API 注入这三项配置。
+`POST /api/sheets` 校验成功后以 HTTP 202 创建等待记录；衍生题和 PDF 由 Celery Worker 后台生成。Worker 逐原题更新进度，失败时写入安全提示且不保留部分题目或半成品 PDF。`LLM_API_KEY`、`LLM_API_BASE`、`LLM_MODEL` 必须注入 Worker，单任务软超时由 `SHEET_GENERATION_SOFT_TIME_LIMIT_SECONDS` 配置。
+
+部署本变更后必须执行 `alembic upgrade head`，重新构建并启动 API 与 Worker。验收时选择 57 道原题、每题 2 道衍生题，确认创建请求快速返回、进度持续更新、离开页面后任务继续且完成后 PDF 可查看。
 
 | Method | Path | 说明 | 鉴权 |
 |--------|------|------|------|
@@ -387,6 +389,8 @@ cd miniprogram
 | DELETE | `/api/questions/{id}` | 删除错题 | ✅ |
 | POST | `/api/sheets` | 生成错题集 | ✅ |
 | GET | `/api/sheets` | 历史错题集列表 | ✅ |
+| GET | `/api/sheets/{id}/generation` | 查询后台生成状态与进度 | ✅ |
+| POST | `/api/sheets/{id}/retry` | 重新投递失败的错题集 | ✅ |
 | GET | `/api/sheets/{id}/review` | 读取错题集题目与最新练习结果 | ✅ |
 | GET | `/api/sheets/{id}/attempts?limit=20&offset=0` | 分页查询错题集练习历史 | ✅ |
 | POST | `/api/sheets/{id}/attempts` | 幂等记录一次练习结果 | ✅ |

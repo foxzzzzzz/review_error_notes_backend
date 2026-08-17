@@ -14,6 +14,7 @@ celery_app.conf.update(
     task_track_started=True,
     imports=[
         "app.tasks.process_image",
+        "app.tasks.generate_sheet",
         "app.tasks.cleanup_questions",
         "app.tasks.cleanup_accounts",
     ],

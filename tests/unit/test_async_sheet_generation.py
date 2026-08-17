@@ -1,0 +1,427 @@
+import asyncio
+import importlib.util
+from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+from fastapi import HTTPException
+
+
+MIGRATION_PATH = (
+    Path(__file__).parents[2]
+    / "alembic"
+    / "versions"
+    / "0005_async_sheet_generation.py"
+)
+
+
+def _load_migration():
+    spec = importlib.util.spec_from_file_location("async_sheet_migration", MIGRATION_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _MigrationRecorder:
+    def __init__(self):
+        self.added = []
+        self.dropped = []
+
+    def add_column(self, table_name, column):
+        self.added.append((table_name, column))
+
+    def drop_column(self, table_name, column_name):
+        self.dropped.append((table_name, column_name))
+
+
+def test_async_sheet_migration_preserves_existing_sheets_as_completed():
+    migration = _load_migration()
+    recorder = _MigrationRecorder()
+    migration.op = recorder
+
+    migration.upgrade()
+
+    assert migration.down_revision == "0004"
+    assert [column.name for _, column in recorder.added] == [
+        "generation_status",
+        "generation_total",
+        "generation_completed",
+        "generation_error_code",
+        "generation_error_message",
+    ]
+    status_column = recorder.added[0][1]
+    assert status_column.nullable is False
+    assert str(status_column.server_default.arg) == "completed"
+
+    migration.downgrade()
+    assert recorder.dropped == [
+        ("practice_sheets", "generation_error_message"),
+        ("practice_sheets", "generation_error_code"),
+        ("practice_sheets", "generation_completed"),
+        ("practice_sheets", "generation_total"),
+        ("practice_sheets", "generation_status"),
+    ]
+
+
+def test_practice_sheet_model_exposes_generation_state_columns():
+    from app.models.practice_sheet import PracticeSheet
+
+    columns = PracticeSheet.__table__.c
+    assert str(columns.generation_status.default.arg) == "completed"
+    assert columns.generation_total.default.arg == 0
+    assert columns.generation_completed.default.arg == 0
+    assert columns.generation_error_code.nullable is True
+    assert columns.generation_error_message.nullable is True
+
+
+def test_sheet_generation_schema_reports_original_question_progress():
+    from app.schemas.sheet import SheetGenerationOut, SheetOut
+
+    now = datetime(2026, 8, 17, 12, 0, 0)
+    sheet_id = uuid4()
+    generation = SheetGenerationOut(
+        id=sheet_id,
+        generation_status="processing",
+        generation_total=57,
+        generation_completed=12,
+        generation_error_code=None,
+        generation_error_message=None,
+        pdf_url=None,
+        updated_at=now,
+    )
+    sheet = SheetOut(
+        id=sheet_id,
+        title="错题重练",
+        config_json={"derived_per_original": 2},
+        pdf_url=None,
+        created_at=now,
+        updated_at=now,
+        generation_status="pending",
+        generation_total=57,
+        generation_completed=0,
+    )
+
+    assert generation.generation_completed == 12
+    assert generation.generation_total == 57
+    assert sheet.generation_status == "pending"
+
+
+def test_sheet_generation_soft_limit_is_positive():
+    from app.config import settings
+
+    assert settings.SHEET_GENERATION_SOFT_TIME_LIMIT_SECONDS > 0
+
+
+class _GenerationRepository:
+    def __init__(self, request):
+        self.request = request
+        self.progress = []
+        self.completed = None
+        self.failed = None
+        self.complete_error = None
+
+    def claim(self, _sheet_id):
+        return self.request
+
+    def update_progress(self, _sheet_id, completed):
+        self.progress.append(completed)
+
+    def complete(self, _sheet_id, request, groups, pdf_url):
+        if self.complete_error:
+            raise self.complete_error
+        self.completed = (request, groups, pdf_url)
+
+    def fail(self, _sheet_id, code, message):
+        self.failed = (code, message)
+
+
+def _generation_request():
+    from app.tasks.generate_sheet import SheetGenerationQuestion, SheetGenerationRequest
+    from app.services.practice_question import PrintableQuestion
+
+    questions = []
+    for index in range(2):
+        original = PrintableQuestion(
+            wrong_question_id=f"question-{index}",
+            instruction="计算",
+            prompt_text=f"{index} + 1",
+            question_type="calculation",
+            display_text=f"计算\n{index} + 1\n________________",
+            answer=str(index + 1),
+        )
+        questions.append(
+            SheetGenerationQuestion(
+                id=f"question-{index}",
+                difficulty=2,
+                subject="math",
+                original=original,
+            )
+        )
+    return SheetGenerationRequest(
+        title="错题重练",
+        student_name="学生",
+        subject="math",
+        derived_per_original=2,
+        difficulty_boost=2,
+        questions=questions,
+    )
+
+
+def test_worker_reports_per_original_progress_and_completes_once():
+    from app.services.practice_question import PrintableQuestion
+    from app.tasks.generate_sheet import execute_sheet_generation
+
+    request = _generation_request()
+    repository = _GenerationRepository(request)
+    derivative_calls = []
+
+    async def derivative_generator(**kwargs):
+        derivative_calls.append(kwargs["original"].wrong_question_id)
+        return [
+            PrintableQuestion(
+                wrong_question_id=kwargs["original"].wrong_question_id,
+                instruction="计算",
+                prompt_text="2 + 2",
+                question_type="calculation",
+                display_text="计算\n2 + 2\n________________",
+                answer="4",
+            )
+        ]
+
+    asyncio.run(
+        execute_sheet_generation(
+            "sheet-id",
+            repository=repository,
+            derivative_generator=derivative_generator,
+            pdf_generator=lambda **_kwargs: "/pdfs/sheet.pdf",
+            pdf_remover=lambda _path: None,
+        )
+    )
+
+    assert derivative_calls == ["question-0", "question-1"]
+    assert repository.progress == [1, 2]
+    assert repository.completed[2] == "/pdfs/sheet.pdf"
+    assert len(repository.completed[1]) == 2
+    assert repository.failed is None
+
+
+def test_worker_ignores_duplicate_delivery_when_task_cannot_be_claimed():
+    from app.tasks.generate_sheet import execute_sheet_generation
+
+    repository = _GenerationRepository(None)
+    calls = []
+
+    asyncio.run(
+        execute_sheet_generation(
+            "sheet-id",
+            repository=repository,
+            derivative_generator=lambda **_kwargs: calls.append("derivative"),
+            pdf_generator=lambda **_kwargs: calls.append("pdf"),
+            pdf_remover=lambda _path: calls.append("remove"),
+        )
+    )
+
+    assert calls == []
+    assert repository.completed is None
+    assert repository.failed is None
+
+
+def test_worker_removes_pdf_and_records_safe_failure_when_persistence_fails():
+    from app.tasks.generate_sheet import execute_sheet_generation
+
+    repository = _GenerationRepository(_generation_request())
+    repository.complete_error = RuntimeError("database password leaked")
+    removed = []
+
+    async def derivative_generator(**_kwargs):
+        return []
+
+    asyncio.run(
+        execute_sheet_generation(
+            "sheet-id",
+            repository=repository,
+            derivative_generator=derivative_generator,
+            pdf_generator=lambda **_kwargs: "/pdfs/uncommitted.pdf",
+            pdf_remover=removed.append,
+        )
+    )
+
+    assert removed == ["/pdfs/uncommitted.pdf"]
+    assert repository.failed == (
+        "sheet_generation_failed",
+        "错题集生成失败，请稍后重试",
+    )
+    assert "password" not in repository.failed[1]
+
+
+def test_worker_maps_derivative_and_timeout_failures_to_safe_messages():
+    from celery.exceptions import SoftTimeLimitExceeded
+    from app.services.derivative import DerivativeGenerationError
+    from app.tasks.generate_sheet import generation_failure_for
+
+    assert generation_failure_for(
+        DerivativeGenerationError("provider response"),
+        "derivatives",
+    ) == ("sheet_derivative_failed", "衍生题生成失败，请重试或调整为仅原题")
+    assert generation_failure_for(
+        SoftTimeLimitExceeded(),
+        "derivatives",
+    ) == ("sheet_generation_timeout", "错题集生成超时，请重试或减少题目数量")
+
+
+class _Rows:
+    def __init__(self, values):
+        self.values = values
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return self.values
+
+
+class _CreateSheetDb:
+    def __init__(self, questions):
+        self.questions = questions
+        self.added = []
+        self.events = []
+
+    async def execute(self, _query):
+        return _Rows(self.questions)
+
+    def add(self, value):
+        self.added.append(value)
+
+    async def commit(self):
+        self.events.append("commit")
+
+    async def flush(self):
+        self.events.append("flush")
+
+    async def refresh(self, value):
+        value.id = value.id or uuid4()
+        value.created_at = datetime(2026, 8, 17, 12, 0, 0)
+        value.updated_at = datetime(2026, 8, 17, 12, 0, 0)
+        self.events.append("refresh")
+
+
+def _question(question_id):
+    return type(
+        "Question",
+        (),
+        {
+            "id": question_id,
+            "difficulty": 2,
+            "subject": "math",
+            "ocr_raw_json": {
+                "instruction": "计算",
+                "prompt_text": "1 + 1",
+                "question_type": "calculation",
+            },
+            "ocr_answer": "2",
+        },
+    )()
+
+
+def test_create_sheet_commits_pending_record_before_dispatch(monkeypatch):
+    from app.api import sheets as sheets_api
+    from app.schemas.sheet import SheetCreate
+
+    db = _CreateSheetDb([_question("question-id")])
+    dispatched = []
+
+    def enqueue(sheet_id):
+        assert db.events == ["commit", "refresh"]
+        dispatched.append(sheet_id)
+
+    monkeypatch.setattr(sheets_api, "enqueue_sheet_generation", enqueue, raising=False)
+
+    sheet = asyncio.run(
+        sheets_api.create_sheet(
+            SheetCreate(question_ids=["question-id"], derived_per_original=0),
+            student=type("Student", (), {"id": "student-id", "display_name": "学生"})(),
+            db=db,
+        )
+    )
+
+    assert len(db.added) == 1
+    assert sheet.generation_status == "pending"
+    assert sheet.generation_total == 1
+    assert sheet.generation_completed == 0
+    assert dispatched == [str(sheet.id)]
+
+
+class _OwnedSheetDb:
+    def __init__(self, sheet):
+        self.sheet = sheet
+        self.commits = 0
+
+    async def scalar(self, _query):
+        return self.sheet
+
+    async def commit(self):
+        self.commits += 1
+
+    async def refresh(self, _value):
+        pass
+
+
+def test_failed_sheet_can_be_reset_and_dispatched_once(monkeypatch):
+    from app.api import sheets as sheets_api
+
+    sheet = type(
+        "Sheet",
+        (),
+        {
+            "id": uuid4(),
+            "generation_status": "failed",
+            "generation_completed": 21,
+            "generation_error_code": "sheet_derivative_failed",
+            "generation_error_message": "衍生题生成失败",
+        },
+    )()
+    db = _OwnedSheetDb(sheet)
+    dispatched = []
+    monkeypatch.setattr(
+        sheets_api,
+        "enqueue_sheet_generation",
+        lambda sheet_id: dispatched.append(sheet_id),
+        raising=False,
+    )
+
+    result = asyncio.run(
+        sheets_api.retry_sheet_generation(
+            str(sheet.id),
+            student=type("Student", (), {"id": "student-id"})(),
+            db=db,
+        )
+    )
+
+    assert result.generation_status == "pending"
+    assert result.generation_completed == 0
+    assert result.generation_error_code is None
+    assert dispatched == [str(sheet.id)]
+    assert db.commits == 1
+
+
+@pytest.mark.parametrize("status", ["pending", "processing", "failed"])
+def test_unfinished_sheet_cannot_enter_practice_flow(status):
+    from app.api.sheets import _require_completed
+
+    sheet = type(
+        "Sheet",
+        (),
+        {
+            "generation_status": status,
+            "generation_error_message": "衍生题生成失败" if status == "failed" else None,
+        },
+    )()
+
+    with pytest.raises(HTTPException) as exc_info:
+        _require_completed(sheet)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == (
+        "衍生题生成失败" if status == "failed" else "错题集尚未生成完成"
+    )

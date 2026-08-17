@@ -70,6 +70,11 @@ class Settings(BaseSettings):
         gt=0,
         description="Maximum records claimed by one cleanup query.",
     )
+    SHEET_GENERATION_SOFT_TIME_LIMIT_SECONDS: int = Field(
+        default=7200,
+        gt=0,
+        description="Soft time limit for one asynchronous sheet generation task.",
+    )
     UPLOAD_DIR: str = "./uploads"
     PDF_DIR: str = "./pdfs"
     AVATAR_DIR: str = "./avatars"

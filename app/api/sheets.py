@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,15 +19,10 @@ from app.schemas.sheet import (
     AttemptOut,
     AttemptUpdate,
     SheetCreate,
+    SheetGenerationOut,
     SheetOut,
     SheetReviewOut,
 )
-from app.services.derivative import (
-    DerivativeGenerationError,
-    generate_derivative_variants,
-)
-from app.services.pdf import generate_sheet_pdf
-from app.services.pdf_storage import remove_generated_pdf
 from app.services.practice_question import (
     MissingPracticePromptError,
     build_printable_questions,
@@ -42,6 +37,12 @@ from app.services.practice_results import (
 )
 
 router = APIRouter(prefix="/sheets", tags=["sheets"])
+
+
+def enqueue_sheet_generation(sheet_id: str) -> None:
+    from app.tasks.generate_sheet import generate_sheet_task
+
+    generate_sheet_task.delay(sheet_id)
 
 
 def _utc_naive(value: datetime) -> datetime:
@@ -149,7 +150,18 @@ def _attempt_conflict():
     )
 
 
-@router.post("", response_model=SheetOut)
+def _require_completed(sheet) -> None:
+    if sheet.generation_status == "completed":
+        return
+    detail = (
+        sheet.generation_error_message
+        if sheet.generation_status == "failed" and sheet.generation_error_message
+        else "错题集尚未生成完成"
+    )
+    raise HTTPException(status_code=409, detail=detail)
+
+
+@router.post("", response_model=SheetOut, status_code=status.HTTP_202_ACCEPTED)
 async def create_sheet(
     data: SheetCreate,
     student: Student = Depends(get_default_student),
@@ -173,7 +185,7 @@ async def create_sheet(
         raise HTTPException(status_code=400, detail="Some selected questions are unavailable")
 
     try:
-        originals = build_printable_questions(questions)
+        build_printable_questions(questions)
     except MissingPracticePromptError as exc:
         raise HTTPException(
             status_code=422,
@@ -189,101 +201,28 @@ async def create_sheet(
             detail="衍生题服务未配置，请选择“仅原题”或联系管理员",
         )
 
-    groups = []
-    try:
-        for question, original in zip(questions, originals):
-            target_difficulty = min(
-                5,
-                (question.difficulty or 2) + data.difficulty_boost,
-            )
-            derivatives = await generate_derivative_variants(
-                original=original,
-                difficulty=question.difficulty or 2,
-                target_difficulty=target_difficulty,
-                subject=question.subject or "math",
-                count=data.derived_per_original,
-            )
-            groups.append(
-                {
-                    "original": original.model_dump(exclude={"answer"}),
-                    "derivatives": [
-                        item.model_dump(exclude={"answer"}) for item in derivatives
-                    ],
-                }
-            )
-    except DerivativeGenerationError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="衍生题生成失败，请稍后重试或选择“仅原题”",
-        ) from exc
-
-    subject = questions[0].subject or "math"
     sheet = PracticeSheet(
         student_id=student.id,
         title=data.title,
         config_json=data.model_dump(),
+        generation_status="pending",
+        generation_total=len(questions),
+        generation_completed=0,
     )
     db.add(sheet)
-
-    pdf_url = None
-    try:
-        await db.flush()
-        sort_order = 0
-        for question, group in zip(questions, groups):
-            original = group["original"]
-            db.add(
-                SheetItem(
-                    sheet_id=sheet.id,
-                    wrong_question_id=question.id,
-                    question_type="original",
-                    question_text=original["display_text"],
-                    question_snapshot={
-                        "question_type": "original",
-                        "question_text": original["display_text"],
-                        "source_wrong_question_id": str(question.id),
-                        "sort_order": sort_order,
-                    },
-                    sort_order=sort_order,
-                    generation_method="vision",
-                )
-            )
-            sort_order += 1
-            for derivative in group["derivatives"]:
-                db.add(
-                    SheetItem(
-                        sheet_id=sheet.id,
-                        wrong_question_id=question.id,
-                        question_type="derived",
-                        derived_from=question.id,
-                        question_text=derivative["display_text"],
-                        question_snapshot={
-                            "question_type": "derived",
-                            "question_text": derivative["display_text"],
-                            "source_wrong_question_id": str(question.id),
-                            "sort_order": sort_order,
-                        },
-                        sort_order=sort_order,
-                        generation_method="llm",
-                    )
-                )
-                sort_order += 1
-
-        await db.flush()
-        pdf_url = generate_sheet_pdf(
-            student_name=student.display_name or "学生",
-            subject=subject,
-            title=data.title,
-            groups=groups,
-        )
-        sheet.pdf_url = pdf_url
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        if pdf_url:
-            remove_generated_pdf(pdf_url)
-        raise
-
+    await db.commit()
     await db.refresh(sheet)
+    try:
+        enqueue_sheet_generation(str(sheet.id))
+    except Exception as exc:
+        sheet.generation_status = "failed"
+        sheet.generation_error_code = "sheet_queue_unavailable"
+        sheet.generation_error_message = "错题集生成服务暂时不可用，请稍后重试"
+        await db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail=sheet.generation_error_message,
+        ) from exc
     return sheet
 
 
@@ -319,6 +258,12 @@ async def list_sheets(
             config_json=sheet.config_json,
             pdf_url=sheet.pdf_url,
             created_at=sheet.created_at,
+            updated_at=sheet.updated_at,
+            generation_status=sheet.generation_status,
+            generation_total=sheet.generation_total,
+            generation_completed=sheet.generation_completed,
+            generation_error_code=sheet.generation_error_code,
+            generation_error_message=sheet.generation_error_message,
             items=[],
             latest_accuracy=(
                 float(row_latest_accuracy)
@@ -334,6 +279,44 @@ async def list_sheets(
     ]
 
 
+@router.get("/{sheet_id}/generation", response_model=SheetGenerationOut)
+async def get_sheet_generation(
+    sheet_id: str,
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _owned_sheet(db, student.id, sheet_id)
+
+
+@router.post("/{sheet_id}/retry", response_model=SheetGenerationOut)
+async def retry_sheet_generation(
+    sheet_id: str,
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    sheet = await _owned_sheet(db, student.id, sheet_id, lock=True)
+    if sheet.generation_status != "failed":
+        raise HTTPException(status_code=409, detail="当前错题集不能重新生成")
+    sheet.generation_status = "pending"
+    sheet.generation_completed = 0
+    sheet.generation_error_code = None
+    sheet.generation_error_message = None
+    await db.commit()
+    await db.refresh(sheet)
+    try:
+        enqueue_sheet_generation(str(sheet.id))
+    except Exception as exc:
+        sheet.generation_status = "failed"
+        sheet.generation_error_code = "sheet_queue_unavailable"
+        sheet.generation_error_message = "错题集生成服务暂时不可用，请稍后重试"
+        await db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail=sheet.generation_error_message,
+        ) from exc
+    return sheet
+
+
 @router.get("/{sheet_id}/review", response_model=SheetReviewOut)
 async def get_sheet_review(
     sheet_id: str,
@@ -341,6 +324,7 @@ async def get_sheet_review(
     db: AsyncSession = Depends(get_db),
 ):
     sheet = await _owned_sheet(db, student.id, sheet_id)
+    _require_completed(sheet)
     items = await _sheet_items(db, sheet.id)
     latest_attempt = await db.scalar(
         select(PracticeAttempt)
@@ -375,6 +359,7 @@ async def list_sheet_attempts(
     db: AsyncSession = Depends(get_db),
 ):
     sheet = await _owned_sheet(db, student.id, sheet_id)
+    _require_completed(sheet)
     result = await db.execute(
         select(PracticeAttempt)
         .where(
@@ -407,6 +392,7 @@ async def create_sheet_attempt(
         return await _attempt_out(db, existing)
 
     sheet = await _owned_sheet(db, student.id, sheet_id, lock=True)
+    _require_completed(sheet)
     items = await _sheet_items(db, sheet.id)
     answers = {item.sheet_item_id: item.is_correct for item in data.items}
     try:
@@ -516,7 +502,8 @@ async def update_sheet_attempt(
     student: Student = Depends(get_default_student),
     db: AsyncSession = Depends(get_db),
 ):
-    await _owned_sheet(db, student.id, sheet_id, lock=True)
+    sheet = await _owned_sheet(db, student.id, sheet_id, lock=True)
+    _require_completed(sheet)
     attempt = await db.scalar(
         select(PracticeAttempt)
         .where(
