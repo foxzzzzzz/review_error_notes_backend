@@ -22,6 +22,13 @@ class WrongQuestion(Base, TimestampMixin):
     tags = Column(ARRAY(String), default=[])
     difficulty = Column(SmallInteger, nullable=True)
     wrong_count = Column(Integer, default=1)
+    collection_status = Column(
+        String(32),
+        default="collected",
+        server_default="collected",
+        nullable=False,
+        index=True,
+    )
     deleted_at = Column(DateTime, nullable=True, index=True)
     review_status = Column(
         ENUM(

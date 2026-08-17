@@ -1,5 +1,5 @@
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, Field
+from typing import Literal, Optional
 from datetime import datetime
 from uuid import UUID
 
@@ -18,6 +18,7 @@ class QuestionOut(BaseModel):
     tags: list[str]
     difficulty: Optional[int]
     wrong_count: int
+    collection_status: str
     review_status: str
     mastery_status: str
     created_at: datetime
@@ -32,3 +33,12 @@ class QuestionUpdate(BaseModel):
     tags: Optional[list[str]] = None
     difficulty: Optional[int] = None
     review_status: Optional[str] = None
+
+
+class ReviewDecision(BaseModel):
+    question_id: UUID
+    decision: Literal["collect", "ignore"]
+
+
+class ReviewDecisionRequest(BaseModel):
+    decisions: list[ReviewDecision] = Field(min_length=1)

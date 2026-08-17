@@ -109,18 +109,29 @@ def process_image(self, image_id: str, filepath: str):
             if not image or image.status != "segmented":
                 return
 
+            persisted_values = []
             for values in question_values:
                 values["ocr_raw_json"]["ignored_text"] = result.ignored_text
+                collection_status = values["collection_status"]
+                if collection_status == "ignored":
+                    continue
+                question_values_for_db = {
+                    key: value
+                    for key, value in values.items()
+                    if key != "collection_status"
+                }
                 question = WrongQuestion(
                     student_id=image.student_id,
                     image_id=image.id,
                     grade=image.grade,
                     semester=image.semester,
-                    **values,
+                    collection_status=collection_status,
+                    **question_values_for_db,
                 )
                 db.add(question)
+                persisted_values.append(question_values_for_db)
 
-            image.question_count = len(question_values)
+            image.question_count = len(persisted_values)
             image.status = image_status_for(question_values)
             if not image.subject:
                 image.subject = result.items[0].subject

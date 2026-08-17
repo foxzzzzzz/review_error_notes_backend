@@ -165,6 +165,7 @@ async def create_sheet(
             WrongQuestion.id.in_(data.question_ids),
             WrongQuestion.student_id == student.id,
             WrongQuestion.deleted_at.is_(None),
+            WrongQuestion.collection_status == "collected",
         )
     )
     questions = order_questions(question_result.scalars().all(), data.question_ids)

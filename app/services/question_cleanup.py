@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
-from sqlalchemy import exists, select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -30,8 +30,16 @@ def cleanup_expired_questions(
         questions = db.scalars(
             select(WrongQuestion)
             .where(
-                WrongQuestion.deleted_at.is_not(None),
-                WrongQuestion.deleted_at < cutoff,
+                or_(
+                    and_(
+                        WrongQuestion.deleted_at.is_not(None),
+                        WrongQuestion.deleted_at < cutoff,
+                    ),
+                    and_(
+                        WrongQuestion.collection_status == "ignored",
+                        WrongQuestion.updated_at < cutoff,
+                    ),
+                )
             )
             .order_by(WrongQuestion.deleted_at, WrongQuestion.id)
             .limit(settings.QUESTION_CLEANUP_BATCH_SIZE)

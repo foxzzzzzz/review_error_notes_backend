@@ -1,5 +1,7 @@
 """MiniMax Token Plan image understanding and structured recognition."""
 
+from __future__ import annotations
+
 import base64
 import io
 import json
@@ -7,6 +9,7 @@ import re
 import time
 import unicodedata
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, List, Literal, Optional
 
 import httpx
@@ -26,6 +29,7 @@ from app.services.error_mark_validation import (
     filter_valid_error_marks,
     validate_localization_red_evidence,
 )
+from app.services.question_collection import collection_reason_for, collection_status_for
 from app.services.tag_normalization import normalize_tags
 
 
@@ -410,7 +414,11 @@ def build_question_values(
                     "display_context_padding_ratio": crop_context_padding_ratio,
                 }
             )
-    return {
+    reliable_error_mark = bool(
+        localization_verified
+        and (localization.mark_ids or localization_red_verified)
+    )
+    values = {
         "crop_region": crop_region,
         "subject": item.subject,
         "ocr_text": item.raw_text,
@@ -421,6 +429,14 @@ def build_question_values(
         "difficulty": item.difficulty,
         "review_status": "needs_review" if needs_review else "confirmed",
     }
+    values["collection_status"] = collection_status_for(
+        SimpleNamespace(**values, reliable_error_mark=reliable_error_mark)
+    )
+    values["ocr_raw_json"]["collection_reason"] = collection_reason_for(
+        SimpleNamespace(**values, reliable_error_mark=reliable_error_mark)
+    )
+    values["ocr_raw_json"]["reliable_error_mark"] = reliable_error_mark
+    return values
 
 
 def recognize_question_batch(
@@ -558,6 +574,16 @@ def recognize_question_batch(
                 "local_ocr": local_ocr,
             }
         )
+        collection_subject = SimpleNamespace(
+            **question_values,
+            reliable_error_mark=question_values["ocr_raw_json"]["reliable_error_mark"],
+        )
+        question_values["collection_status"] = collection_status_for(
+            collection_subject
+        )
+        question_values["ocr_raw_json"]["collection_reason"] = (
+            collection_reason_for(collection_subject)
+        )
         values.append(question_values)
     return result, values
 
@@ -565,7 +591,11 @@ def recognize_question_batch(
 def image_status_for(question_values: List[dict]) -> str:
     """An image needs review when any recognized item needs review."""
     if any(
-        values["review_status"] == "needs_review"
+        values.get("collection_status") == "pending_review"
+        or (
+            "collection_status" not in values
+            and values.get("review_status") == "needs_review"
+        )
         for values in question_values
     ):
         return "needs_review"

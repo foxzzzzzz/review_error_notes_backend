@@ -11,7 +11,7 @@ from app.api.deps import get_default_student
 from app.models.student import Student
 from app.models.wrong_question import WrongQuestion
 from app.models.wrong_image import WrongImage
-from app.schemas.question import QuestionOut, QuestionUpdate
+from app.schemas.question import QuestionOut, QuestionUpdate, ReviewDecisionRequest
 from app.services.question_image import (
     QuestionImageInvalid,
     QuestionImageNotFound,
@@ -44,6 +44,7 @@ async def list_questions(
     q = select(WrongQuestion).where(
         WrongQuestion.student_id == student.id,
         WrongQuestion.deleted_at.is_(None),
+        WrongQuestion.collection_status == "collected",
     )
     if subject:
         q = q.where(WrongQuestion.subject == subject)
@@ -65,6 +66,99 @@ async def list_questions(
     ).offset(offset).limit(limit)
     result = await db.execute(q)
     return result.scalars().all()
+
+
+@router.get("/review/images")
+async def list_review_images(
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(WrongQuestion, WrongImage)
+        .join(WrongImage, WrongImage.id == WrongQuestion.image_id)
+        .where(
+            WrongQuestion.student_id == student.id,
+            WrongQuestion.deleted_at.is_(None),
+            WrongQuestion.collection_status == "pending_review",
+        )
+        .order_by(WrongImage.created_at.desc(), WrongQuestion.created_at.asc())
+    )
+    groups = {}
+    for question, image in result.all():
+        image_id = str(image.id)
+        group = groups.setdefault(
+            image_id,
+            {
+                "image_id": image_id,
+                "question_count": 0,
+                "questions": [],
+            },
+        )
+        item = QuestionOut.model_validate(question).model_dump(mode="json")
+        item["crop_region"] = question.crop_region
+        group["questions"].append(item)
+        group["question_count"] += 1
+    return list(groups.values())
+
+
+@router.post("/review/images/{image_id}/decisions")
+async def decide_image_reviews(
+    image_id: str,
+    data: ReviewDecisionRequest,
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    decisions = {str(item.question_id): item.decision for item in data.decisions}
+    if len(decisions) != len(data.decisions):
+        raise HTTPException(status_code=400, detail="Duplicate question decisions")
+    result = await db.execute(
+        select(WrongQuestion)
+        .where(
+            WrongQuestion.id.in_(list(decisions)),
+            WrongQuestion.image_id == image_id,
+            WrongQuestion.student_id == student.id,
+            WrongQuestion.deleted_at.is_(None),
+            WrongQuestion.collection_status == "pending_review",
+        )
+        .with_for_update()
+    )
+    questions = result.scalars().all()
+    if len(questions) != len(decisions):
+        raise HTTPException(status_code=404, detail="Review question not found")
+    for question in questions:
+        question.collection_status = (
+            "collected" if decisions[str(question.id)] == "collect" else "ignored"
+        )
+        question.review_status = "confirmed"
+
+    image = await db.scalar(
+        select(WrongImage)
+        .where(
+            WrongImage.id == image_id,
+            WrongImage.student_id == student.id,
+        )
+        .with_for_update()
+    )
+    if not image:
+        raise HTTPException(status_code=404, detail="Review image not found")
+    await db.flush()
+    remaining = await db.scalar(
+        select(WrongQuestion.id)
+        .where(
+            WrongQuestion.image_id == image.id,
+            WrongQuestion.collection_status == "pending_review",
+            WrongQuestion.deleted_at.is_(None),
+        )
+        .limit(1)
+    )
+    if not remaining:
+        image.status = "confirmed"
+    await db.commit()
+    return {
+        "collected": sum(item == "collect" for item in decisions.values()),
+        "ignored": sum(item == "ignore" for item in decisions.values()),
+        "remaining": bool(remaining),
+    }
 
 
 @router.get("/{question_id}", response_model=QuestionOut)

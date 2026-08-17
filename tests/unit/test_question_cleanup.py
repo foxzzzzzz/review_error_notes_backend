@@ -50,7 +50,7 @@ def _settings(upload_dir):
     )
 
 
-def test_cleanup_selects_only_expired_soft_deleted_questions_in_locked_batches(
+def test_cleanup_selects_expired_soft_deleted_and_ignored_questions_in_locked_batches(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(cleanup_module, "settings", _settings(tmp_path))
@@ -65,6 +65,8 @@ def test_cleanup_selects_only_expired_soft_deleted_questions_in_locked_batches(
     sql = str(compiled)
     assert "wrong_questions.deleted_at IS NOT NULL" in sql
     assert "wrong_questions.deleted_at <" in sql
+    assert "wrong_questions.collection_status =" in sql
+    assert "wrong_questions.updated_at <" in sql
     assert "LIMIT" in sql
     assert "FOR UPDATE SKIP LOCKED" in sql
     assert "ORDER BY wrong_questions.deleted_at, wrong_questions.id" in sql

@@ -49,6 +49,7 @@ async def load_profile_stats(
     ).where(
         WrongQuestion.student_id == student_id,
         WrongQuestion.deleted_at.is_(None),
+        WrongQuestion.collection_status == "collected",
     )
     row = (await db.execute(statement)).one()
     return ProfileStats(
