@@ -9,9 +9,13 @@ from jinja2 import Environment, FileSystemLoader
 from weasyprint import HTML
 
 from app.config import settings
+from app.services.pdf_layout import split_trailing_answer_line
 
 TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "templates")
 env = Environment(loader=FileSystemLoader(TEMPLATE_DIR), autoescape=True)
+
+
+env.filters["split_trailing_answer_line"] = split_trailing_answer_line
 
 
 def generate_sheet_pdf(

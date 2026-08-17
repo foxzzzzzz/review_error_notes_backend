@@ -5,7 +5,7 @@
 <style>
   @page {
     size: A4;
-    margin: 16mm 16mm 18mm;
+    margin: 12mm 12mm 14mm;
     @bottom-center {
       content: "第 " counter(page) " 页";
       color: #8a8a8a;
@@ -16,57 +16,92 @@
   body {
     color: #202124;
     font-family: "Noto Sans CJK SC", sans-serif;
-    font-size: 12pt;
-    line-height: 1.75;
+    font-size: 11.5pt;
+    line-height: 1.45;
+    margin: 0;
   }
   .header {
     border-bottom: 2px solid #2f6f4e;
-    margin-bottom: 8mm;
-    padding-bottom: 5mm;
+    margin-bottom: 5mm;
+    padding-bottom: 3mm;
     text-align: center;
   }
   .header h1 {
-    font-size: 20pt;
-    margin: 0 0 2mm;
+    font-size: 17pt;
+    margin: 0 0 1mm;
   }
   .meta {
     color: #5f6368;
-    font-size: 10.5pt;
+    font-size: 9pt;
     margin: 0;
+  }
+  main {
+    column-count: 2;
+    column-gap: 6mm;
   }
   .question-group {
     break-inside: avoid;
+    break-inside: avoid-column;
     border: 1px solid #dfe5e1;
-    border-radius: 3mm;
-    margin: 0 0 7mm;
-    padding: 5mm 6mm;
+    border-radius: 2mm;
+    box-sizing: border-box;
+    display: inline-block;
+    margin: 0 0 3.5mm;
+    padding: 3mm 4mm;
+    width: 100%;
   }
   .group-title {
     color: #2f6f4e;
-    font-size: 11pt;
+    font-size: 9.5pt;
     font-weight: 700;
-    margin-bottom: 2mm;
+    margin-bottom: 1.5mm;
   }
   .question-content {
-    font-size: 13pt;
+    align-items: baseline;
+    column-gap: 2mm;
+    display: flex;
+    flex-wrap: wrap;
+    font-size: 11.5pt;
+    line-height: 1.45;
+  }
+  .question-prompt {
+    flex: 0 1 auto;
+    max-width: 100%;
+    min-width: 0;
     white-space: pre-line;
+  }
+  .answer-line {
+    border-bottom: 0.7pt solid #5f6368;
+    flex: 1 1 22mm;
+    min-width: 22mm;
+    transform: translateY(-0.2em);
   }
   .derivatives {
     border-top: 1px dashed #b8c5bd;
-    margin-top: 4mm;
-    padding-top: 3mm;
+    margin-top: 2mm;
+    padding-top: 2mm;
   }
   .derivative {
-    margin-top: 3mm;
+    margin-top: 1.5mm;
+  }
+  .derivative:first-child {
+    margin-top: 0;
   }
   .derivative-label {
     color: #5f6368;
-    font-size: 10pt;
+    font-size: 9.5pt;
     font-weight: 700;
   }
 </style>
 </head>
 <body>
+{% macro render_question(display_text) -%}
+  {% set question = display_text | split_trailing_answer_line %}
+  <div class="question-content">
+    <span class="question-prompt">{{ question.prompt }}</span>
+    {% if question.has_answer_line %}<span class="answer-line" aria-hidden="true"></span>{% endif %}
+  </div>
+{%- endmacro %}
 <header class="header">
   <h1>{{ title }}</h1>
   <p class="meta">学生：{{ student_name }}　科目：{{ subject }}　日期：{{ date }}</p>
@@ -76,13 +111,13 @@
   {% for group in groups %}
   <section class="question-group">
     <div class="group-title">第 {{ loop.index }} 题 · 原题重做</div>
-    <div class="question-content">{{ group.original.display_text }}</div>
+    {{ render_question(group.original.display_text) }}
     {% if group.derivatives %}
     <div class="derivatives">
       {% for item in group.derivatives %}
       <div class="derivative">
         <div class="derivative-label">强化练习 {{ loop.index }}</div>
-        <div class="question-content">{{ item.display_text }}</div>
+        {{ render_question(item.display_text) }}
       </div>
       {% endfor %}
     </div>
