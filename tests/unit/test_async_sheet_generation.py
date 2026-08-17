@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import logging
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -113,6 +114,42 @@ def test_sheet_generation_soft_limit_is_positive():
     assert settings.SHEET_GENERATION_SOFT_TIME_LIMIT_SECONDS > 0
 
 
+def test_sheet_derivative_batch_configuration_defaults_and_bounds():
+    from pydantic import ValidationError
+
+    from app.config import Settings
+
+    values = Settings(_env_file=None)
+    assert values.SHEET_DERIVATIVE_GENERATION_MODE == "serial"
+    assert values.SHEET_DERIVATIVE_BATCH_SIZE == 8
+    assert values.SHEET_DERIVATIVE_MAX_CONCURRENCY == 3
+    assert values.LLM_REQUEST_TIMEOUT_SECONDS == 60
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, SHEET_DERIVATIVE_GENERATION_MODE="other")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, SHEET_DERIVATIVE_BATCH_SIZE=21)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, SHEET_DERIVATIVE_MAX_CONCURRENCY=9)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, LLM_REQUEST_TIMEOUT_SECONDS=0)
+
+
+def test_worker_receives_documented_batch_generation_settings():
+    backend = Path(__file__).parents[2]
+    compose = (backend / "docker-compose.yml").read_text(encoding="utf-8")
+    env_example = (backend / ".env.example").read_text(encoding="utf-8")
+
+    for name in (
+        "SHEET_DERIVATIVE_GENERATION_MODE",
+        "SHEET_DERIVATIVE_BATCH_SIZE",
+        "SHEET_DERIVATIVE_MAX_CONCURRENCY",
+        "LLM_REQUEST_TIMEOUT_SECONDS",
+    ):
+        assert name in compose
+        assert name in env_example
+
+
 class _GenerationRepository:
     def __init__(self, request):
         self.request = request
@@ -136,12 +173,12 @@ class _GenerationRepository:
         self.failed = (code, message)
 
 
-def _generation_request():
+def _generation_request(question_count=2, derived_per_original=2):
     from app.tasks.generate_sheet import SheetGenerationQuestion, SheetGenerationRequest
     from app.services.practice_question import PrintableQuestion
 
     questions = []
-    for index in range(2):
+    for index in range(question_count):
         original = PrintableQuestion(
             wrong_question_id=f"question-{index}",
             instruction="计算",
@@ -162,7 +199,7 @@ def _generation_request():
         title="错题重练",
         student_name="学生",
         subject="math",
-        derived_per_original=2,
+        derived_per_original=derived_per_original,
         difficulty_boost=2,
         questions=questions,
     )
@@ -189,11 +226,16 @@ def test_worker_reports_per_original_progress_and_completes_once():
             )
         ]
 
+    async def batch_generator(**_kwargs):
+        raise AssertionError("batch generator must not run in serial mode")
+
     asyncio.run(
         execute_sheet_generation(
             "sheet-id",
             repository=repository,
             derivative_generator=derivative_generator,
+            batch_derivative_generator=batch_generator,
+            generation_mode="serial",
             pdf_generator=lambda **_kwargs: "/pdfs/sheet.pdf",
             pdf_remover=lambda _path: None,
         )
@@ -204,6 +246,235 @@ def test_worker_reports_per_original_progress_and_completes_once():
     assert repository.completed[2] == "/pdfs/sheet.pdf"
     assert len(repository.completed[1]) == 2
     assert repository.failed is None
+
+
+def test_worker_skips_both_derivative_generators_for_original_only_batch_mode():
+    from app.tasks.generate_sheet import execute_sheet_generation
+
+    repository = _GenerationRepository(
+        _generation_request(question_count=3, derived_per_original=0)
+    )
+
+    async def fail(**_kwargs):
+        raise AssertionError("derivative generator must not run")
+
+    asyncio.run(
+        execute_sheet_generation(
+            "sheet-id",
+            repository=repository,
+            derivative_generator=fail,
+            batch_derivative_generator=fail,
+            generation_mode="batch",
+            batch_size=2,
+            max_concurrency=2,
+            pdf_generator=lambda **_kwargs: "/pdfs/originals.pdf",
+            pdf_remover=lambda _path: None,
+        )
+    )
+
+    assert repository.progress == [1, 2, 3]
+    assert [group["derivatives"] for group in repository.completed[1]] == [[], [], []]
+    assert repository.failed is None
+
+
+def test_worker_batches_questions_and_restores_order_after_out_of_order_completion():
+    from app.services.derivative import DerivativeBatchGenerationResult
+    from app.services.practice_question import PrintableQuestion
+    from app.tasks.generate_sheet import execute_sheet_generation
+
+    repository = _GenerationRepository(_generation_request(question_count=5))
+    calls = []
+
+    async def batch_generator(items, **_kwargs):
+        source_ids = [item.source_id for item in items]
+        calls.append(source_ids)
+        await asyncio.sleep({"question-0": 0.03, "question-2": 0.02}.get(source_ids[0], 0))
+        return DerivativeBatchGenerationResult(
+            variants_by_source_id={
+                item.source_id: [
+                    PrintableQuestion(
+                        wrong_question_id=item.source_id,
+                        instruction="计算",
+                        prompt_text=f"derived-{item.source_id}",
+                        question_type="calculation",
+                        display_text=f"derived-{item.source_id}",
+                        answer="1",
+                    )
+                ]
+                for item in items
+            },
+            usage={"total_tokens": len(items) * 10},
+        )
+
+    async def serial_generator(**_kwargs):
+        raise AssertionError("serial generator must not run in batch mode")
+
+    asyncio.run(
+        execute_sheet_generation(
+            "sheet-id",
+            repository=repository,
+            derivative_generator=serial_generator,
+            batch_derivative_generator=batch_generator,
+            generation_mode="batch",
+            batch_size=2,
+            max_concurrency=2,
+            pdf_generator=lambda **_kwargs: "/pdfs/batch.pdf",
+            pdf_remover=lambda _path: None,
+        )
+    )
+
+    assert calls == [
+        ["question-0", "question-1"],
+        ["question-2", "question-3"],
+        ["question-4"],
+    ]
+    groups = repository.completed[1]
+    assert [group["original"]["wrong_question_id"] for group in groups] == [
+        f"question-{index}" for index in range(5)
+    ]
+    assert [group["derivatives"][0]["prompt_text"] for group in groups] == [
+        f"derived-question-{index}" for index in range(5)
+    ]
+    assert repository.progress == sorted(repository.progress)
+    assert repository.progress[-1] == 5
+
+
+def test_worker_limits_batch_concurrency():
+    from app.services.derivative import DerivativeBatchGenerationResult
+    from app.tasks.generate_sheet import execute_sheet_generation
+
+    repository = _GenerationRepository(_generation_request(question_count=6))
+    active = 0
+    peak_active = 0
+
+    async def batch_generator(items, **_kwargs):
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return DerivativeBatchGenerationResult(
+            variants_by_source_id={item.source_id: [] for item in items},
+            usage={},
+        )
+
+    asyncio.run(
+        execute_sheet_generation(
+            "sheet-id",
+            repository=repository,
+            batch_derivative_generator=batch_generator,
+            generation_mode="batch",
+            batch_size=1,
+            max_concurrency=2,
+            pdf_generator=lambda **_kwargs: "/pdfs/batch.pdf",
+            pdf_remover=lambda _path: None,
+        )
+    )
+
+    assert peak_active == 2
+
+
+def test_worker_cancels_sibling_batches_after_first_failure():
+    from app.services.derivative import DerivativeGenerationError
+    from app.tasks.generate_sheet import execute_sheet_generation
+
+    repository = _GenerationRepository(_generation_request(question_count=2))
+    first_started = asyncio.Event()
+    cancelled = []
+
+    async def batch_generator(items, **_kwargs):
+        if items[0].source_id == "question-0":
+            first_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.append("question-0")
+                raise
+        await first_started.wait()
+        raise DerivativeGenerationError("provider batch failed")
+
+    asyncio.run(
+        execute_sheet_generation(
+            "sheet-id",
+            repository=repository,
+            batch_derivative_generator=batch_generator,
+            generation_mode="batch",
+            batch_size=1,
+            max_concurrency=2,
+            pdf_generator=lambda **_kwargs: "/pdfs/never.pdf",
+            pdf_remover=lambda _path: None,
+        )
+    )
+
+    assert cancelled == ["question-0"]
+    assert repository.completed is None
+    assert repository.failed == (
+        "sheet_derivative_failed",
+        "衍生题生成失败，请重试或调整为仅原题",
+    )
+
+
+def test_worker_logs_batch_and_phase_timing_without_question_content(caplog):
+    from app.services.derivative import DerivativeBatchGenerationResult
+    from app.tasks.generate_sheet import execute_sheet_generation
+
+    repository = _GenerationRepository(_generation_request(question_count=2))
+
+    async def batch_generator(items, **_kwargs):
+        return DerivativeBatchGenerationResult(
+            variants_by_source_id={item.source_id: [] for item in items},
+            usage={"prompt_tokens": 20, "completion_tokens": 10},
+        )
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(
+            execute_sheet_generation(
+                "sheet-id",
+                repository=repository,
+                batch_derivative_generator=batch_generator,
+                generation_mode="batch",
+                batch_size=2,
+                max_concurrency=1,
+                pdf_generator=lambda **_kwargs: "/pdfs/batch.pdf",
+                pdf_remover=lambda _path: None,
+            )
+        )
+
+    assert "sheet derivative batch completed" in caplog.text
+    assert "sheet derivative phase completed" in caplog.text
+    assert "sheet pdf phase completed" in caplog.text
+    assert "duration_ms=" in caplog.text
+    assert "prompt_tokens" in caplog.text
+    assert "0 + 1" not in caplog.text
+
+
+def test_worker_failure_log_does_not_include_provider_or_question_content(caplog):
+    from app.services.derivative import DerivativeGenerationError
+    from app.tasks.generate_sheet import execute_sheet_generation
+
+    repository = _GenerationRepository(_generation_request(question_count=1))
+
+    async def batch_generator(**_kwargs):
+        raise DerivativeGenerationError("secret-answer provider-response")
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(
+            execute_sheet_generation(
+                "sheet-id",
+                repository=repository,
+                batch_derivative_generator=batch_generator,
+                generation_mode="batch",
+                batch_size=1,
+                max_concurrency=1,
+                pdf_generator=lambda **_kwargs: "/pdfs/never.pdf",
+                pdf_remover=lambda _path: None,
+            )
+        )
+
+    assert "error_type=DerivativeGenerationError" in caplog.text
+    assert "secret-answer" not in caplog.text
+    assert "provider-response" not in caplog.text
+    assert "0 + 1" not in caplog.text
 
 
 def test_worker_ignores_duplicate_delivery_when_task_cannot_be_claimed():

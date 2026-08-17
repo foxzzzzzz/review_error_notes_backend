@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
@@ -24,6 +26,11 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = ""
     LLM_API_BASE: str = "https://api.openai.com/v1"
     LLM_MODEL: str = "gpt-4o-mini"
+    LLM_REQUEST_TIMEOUT_SECONDS: float = Field(
+        default=60,
+        gt=0,
+        description="Timeout in seconds for one LLM HTTP request.",
+    )
     MINIMAX_API_KEY: str = ""
     MINIMAX_API_HOST: str = ""
     MINIMAX_VISION_TIMEOUT_SECONDS: float = 60
@@ -75,6 +82,9 @@ class Settings(BaseSettings):
         gt=0,
         description="Soft time limit for one asynchronous sheet generation task.",
     )
+    SHEET_DERIVATIVE_GENERATION_MODE: Literal["serial", "batch"] = "serial"
+    SHEET_DERIVATIVE_BATCH_SIZE: int = Field(default=8, ge=1, le=20)
+    SHEET_DERIVATIVE_MAX_CONCURRENCY: int = Field(default=3, ge=1, le=8)
     UPLOAD_DIR: str = "./uploads"
     PDF_DIR: str = "./pdfs"
     AVATAR_DIR: str = "./avatars"

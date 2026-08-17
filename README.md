@@ -370,9 +370,13 @@ cd miniprogram
 
 每个新识别项同时保存：学生实际作答 `raw_text`、原练习要求 `instruction`、干净提示材料 `prompt_text`、正确答案 `answer` 和稳定题型 `question_type`。错题详情可以展示学生错答和模型参考，但 PDF 只根据 `instruction`、`prompt_text`、`question_type` 重建练习题，不打印学生错答和答案。
 
-`POST /api/sheets` 的 `derived_per_original` 支持 0 至 3，默认 0。值为 0 时仅生成原题且不依赖 LLM；值为 1 至 3 时需要配置 `LLM_API_KEY`，并对结构化衍生题执行非空、非原题复制和同组去重校验。PDF 使用单栏分组布局，不生成答案页。
+`POST /api/sheets` 的 `derived_per_original` 支持 0 至 3，默认 0。值为 0 时仅生成原题且不依赖 LLM；值为 1 至 3 时需要配置 `LLM_API_KEY`，并对结构化衍生题执行非空、非原题复制和同组去重校验。PDF 使用 A4 双栏分组布局，不生成答案页。
 
 `POST /api/sheets` 校验成功后以 HTTP 202 创建等待记录；衍生题和 PDF 由 Celery Worker 后台生成。Worker 逐原题更新进度，失败时写入安全提示且不保留部分题目或半成品 PDF。`LLM_API_KEY`、`LLM_API_BASE`、`LLM_MODEL` 必须注入 Worker，单任务软超时由 `SHEET_GENERATION_SOFT_TIME_LIMIT_SECONDS` 配置。
+
+衍生题默认使用 `SHEET_DERIVATIVE_GENERATION_MODE=serial` 保持逐题串行行为。云服务器完成小样本验证后可改为 `batch`，并通过 `SHEET_DERIVATIVE_BATCH_SIZE` 和 `SHEET_DERIVATIVE_MAX_CONCURRENCY` 控制每批题数及同一错题集内的最大并发批次数；修改这些变量后必须重启 Worker。单次 LLM HTTP 请求超时由 `LLM_REQUEST_TIMEOUT_SECONDS` 配置。
+
+批量模式首次上线按以下顺序验证：先保留 `serial` 部署并用 8 道原题×每题 1 道衍生题确认原流程正常；再设置 `SHEET_DERIVATIVE_GENERATION_MODE=batch`、`SHEET_DERIVATIVE_BATCH_SIZE=8`、`SHEET_DERIVATIVE_MAX_CONCURRENCY=3` 并仅重启 Worker，依次使用 8、24、57 道原题且每题 1 道衍生题验证数量、顺序、内容和耗时，57 道目标为 180 秒以内。出现 HTTP 429 或排队时先把并发数降至 `2`；出现响应截断、缺题或结构校验失败时先把批大小降至 `6`。批量失败不会静默回退串行，避免任务在用户不知情时再次运行约 30 分钟。
 
 部署本变更后必须执行 `alembic upgrade head`，重新构建并启动 API 与 Worker。验收时选择 57 道原题、每题 2 道衍生题，确认创建请求快速返回、进度持续更新、离开页面后任务继续且完成后 PDF 可查看。
 
@@ -427,6 +431,7 @@ student (学生)
 | `LLM_API_KEY` | OpenAI 兼容 API Key | 空=不启用 LLM |
 | `LLM_API_BASE` | LLM API 地址 | `https://api.openai.com/v1` |
 | `LLM_MODEL` | 模型名称 | `gpt-4o-mini` |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | 单次 LLM HTTP 请求超时秒数 | `60` |
 | `MINIMAX_API_KEY` | MiniMax Token Plan Key | - |
 | `MINIMAX_API_HOST` | 与 Key 地区匹配的 API Host | - |
 | `MINIMAX_VISION_TIMEOUT_SECONDS` | 图片理解请求超时秒数 | `60` |
@@ -454,6 +459,10 @@ student (学生)
 | `QUESTION_SOFT_DELETE_RETENTION_DAYS` | 软删除错题和无引用图片在物理清理前的保留天数 | `30` |
 | `QUESTION_CLEANUP_INTERVAL_SECONDS` | Beat 投递周期清理任务的间隔秒数 | `86400` |
 | `QUESTION_CLEANUP_BATCH_SIZE` | Worker 单次清理最多锁定和处理的记录数 | `100` |
+| `SHEET_GENERATION_SOFT_TIME_LIMIT_SECONDS` | 单个异步错题集任务软超时秒数 | `7200` |
+| `SHEET_DERIVATIVE_GENERATION_MODE` | 衍生题生成模式：`serial` 或 `batch` | `serial` |
+| `SHEET_DERIVATIVE_BATCH_SIZE` | 批量模式每个 Prompt 的原题数 | `8` |
+| `SHEET_DERIVATIVE_MAX_CONCURRENCY` | 同一错题集最大并发批次数 | `3` |
 | `DEV_MODE` | 开发模式（启用 dev-login） | `false` |
 | `WECHAT_APP_ID` | 小程序 AppID | - |
 | `WECHAT_APP_SECRET` | 小程序 Secret | - |
