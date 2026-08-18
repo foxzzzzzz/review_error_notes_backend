@@ -72,3 +72,16 @@ def test_failed_file_cleanup_retains_retry_job(monkeypatch):
     assert job.attempt_count == 1
     assert job.last_error == "PermissionError"
     assert db.commit_calls == 1
+
+
+def test_build_file_cleanup_job_accepts_one_pdf_and_rejects_unsafe_paths():
+    from app.services.file_cleanup import build_file_cleanup_job
+
+    job = build_file_cleanup_job("pdf", "/pdfs/sheet.pdf")
+
+    assert job.storage_kind == "pdf"
+    assert job.object_path == "/pdfs/sheet.pdf"
+    assert build_file_cleanup_job("pdf", None) is None
+    assert build_file_cleanup_job("pdf", "/uploads/sheet.pdf") is None
+    assert build_file_cleanup_job("pdf", "/pdfs/nested/sheet.pdf") is None
+    assert build_file_cleanup_job("unknown", "/pdfs/sheet.pdf") is None

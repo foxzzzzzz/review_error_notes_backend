@@ -1,4 +1,4 @@
-from sqlalchemy import Column, ForeignKey, Integer, String
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from app.models import Base, TimestampMixin, gen_uuid
 
@@ -20,3 +20,5 @@ class PracticeSheet(Base, TimestampMixin):
     generation_completed = Column(Integer, nullable=False, default=0, server_default="0")
     generation_error_code = Column(String(64), nullable=True)
     generation_error_message = Column(String(255), nullable=True)
+    generation_started_at = Column(DateTime, nullable=True)
+    generation_duration_seconds = Column(Integer, nullable=True)

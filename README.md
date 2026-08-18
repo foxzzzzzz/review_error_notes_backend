@@ -378,6 +378,8 @@ cd miniprogram
 
 批量模式首次上线按以下顺序验证：先保留 `serial` 部署并用 8 道原题×每题 1 道衍生题确认原流程正常；再设置 `SHEET_DERIVATIVE_GENERATION_MODE=batch`、`SHEET_DERIVATIVE_BATCH_SIZE=8`、`SHEET_DERIVATIVE_MAX_CONCURRENCY=3` 并仅重启 Worker，依次使用 8、24、57 道原题且每题 1 道衍生题验证数量、顺序、内容和耗时，57 道目标为 180 秒以内。出现 HTTP 429 或排队时先把并发数降至 `2`；出现响应截断、缺题或结构校验失败时先把批大小降至 `6`。批量失败不会静默回退串行，避免任务在用户不知情时再次运行约 30 分钟。
 
+Worker 在领取任务时记录 `generation_started_at`，完成题目、PDF 和状态写入时记录向上取整的 `generation_duration_seconds`；该时长不包含队列等待，仅在已完成历史记录中展示。终态错题集可通过 `DELETE /api/sheets/{id}` 删除；接口会同步删除其练习与题目快照、按剩余历史回算原错题统计，并将 PDF 纳入持久化文件清理任务。正在等待或处理的任务返回 409，原始错题和上传图片不会被删除。
+
 部署本变更后必须执行 `alembic upgrade head`，重新构建并启动 API 与 Worker。验收时选择 57 道原题、每题 2 道衍生题，确认创建请求快速返回、进度持续更新、离开页面后任务继续且完成后 PDF 可查看。
 
 | Method | Path | 说明 | 鉴权 |
@@ -393,6 +395,7 @@ cd miniprogram
 | DELETE | `/api/questions/{id}` | 删除错题 | ✅ |
 | POST | `/api/sheets` | 生成错题集 | ✅ |
 | GET | `/api/sheets` | 历史错题集列表 | ✅ |
+| DELETE | `/api/sheets/{id}` | 删除终态错题集并回算练习统计 | ✅ |
 | GET | `/api/sheets/{id}/generation` | 查询后台生成状态与进度 | ✅ |
 | POST | `/api/sheets/{id}/retry` | 重新投递失败的错题集 | ✅ |
 | GET | `/api/sheets/{id}/review` | 读取错题集题目与最新练习结果 | ✅ |

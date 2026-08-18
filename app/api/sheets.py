@@ -1,10 +1,11 @@
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pathlib import Path
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_default_student
@@ -37,8 +38,11 @@ from app.services.practice_results import (
     calculate_attempt_summary,
     group_item_results,
 )
+from app.services.file_cleanup import attempt_file_cleanup
+from app.services.sheet_deletion import delete_sheet_data
 
 router = APIRouter(prefix="/sheets", tags=["sheets"])
+logger = logging.getLogger(__name__)
 
 
 def enqueue_sheet_generation(sheet_id: str) -> None:
@@ -266,6 +270,7 @@ async def list_sheets(
             generation_completed=sheet.generation_completed,
             generation_error_code=sheet.generation_error_code,
             generation_error_message=sheet.generation_error_message,
+            generation_duration_seconds=sheet.generation_duration_seconds,
             items=[],
             latest_accuracy=(
                 float(row_latest_accuracy)
@@ -288,6 +293,43 @@ async def get_sheet_generation(
     db: AsyncSession = Depends(get_db),
 ):
     return await _owned_sheet(db, student.id, sheet_id)
+
+
+@router.delete("/{sheet_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_sheet(
+    sheet_id: str,
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    sheet = await _owned_sheet(db, student.id, sheet_id, lock=True)
+    if sheet.generation_status not in {"completed", "failed"}:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "错题集正在生成，暂不能删除"
+                if sheet.generation_status in {"pending", "processing"}
+                else "当前错题集状态暂不能删除"
+            ),
+        )
+
+    cleanup_job_id = await delete_sheet_data(db, sheet, student.id)
+    await db.commit()
+    if cleanup_job_id is not None:
+        try:
+            await attempt_file_cleanup(db, cleanup_job_id)
+        except SQLAlchemyError:
+            logger.exception(
+                "Immediate sheet PDF cleanup failed after deletion",
+                extra={"sheet_id": str(sheet_id), "cleanup_job_id": str(cleanup_job_id)},
+            )
+            try:
+                await db.rollback()
+            except SQLAlchemyError:
+                logger.exception(
+                    "Failed to roll back immediate sheet PDF cleanup attempt",
+                    extra={"sheet_id": str(sheet_id)},
+                )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/{sheet_id}/pdf")

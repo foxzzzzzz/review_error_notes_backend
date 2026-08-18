@@ -13,6 +13,27 @@ _STORAGE_LOCATIONS = {
 }
 
 
+def build_file_cleanup_job(
+    storage_kind: str,
+    object_path: str | None,
+) -> FileCleanupJob | None:
+    location = _STORAGE_LOCATIONS.get(storage_kind)
+    if location is None or not object_path:
+        return None
+
+    normalized = PurePosixPath(object_path)
+    try:
+        relative_path = normalized.relative_to(location[0])
+    except ValueError:
+        return None
+    if len(relative_path.parts) != 1 or relative_path.name in {"", ".", ".."}:
+        return None
+    return FileCleanupJob(
+        storage_kind=storage_kind,
+        object_path=str(normalized),
+    )
+
+
 def _delete_cleanup_path(job: FileCleanupJob) -> None:
     location = _STORAGE_LOCATIONS.get(job.storage_kind)
     if location is None:

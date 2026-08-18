@@ -1,7 +1,7 @@
 import asyncio
 import importlib.util
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,10 +15,26 @@ MIGRATION_PATH = (
     / "versions"
     / "0005_async_sheet_generation.py"
 )
+DURATION_MIGRATION_PATH = (
+    Path(__file__).parents[2]
+    / "alembic"
+    / "versions"
+    / "0006_sheet_duration.py"
+)
 
 
 def _load_migration():
     spec = importlib.util.spec_from_file_location("async_sheet_migration", MIGRATION_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_duration_migration():
+    spec = importlib.util.spec_from_file_location(
+        "sheet_duration_migration",
+        DURATION_MIGRATION_PATH,
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -76,6 +92,35 @@ def test_practice_sheet_model_exposes_generation_state_columns():
     assert columns.generation_error_message.nullable is True
 
 
+def test_sheet_duration_migration_adds_nullable_timing_columns():
+    migration = _load_duration_migration()
+    recorder = _MigrationRecorder()
+    migration.op = recorder
+
+    migration.upgrade()
+
+    assert migration.down_revision == "0005"
+    assert [column.name for _, column in recorder.added] == [
+        "generation_started_at",
+        "generation_duration_seconds",
+    ]
+    assert all(column.nullable is True for _, column in recorder.added)
+
+    migration.downgrade()
+    assert recorder.dropped == [
+        ("practice_sheets", "generation_duration_seconds"),
+        ("practice_sheets", "generation_started_at"),
+    ]
+
+
+def test_practice_sheet_model_exposes_nullable_generation_timing_columns():
+    from app.models.practice_sheet import PracticeSheet
+
+    columns = PracticeSheet.__table__.c
+    assert columns.generation_started_at.nullable is True
+    assert columns.generation_duration_seconds.nullable is True
+
+
 def test_sheet_generation_schema_reports_original_question_progress():
     from app.schemas.sheet import SheetGenerationOut, SheetOut
 
@@ -88,6 +133,7 @@ def test_sheet_generation_schema_reports_original_question_progress():
         generation_completed=12,
         generation_error_code=None,
         generation_error_message=None,
+        generation_duration_seconds=None,
         pdf_url=None,
         updated_at=now,
     )
@@ -101,11 +147,55 @@ def test_sheet_generation_schema_reports_original_question_progress():
         generation_status="pending",
         generation_total=57,
         generation_completed=0,
+        generation_duration_seconds=38,
     )
 
     assert generation.generation_completed == 12
     assert generation.generation_total == 57
     assert sheet.generation_status == "pending"
+    assert sheet.generation_duration_seconds == 38
+
+
+def test_generation_timing_rounds_up_and_resets_for_retry():
+    from app.tasks.generate_sheet import (
+        _complete_sheet_generation_timing,
+        _start_sheet_generation_timing,
+    )
+
+    started_at = datetime(2026, 8, 18, 1, 0, 0)
+    sheet = type(
+        "Sheet",
+        (),
+        {
+            "generation_started_at": started_at - timedelta(minutes=1),
+            "generation_duration_seconds": 60,
+        },
+    )()
+
+    _start_sheet_generation_timing(sheet, started_at)
+    assert sheet.generation_started_at == started_at
+    assert sheet.generation_duration_seconds is None
+
+    _complete_sheet_generation_timing(
+        sheet,
+        started_at + timedelta(milliseconds=1),
+    )
+    assert sheet.generation_duration_seconds == 1
+
+
+def test_generation_timing_clamps_negative_clock_skew_to_zero():
+    from app.tasks.generate_sheet import _generation_duration_seconds
+
+    started_at = datetime(2026, 8, 18, 1, 0, 0)
+
+    assert _generation_duration_seconds(
+        started_at,
+        started_at + timedelta(seconds=12),
+    ) == 12
+    assert _generation_duration_seconds(
+        started_at,
+        started_at - timedelta(seconds=1),
+    ) == 0
 
 
 def test_sheet_generation_soft_limit_is_positive():
@@ -696,3 +786,175 @@ def test_unfinished_sheet_cannot_enter_practice_flow(status):
     assert exc_info.value.detail == (
         "衍生题生成失败" if status == "failed" else "错题集尚未生成完成"
     )
+
+
+class _DeleteSheetRouteDb:
+    def __init__(self, sheet):
+        self.sheet = sheet
+        self.events = []
+
+    async def scalar(self, _query):
+        return self.sheet
+
+    async def commit(self):
+        self.events.append("commit")
+
+    async def rollback(self):
+        self.events.append("rollback")
+
+
+@pytest.mark.parametrize("generation_status", ["pending", "processing"])
+def test_active_sheet_cannot_be_deleted(generation_status):
+    from app.api.sheets import delete_sheet
+
+    sheet = type(
+        "Sheet",
+        (),
+        {"id": uuid4(), "generation_status": generation_status},
+    )()
+    db = _DeleteSheetRouteDb(sheet)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            delete_sheet(
+                str(sheet.id),
+                student=type("Student", (), {"id": "student-id"})(),
+                db=db,
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "错题集正在生成，暂不能删除"
+    assert db.events == []
+
+
+@pytest.mark.parametrize("generation_status", ["completed", "failed"])
+def test_terminal_sheet_delete_commits_before_immediate_pdf_cleanup(
+    generation_status,
+    monkeypatch,
+):
+    from app.api import sheets as sheets_api
+
+    sheet = type(
+        "Sheet",
+        (),
+        {"id": uuid4(), "generation_status": generation_status},
+    )()
+    db = _DeleteSheetRouteDb(sheet)
+    cleanup_job_id = uuid4()
+
+    async def delete_data(received_db, received_sheet, student_id):
+        assert received_db is db
+        assert received_sheet is sheet
+        assert student_id == "student-id"
+        db.events.append("delete")
+        return cleanup_job_id
+
+    async def cleanup(received_db, received_job_id):
+        assert received_db is db
+        assert received_job_id == cleanup_job_id
+        assert db.events == ["delete", "commit"]
+        db.events.append("cleanup_failed_but_queued")
+        return False
+
+    monkeypatch.setattr(sheets_api, "delete_sheet_data", delete_data, raising=False)
+    monkeypatch.setattr(sheets_api, "attempt_file_cleanup", cleanup, raising=False)
+
+    response = asyncio.run(
+        sheets_api.delete_sheet(
+            str(sheet.id),
+            student=type("Student", (), {"id": "student-id"})(),
+            db=db,
+        )
+    )
+
+    assert response.status_code == 204
+    assert db.events == ["delete", "commit", "cleanup_failed_but_queued"]
+
+
+def test_missing_sheet_delete_returns_not_found():
+    from app.api.sheets import delete_sheet
+
+    db = _DeleteSheetRouteDb(None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            delete_sheet(
+                str(uuid4()),
+                student=type("Student", (), {"id": "student-id"})(),
+                db=db,
+            )
+        )
+
+    assert exc_info.value.status_code == 404
+
+
+def test_unknown_sheet_status_cannot_be_deleted(monkeypatch):
+    from app.api import sheets as sheets_api
+
+    sheet = type(
+        "Sheet",
+        (),
+        {"id": uuid4(), "generation_status": "archived"},
+    )()
+    db = _DeleteSheetRouteDb(sheet)
+
+    async def unexpected_delete(*_args, **_kwargs):
+        raise AssertionError("unknown status must not enter deletion")
+
+    monkeypatch.setattr(
+        sheets_api,
+        "delete_sheet_data",
+        unexpected_delete,
+        raising=False,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            sheets_api.delete_sheet(
+                str(sheet.id),
+                student=type("Student", (), {"id": "student-id"})(),
+                db=db,
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert db.events == []
+
+
+def test_cleanup_database_error_after_delete_commit_still_returns_success(
+    monkeypatch,
+):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.api import sheets as sheets_api
+
+    sheet = type(
+        "Sheet",
+        (),
+        {"id": uuid4(), "generation_status": "completed"},
+    )()
+    db = _DeleteSheetRouteDb(sheet)
+    cleanup_job_id = uuid4()
+
+    async def delete_data(*_args, **_kwargs):
+        db.events.append("delete")
+        return cleanup_job_id
+
+    async def cleanup(*_args, **_kwargs):
+        db.events.append("cleanup")
+        raise SQLAlchemyError("cleanup database unavailable")
+
+    monkeypatch.setattr(sheets_api, "delete_sheet_data", delete_data, raising=False)
+    monkeypatch.setattr(sheets_api, "attempt_file_cleanup", cleanup, raising=False)
+
+    response = asyncio.run(
+        sheets_api.delete_sheet(
+            str(sheet.id),
+            student=type("Student", (), {"id": "student-id"})(),
+            db=db,
+        )
+    )
+
+    assert response.status_code == 204
+    assert db.events == ["delete", "commit", "cleanup", "rollback"]

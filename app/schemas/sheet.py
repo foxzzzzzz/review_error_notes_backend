@@ -33,6 +33,7 @@ class SheetOut(BaseModel):
     generation_completed: int = 0
     generation_error_code: Optional[str] = None
     generation_error_message: Optional[str] = None
+    generation_duration_seconds: Optional[int] = None
     items: list[SheetItemOut] = []
     latest_accuracy: Optional[float] = None
     attempt_count: int = 0
@@ -49,6 +50,7 @@ class SheetGenerationOut(BaseModel):
     generation_completed: int
     generation_error_code: Optional[str] = None
     generation_error_message: Optional[str] = None
+    generation_duration_seconds: Optional[int] = None
     pdf_url: Optional[str]
     updated_at: datetime
 

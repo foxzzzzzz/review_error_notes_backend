@@ -96,3 +96,13 @@ def test_alembic_environment_imports_phase_four_recovery_models():
     source = (ROOT / "alembic" / "env.py").read_text(encoding="utf-8")
 
     assert "app.models.account_recovery" in source
+
+
+def test_sheet_duration_revision_follows_async_generation_revision():
+    revision = VERSIONS / "0006_sheet_duration.py"
+
+    assert revision.exists()
+    source = revision.read_text(encoding="utf-8")
+    assert 'down_revision: Union[str, None] = "0005"' in source
+    assert '"generation_started_at"' in source
+    assert '"generation_duration_seconds"' in source

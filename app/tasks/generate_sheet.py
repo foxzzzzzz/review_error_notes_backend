@@ -2,8 +2,10 @@
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Callable
 
 import httpx
@@ -33,6 +35,32 @@ from app.tasks.celery_app import celery_app
 
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _generation_duration_seconds(
+    started_at: datetime,
+    completed_at: datetime,
+) -> int:
+    return math.ceil(max(0.0, (completed_at - started_at).total_seconds()))
+
+
+def _start_sheet_generation_timing(sheet, started_at: datetime) -> None:
+    sheet.generation_started_at = started_at
+    sheet.generation_duration_seconds = None
+
+
+def _complete_sheet_generation_timing(sheet, completed_at: datetime) -> None:
+    if sheet.generation_started_at is None:
+        sheet.generation_duration_seconds = None
+        return
+    sheet.generation_duration_seconds = _generation_duration_seconds(
+        sheet.generation_started_at,
+        completed_at,
+    )
 
 
 class SheetGenerationInputError(RuntimeError):
@@ -93,6 +121,7 @@ class SheetGenerationRepository:
             sheet.generation_completed = 0
             sheet.generation_error_code = None
             sheet.generation_error_message = None
+            _start_sheet_generation_timing(sheet, _utc_now())
             db.commit()
 
             generation_questions = [
@@ -186,6 +215,7 @@ class SheetGenerationRepository:
             sheet.generation_completed = sheet.generation_total
             sheet.generation_error_code = None
             sheet.generation_error_message = None
+            _complete_sheet_generation_timing(sheet, _utc_now())
             db.commit()
 
     def fail(self, sheet_id: str, code: str, message: str) -> None:
