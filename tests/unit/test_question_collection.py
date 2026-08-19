@@ -67,6 +67,14 @@ def test_ignored_item_does_not_keep_image_in_review_state():
     ]) == "confirmed"
 
 
+def test_recognized_item_not_auto_collected_is_retained_for_review():
+    from app.tasks.process_image import collection_status_to_persist
+
+    assert collection_status_to_persist("collected") == "collected"
+    assert collection_status_to_persist("pending_review") == "pending_review"
+    assert collection_status_to_persist("ignored") == "pending_review"
+
+
 def test_collection_reason_explains_answer_and_error_mark_conflict():
     from app.services.question_collection import collection_reason_for
 

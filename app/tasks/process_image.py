@@ -29,6 +29,11 @@ def processing_failure_for(_error: Exception) -> tuple[str, str]:
     return "recognition_failed", "图片识别失败，请重试"
 
 
+def collection_status_to_persist(collection_status: str) -> str:
+    """Keep recognized candidates available for an explicit user decision."""
+    return "pending_review" if collection_status == "ignored" else collection_status
+
+
 def log_mark_validation_diagnostics(
     image_id: str,
     question_values: list[dict],
@@ -112,9 +117,10 @@ def process_image(self, image_id: str, filepath: str):
             persisted_values = []
             for values in question_values:
                 values["ocr_raw_json"]["ignored_text"] = result.ignored_text
-                collection_status = values["collection_status"]
-                if collection_status == "ignored":
-                    continue
+                collection_status = collection_status_to_persist(
+                    values["collection_status"]
+                )
+                values["collection_status"] = collection_status
                 question_values_for_db = {
                     key: value
                     for key, value in values.items()
