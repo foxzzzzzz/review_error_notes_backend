@@ -54,6 +54,17 @@ def test_prompt_prioritizes_red_error_marks_and_falls_back_to_all_questions():
     assert "[left, top, right, bottom]" in RECOGNITION_PROMPT
 
 
+def test_recognition_correction_adds_only_the_selected_constraint():
+    from app.services.vision_recognition import recognition_correction_instruction
+
+    assert "红色错误标记" in recognition_correction_instruction("missed_errors")
+    assert "可靠错误证据" in recognition_correction_instruction("false_positives")
+    both = recognition_correction_instruction("both")
+    assert "红色错误标记" in both
+    assert "可靠错误证据" in both
+    assert recognition_correction_instruction(None) == ""
+
+
 def test_prompt_splits_marked_worksheet_into_smallest_answerable_units():
     from app.services.vision_recognition import RECOGNITION_PROMPT
 

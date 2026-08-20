@@ -1,6 +1,7 @@
 """Tests for question CRUD API."""
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -10,6 +11,25 @@ from fastapi.testclient import TestClient
 from sqlalchemy.dialects import postgresql
 
 from app.api import questions as question_api
+
+
+def test_review_reprocess_route_replaces_only_pending_candidates():
+    source = (Path(__file__).parents[1] / "app" / "api" / "questions.py").read_text(encoding="utf-8")
+
+    assert '@router.post("/review/images/{image_id}/reprocess")' in source
+    assert 'WrongQuestion.collection_status == "pending_review"' in source
+    assert 'question.collection_status = "superseded"' in source
+    assert 'process_image.delay' in source
+
+
+def test_review_decision_locks_image_before_its_questions():
+    source = (Path(__file__).parents[1] / "app" / "api" / "questions.py").read_text(encoding="utf-8")
+    decision_source = source[
+        source.index("async def decide_image_reviews"):
+        source.index("async def reprocess_review_image")
+    ]
+
+    assert decision_source.index("select(WrongImage)") < decision_source.index("select(WrongQuestion)")
 
 
 def test_list_route_hides_soft_deleted_question_without_postgres():

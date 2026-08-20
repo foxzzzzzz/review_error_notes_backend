@@ -37,6 +37,15 @@ VISION_PATH = "/v1/coding_plan/vlm"
 OUTPUT_RE = re.compile(r"<output>\s*(.*?)\s*</output>", re.DOTALL)
 FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
+
+def recognition_correction_instruction(correction: Optional[str]) -> str:
+    instructions = {
+        "missed_errors": "本图上次可能漏识别错题：请重点复查红色错误标记及其对应的完整作答单元。",
+        "false_positives": "本图上次可能误识别正确题：只保留具有可靠错误证据的题目，不要把无错误标记的正确题列为错题。",
+        "both": "本图上次可能同时漏识别错题并误识别正确题：重点复查红色错误标记及其对应作答单元，并只保留具有可靠错误证据的题目。",
+    }
+    return instructions.get(correction, "")
+
 RECOGNITION_PROMPT = """你是小学错题内容与红色批改标记识别器。请观察整张图片，一次性输出题目内容和独立的红色错误标记。
 
 要求：
@@ -452,9 +461,13 @@ def recognize_question_batch(
     tag_config_path: str,
     ocr_verifier,
     crop_context_padding_ratio: float = 0.0,
+    recognition_correction: Optional[str] = None,
 ) -> tuple[VisionResult, List[dict]]:
     """Recognize marks/content, independently localize, then OCR-check each crop."""
-    result = client.recognize(image_path, subject_hint=subject_hint)
+    recognize_kwargs = {"subject_hint": subject_hint}
+    if recognition_correction:
+        recognize_kwargs["recognition_correction"] = recognition_correction
+    result = client.recognize(image_path, **recognize_kwargs)
     try:
         valid_marks, rejected_mark_ids, mark_diagnostics = filter_valid_error_marks(
             image_path,
@@ -679,13 +692,22 @@ class MiniMaxVisionClient:
             retry_delay_seconds=settings.MINIMAX_VISION_RETRY_DELAY_SECONDS,
         )
 
-    def recognize(self, image_path: str, subject_hint: Optional[str] = None) -> VisionResult:
+    def recognize(
+        self,
+        image_path: str,
+        subject_hint: Optional[str] = None,
+        recognition_correction: Optional[str] = None,
+    ) -> VisionResult:
         if not self.api_key or not self.api_host:
             raise VisionRecognitionError("MiniMax vision is not configured")
 
         image_url = prepare_image_data_url(image_path, self.max_edge, self.jpeg_quality)
+        correction_instruction = recognition_correction_instruction(
+            recognition_correction
+        )
         payload = {
-            "prompt": RECOGNITION_PROMPT.format(subject_hint=subject_hint or "自动判断"),
+            "prompt": RECOGNITION_PROMPT.format(subject_hint=subject_hint or "自动判断")
+            + ("\n\n纠偏要求：" + correction_instruction if correction_instruction else ""),
             "image_url": image_url,
         }
 

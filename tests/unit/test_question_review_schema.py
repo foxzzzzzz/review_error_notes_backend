@@ -17,3 +17,10 @@ def test_question_detail_exposes_structured_review_context():
 
     assert "ocr_answer" in fields
     assert "ocr_raw_json" in fields
+
+
+def test_review_reprocessing_accepts_only_fixed_correction_reasons():
+    source = (Path(__file__).parents[2] / "app" / "schemas" / "question.py").read_text(encoding="utf-8")
+
+    assert "class ReviewImageReprocessRequest" in source
+    assert 'Literal["missed_errors", "false_positives", "both"]' in source

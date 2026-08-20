@@ -41,3 +41,7 @@ class ReviewDecision(BaseModel):
 
 class ReviewDecisionRequest(BaseModel):
     decisions: list[ReviewDecision] = Field(min_length=1)
+
+
+class ReviewImageReprocessRequest(BaseModel):
+    correction: Literal["missed_errors", "false_positives", "both"]

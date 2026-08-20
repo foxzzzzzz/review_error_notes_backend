@@ -106,3 +106,12 @@ def test_sheet_duration_revision_follows_async_generation_revision():
     assert 'down_revision: Union[str, None] = "0005"' in source
     assert '"generation_started_at"' in source
     assert '"generation_duration_seconds"' in source
+
+
+def test_image_recognition_correction_revision_follows_sheet_duration():
+    revision = VERSIONS / "0007_image_recognition_correction.py"
+
+    assert revision.exists()
+    source = revision.read_text(encoding="utf-8")
+    assert 'down_revision: Union[str, None] = "0006"' in source
+    assert '"recognition_correction"' in source

@@ -75,6 +75,18 @@ def test_recognized_item_not_auto_collected_is_retained_for_review():
     assert collection_status_to_persist("ignored") == "pending_review"
 
 
+def test_strict_reprocessing_drops_automatically_ignored_candidates():
+    from app.tasks.process_image import should_persist_candidate
+
+    ignored = {"collection_status": "ignored"}
+    pending = {"collection_status": "pending_review"}
+
+    assert not should_persist_candidate(ignored, "false_positives")
+    assert not should_persist_candidate(ignored, "both")
+    assert should_persist_candidate(ignored, "missed_errors")
+    assert should_persist_candidate(pending, "false_positives")
+
+
 def test_collection_reason_explains_answer_and_error_mark_conflict():
     from app.services.question_collection import collection_reason_for
 

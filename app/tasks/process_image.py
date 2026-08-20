@@ -34,6 +34,14 @@ def collection_status_to_persist(collection_status: str) -> str:
     return "pending_review" if collection_status == "ignored" else collection_status
 
 
+def should_persist_candidate(values: dict, recognition_correction: str | None) -> bool:
+    """Strict correction modes discard candidates previously judged as correct."""
+    return not (
+        recognition_correction in {"false_positives", "both"}
+        and values["collection_status"] == "ignored"
+    )
+
+
 def log_mark_validation_diagnostics(
     image_id: str,
     question_values: list[dict],
@@ -70,6 +78,7 @@ def process_image(self, image_id: str, filepath: str):
             if not image or image.status != "pending":
                 return
             subject_hint = image.subject
+            recognition_correction = image.recognition_correction
             image.status = "segmented"
             db.commit()
             claimed = True
@@ -99,6 +108,7 @@ def process_image(self, image_id: str, filepath: str):
                 support_similarity_threshold=settings.LOCAL_OCR_SUPPORT_SIMILARITY_THRESHOLD,
                 contradiction_similarity_threshold=settings.LOCAL_OCR_CONTRADICTION_SIMILARITY_THRESHOLD,
             ),
+            recognition_correction=recognition_correction,
         )
         log_mark_validation_diagnostics(image_id, question_values)
 
@@ -117,6 +127,8 @@ def process_image(self, image_id: str, filepath: str):
             persisted_values = []
             for values in question_values:
                 values["ocr_raw_json"]["ignored_text"] = result.ignored_text
+                if not should_persist_candidate(values, recognition_correction):
+                    continue
                 collection_status = collection_status_to_persist(
                     values["collection_status"]
                 )
@@ -139,6 +151,7 @@ def process_image(self, image_id: str, filepath: str):
 
             image.question_count = len(persisted_values)
             image.status = image_status_for(question_values)
+            image.recognition_correction = None
             if not image.subject:
                 image.subject = result.items[0].subject
             db.commit()

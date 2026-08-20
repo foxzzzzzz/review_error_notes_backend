@@ -5,13 +5,19 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Query, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from app.config import settings
 from app.database import get_db
 from app.api.deps import get_default_student
 from app.models.student import Student
 from app.models.wrong_question import WrongQuestion
 from app.models.wrong_image import WrongImage
-from app.schemas.question import QuestionOut, QuestionUpdate, ReviewDecisionRequest
+from app.schemas.question import (
+    QuestionOut,
+    QuestionUpdate,
+    ReviewDecisionRequest,
+    ReviewImageReprocessRequest,
+)
+from app.config import settings
+from app.tasks.process_image import process_image
 from app.services.question_image import (
     QuestionImageInvalid,
     QuestionImageNotFound,
@@ -111,6 +117,16 @@ async def decide_image_reviews(
     decisions = {str(item.question_id): item.decision for item in data.decisions}
     if len(decisions) != len(data.decisions):
         raise HTTPException(status_code=400, detail="Duplicate question decisions")
+    image = await db.scalar(
+        select(WrongImage)
+        .where(
+            WrongImage.id == image_id,
+            WrongImage.student_id == student.id,
+        )
+        .with_for_update()
+    )
+    if not image:
+        raise HTTPException(status_code=404, detail="Review image not found")
     result = await db.execute(
         select(WrongQuestion)
         .where(
@@ -131,16 +147,6 @@ async def decide_image_reviews(
         )
         question.review_status = "confirmed"
 
-    image = await db.scalar(
-        select(WrongImage)
-        .where(
-            WrongImage.id == image_id,
-            WrongImage.student_id == student.id,
-        )
-        .with_for_update()
-    )
-    if not image:
-        raise HTTPException(status_code=404, detail="Review image not found")
     await db.flush()
     remaining = await db.scalar(
         select(WrongQuestion.id)
@@ -159,6 +165,60 @@ async def decide_image_reviews(
         "ignored": sum(item == "ignore" for item in decisions.values()),
         "remaining": bool(remaining),
     }
+
+
+@router.post("/review/images/{image_id}/reprocess")
+async def reprocess_review_image(
+    image_id: str,
+    data: ReviewImageReprocessRequest,
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    image = await db.scalar(
+        select(WrongImage)
+        .where(
+            WrongImage.id == image_id,
+            WrongImage.student_id == student.id,
+        )
+        .with_for_update()
+    )
+    if not image:
+        raise HTTPException(status_code=404, detail="Review image not found")
+    result = await db.execute(
+        select(WrongQuestion)
+        .where(
+            WrongQuestion.image_id == image.id,
+            WrongQuestion.student_id == student.id,
+            WrongQuestion.collection_status == "pending_review",
+            WrongQuestion.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )
+    questions = result.scalars().all()
+    if not questions:
+        raise HTTPException(status_code=409, detail="No pending review questions")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for question in questions:
+        question.collection_status = "superseded"
+        question.deleted_at = now
+    image.status = "pending"
+    image.question_count = 0
+    image.error_code = None
+    image.error_message = None
+    image.recognition_correction = data.correction
+    await db.commit()
+    try:
+        filepath = str(Path(settings.UPLOAD_DIR) / Path(image.original_url).name)
+        process_image.delay(str(image.id), filepath)
+    except Exception:
+        for question in questions:
+            question.collection_status = "pending_review"
+            question.deleted_at = None
+        image.status = "needs_review"
+        image.recognition_correction = None
+        await db.commit()
+        raise HTTPException(status_code=503, detail="处理任务投递失败，请重试")
+    return {"image_id": str(image.id), "status": "pending"}
 
 
 @router.get("/{question_id}", response_model=QuestionOut)
