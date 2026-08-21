@@ -2,6 +2,7 @@
 
 import json
 import logging
+import unicodedata
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -43,6 +44,38 @@ def should_persist_candidate(values: dict, recognition_correction: str | None) -
         recognition_correction in {"false_positives", "both"}
         and values["collection_status"] == "ignored"
     )
+
+
+def candidate_identity_for(values: dict) -> tuple[str, str, str, str, str]:
+    def normalize(value) -> str:
+        normalized = unicodedata.normalize("NFKC", value or "").casefold()
+        return "".join(character for character in normalized if character.isalnum())
+
+    raw = values.get("ocr_raw_json", {})
+    return (
+        normalize(raw.get("instruction")),
+        normalize(raw.get("prompt_text")),
+        normalize(values.get("ocr_text")),
+        normalize(values.get("ocr_answer")),
+        values.get("question_type") or "",
+    )
+
+
+def discard_pending_duplicates_of_collected(question_values: list[dict]) -> list[dict]:
+    """Prefer a reliable auto-collected copy over the same pending candidate."""
+    collected_identities = {
+        candidate_identity_for(candidate)
+        for candidate in question_values
+        if candidate["collection_status"] == "collected"
+    }
+    return [
+        candidate
+        for candidate in question_values
+        if not (
+            candidate["collection_status"] in {"pending_review", "ignored"}
+            and candidate_identity_for(candidate) in collected_identities
+        )
+    ]
 
 
 def log_mark_validation_diagnostics(
@@ -116,6 +149,7 @@ def process_image(self, image_id: str, filepath: str):
             recognition_correction=recognition_correction,
         )
         log_mark_validation_diagnostics(image_id, question_values)
+        question_values = discard_pending_duplicates_of_collected(question_values)
 
         stage = "persistence"
         with Session(engine) as db:

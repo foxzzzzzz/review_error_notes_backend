@@ -97,3 +97,62 @@ def test_collection_reason_explains_answer_and_error_mark_conflict():
             reliable_mark=True,
         )
     ) == "答案与错误标记不一致"
+
+
+def test_discards_pending_duplicate_when_same_image_has_collected_candidate():
+    from app.tasks.process_image import discard_pending_duplicates_of_collected
+
+    collected = {
+        "collection_status": "collected",
+        "ocr_text": "xiang qin",
+        "ocr_answer": "相亲",
+        "question_type": "write_word",
+        "ocr_raw_json": {"instruction": "看拼音写词语", "prompt_text": "xiāng qīn"},
+    }
+    pending_duplicate = {
+        **collected,
+        "collection_status": "pending_review",
+    }
+
+    assert discard_pending_duplicates_of_collected(
+        [collected, pending_duplicate]
+    ) == [collected]
+
+
+def test_task_discards_duplicates_after_recognition_before_persistence():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[2] / "app" / "tasks" / "process_image.py"
+    ).read_text(encoding="utf-8")
+
+    recognition = source.index("result, question_values = recognize_question_batch(")
+    deduplication = source.index(
+        "question_values = discard_pending_duplicates_of_collected(question_values)"
+    )
+    persistence = source.index("for values in question_values")
+
+    assert recognition < deduplication < persistence
+
+
+def test_keeps_pending_candidate_when_its_content_differs_from_collected_candidate():
+    from app.tasks.process_image import discard_pending_duplicates_of_collected
+
+    collected = {
+        "collection_status": "collected",
+        "ocr_text": "xiang qin",
+        "ocr_answer": "相亲",
+        "question_type": "write_word",
+        "ocr_raw_json": {"instruction": "看拼音写词语", "prompt_text": "xiāng qīn"},
+    }
+    pending_other_question = {
+        **collected,
+        "collection_status": "pending_review",
+        "ocr_text": "zhan you",
+        "ocr_answer": "战友",
+        "ocr_raw_json": {"instruction": "看拼音写词语", "prompt_text": "zhàn yǒu"},
+    }
+
+    assert discard_pending_duplicates_of_collected(
+        [collected, pending_other_question]
+    ) == [collected, pending_other_question]

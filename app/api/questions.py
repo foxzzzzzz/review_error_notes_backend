@@ -4,7 +4,8 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.orm import aliased
 from app.database import get_db
 from app.api.deps import get_default_student
 from app.models.student import Student
@@ -79,8 +80,19 @@ async def list_review_images(
     student: Student = Depends(get_default_student),
     db: AsyncSession = Depends(get_db),
 ):
+    collected_question = aliased(WrongQuestion)
+    auto_collected_count = (
+        select(func.count(collected_question.id))
+        .where(
+            collected_question.image_id == WrongImage.id,
+            collected_question.deleted_at.is_(None),
+            collected_question.collection_status == "collected",
+        )
+        .correlate(WrongImage)
+        .scalar_subquery()
+    )
     result = await db.execute(
-        select(WrongQuestion, WrongImage)
+        select(WrongQuestion, WrongImage, auto_collected_count.label("auto_collected_count"))
         .join(WrongImage, WrongImage.id == WrongQuestion.image_id)
         .where(
             WrongQuestion.student_id == student.id,
@@ -90,13 +102,14 @@ async def list_review_images(
         .order_by(WrongImage.created_at.desc(), WrongQuestion.created_at.asc())
     )
     groups = {}
-    for question, image in result.all():
+    for question, image, collected_count in result.all():
         image_id = str(image.id)
         group = groups.setdefault(
             image_id,
             {
                 "image_id": image_id,
                 "question_count": 0,
+                "auto_collected_count": collected_count,
                 "questions": [],
             },
         )
