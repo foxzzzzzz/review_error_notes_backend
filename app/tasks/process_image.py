@@ -17,6 +17,7 @@ from app.models.wrong_question import WrongQuestion
 from app.services.local_ocr_verification import RapidOCRVerifier
 from app.services.vision_recognition import (
     MiniMaxVisionClient,
+    VisionRecognitionError,
     image_status_for,
     recognize_question_batch,
 )
@@ -25,8 +26,10 @@ from app.tasks.celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 
-def processing_failure_for(_error: Exception) -> tuple[str, str]:
-    return "recognition_failed", "图片识别失败，请重试"
+def processing_failure_for(error: Exception) -> tuple[str, str]:
+    if isinstance(error, VisionRecognitionError):
+        return error.code, error.user_message
+    return "recognition_internal_error", "识别暂时失败，请稍后重试"
 
 
 def collection_status_to_persist(collection_status: str) -> str:
@@ -65,6 +68,7 @@ def process_image(self, image_id: str, filepath: str):
     engine = create_engine(sync_url)
 
     claimed = False
+    stage = "claim"
     try:
         with Session(engine) as db:
             image = db.scalar(
@@ -83,6 +87,7 @@ def process_image(self, image_id: str, filepath: str):
             db.commit()
             claimed = True
 
+        stage = "recognition"
         result, question_values = recognize_question_batch(
             client=MiniMaxVisionClient.from_settings(),
             image_path=filepath,
@@ -112,6 +117,7 @@ def process_image(self, image_id: str, filepath: str):
         )
         log_mark_validation_diagnostics(image_id, question_values)
 
+        stage = "persistence"
         with Session(engine) as db:
             image = db.scalar(
                 select(WrongImage)
@@ -166,11 +172,16 @@ def process_image(self, image_id: str, filepath: str):
                 )
                 if claimed_image and claimed_image.status == "segmented":
                     claimed_image.status = "failed"
-                    (
-                        claimed_image.error_code,
-                        claimed_image.error_message,
-                    ) = processing_failure_for(exc)
+                    error_code, error_message = processing_failure_for(exc)
+                    claimed_image.error_code = error_code
+                    claimed_image.error_message = error_message
                     db.commit()
-        logger.exception("image recognition failed image_id=%s", image_id)
+        logger.exception(
+            "image_recognition_failed image_id=%s stage=%s error_code=%s error_type=%s",
+            image_id,
+            stage,
+            processing_failure_for(exc)[0],
+            type(exc).__name__,
+        )
     finally:
         engine.dispose()

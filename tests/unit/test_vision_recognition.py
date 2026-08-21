@@ -354,4 +354,72 @@ def test_client_errors_do_not_expose_key_or_image_payload(tmp_path):
     message = str(exc_info.value)
     assert "never-log-this-key" not in message
     assert "base64" not in message
-    assert "401" in message
+    assert message == "识别结果异常，请稍后重试"
+
+
+def test_recognition_error_exposes_only_its_safe_category_and_message():
+    from app.services.vision_recognition import VisionRecognitionError
+
+    error = VisionRecognitionError(
+        "vision_timeout",
+        "识别服务响应超时，请稍后重试",
+    )
+
+    assert error.code == "vision_timeout"
+    assert error.user_message == "识别服务响应超时，请稍后重试"
+    assert str(error) == "识别服务响应超时，请稍后重试"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_code", "expected_message"),
+    [
+        (429, "vision_rate_limited", "识别服务繁忙，请稍后重试"),
+        (503, "vision_service_unavailable", "识别服务暂时不可用，请稍后重试"),
+        (401, "vision_response_invalid", "识别结果异常，请稍后重试"),
+    ],
+)
+def test_client_classifies_unsuccessful_minimax_responses(
+    tmp_path, status_code, expected_code, expected_message,
+):
+    from app.services.vision_recognition import MiniMaxVisionClient, VisionRecognitionError
+
+    source = tmp_path / "question.jpg"
+    _write_image(source, (400, 300))
+    client = MiniMaxVisionClient(
+        api_key="secret-token",
+        api_host="https://api.minimaxi.com",
+        timeout_seconds=5,
+        max_retries=0,
+        max_edge=1200,
+        jpeg_quality=90,
+        transport=httpx.MockTransport(lambda _request: httpx.Response(status_code)),
+    )
+
+    with pytest.raises(VisionRecognitionError) as exc_info:
+        client.recognize(str(source))
+
+    assert exc_info.value.code == expected_code
+    assert exc_info.value.user_message == expected_message
+    assert "secret-token" not in str(exc_info.value)
+
+
+def test_client_classifies_missing_configuration_without_exposing_details(tmp_path):
+    from app.services.vision_recognition import MiniMaxVisionClient, VisionRecognitionError
+
+    source = tmp_path / "question.jpg"
+    _write_image(source, (400, 300))
+    client = MiniMaxVisionClient(
+        api_key="",
+        api_host="",
+        timeout_seconds=5,
+        max_retries=0,
+        max_edge=1200,
+        jpeg_quality=90,
+    )
+
+    with pytest.raises(VisionRecognitionError) as exc_info:
+        client.recognize(str(source))
+
+    assert (exc_info.value.code, exc_info.value.user_message) == (
+        "vision_not_configured", "识别服务尚未配置，请联系管理员",
+    )

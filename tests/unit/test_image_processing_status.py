@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,7 +34,22 @@ def test_processing_failure_hides_internal_exception_details():
 
     code, message = processing_failure_for(RuntimeError("secret-token /uploads/a.jpg"))
 
-    assert (code, message) == ("recognition_failed", "图片识别失败，请重试")
+    assert (code, message) == ("recognition_internal_error", "识别暂时失败，请稍后重试")
+
+
+def test_processing_failure_preserves_a_safe_recognition_error_category():
+    from app.services.vision_recognition import VisionRecognitionError
+    from app.tasks.process_image import processing_failure_for
+
+    error = VisionRecognitionError(
+        "vision_timeout",
+        "识别服务响应超时，请稍后重试",
+    )
+
+    assert processing_failure_for(error) == (
+        "vision_timeout",
+        "识别服务响应超时，请稍后重试",
+    )
 
 
 class RetryDB:
@@ -46,6 +62,51 @@ class RetryDB:
 
     async def commit(self):
         self.committed = True
+
+
+class IncompleteImagesDB:
+    def __init__(self, images):
+        self.images = images
+        self.statement = None
+
+    async def execute(self, statement):
+        self.statement = statement
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: self.images))
+
+
+def test_incomplete_image_statuses_exclude_confirmed_and_other_students():
+    from app.api import upload as upload_api
+
+    student_id = uuid.uuid4()
+    db = IncompleteImagesDB([
+        SimpleNamespace(
+            id="failed-image",
+            status="failed",
+            question_count=0,
+            error_code="vision_timeout",
+            error_message="识别服务响应超时，请稍后重试",
+        ),
+    ])
+
+    result = asyncio.run(
+        upload_api.get_incomplete_image_statuses(
+            student=SimpleNamespace(id=student_id),
+            db=db,
+        )
+    )
+
+    assert result == [{
+        "image_id": "failed-image",
+        "status": "failed",
+        "question_count": 0,
+        "error_code": "vision_timeout",
+        "error_message": "识别服务响应超时，请稍后重试",
+    }]
+    compiled = str(db.statement.compile(compile_kwargs={"literal_binds": True}))
+    assert student_id.hex in compiled
+    for status in ("pending", "segmented", "needs_review", "failed"):
+        assert status in compiled
+    assert "confirmed" not in compiled
 
 
 def test_retry_only_requeues_a_failed_image(monkeypatch):

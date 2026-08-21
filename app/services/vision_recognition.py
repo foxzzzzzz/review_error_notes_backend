@@ -120,6 +120,14 @@ __INPUT__
 class VisionRecognitionError(RuntimeError):
     """Safe recognition error that never contains credentials or image bytes."""
 
+    def __init__(self, code: str, user_message: str | None = None):
+        if user_message is None:
+            code = "vision_response_invalid"
+            user_message = "识别结果异常，请稍后重试"
+        self.code = code
+        self.user_message = user_message
+        super().__init__(user_message)
+
 
 def validate_normalized_bbox(value: List[float]) -> List[float]:
     if len(value) != 4 or any(coordinate < 0 or coordinate > 1 for coordinate in value):
@@ -240,20 +248,18 @@ def validated_localizations(
 ) -> dict[int, LocalizationItem]:
     indexes = [item.index for item in result.items]
     if len(indexes) != item_count or len(set(indexes)) != len(indexes):
-        raise VisionRecognitionError("MiniMax localization indexes do not match recognition")
+        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
     if set(indexes) != set(range(item_count)):
-        raise VisionRecognitionError("MiniMax localization indexes do not match recognition")
+        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
     assigned_mark_ids = [
         mark_id
         for item in result.items
         for mark_id in item.mark_ids
     ]
     if len(assigned_mark_ids) != len(set(assigned_mark_ids)):
-        raise VisionRecognitionError("MiniMax localization assigned a mark more than once")
+        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
     if set(assigned_mark_ids) != set(marks):
-        raise VisionRecognitionError(
-            "MiniMax localization marks do not match validated error marks"
-        )
+        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
     return {item.index: item for item in result.items}
 
 
@@ -619,7 +625,9 @@ def prepare_image_data_url(image_path: str, max_edge: int, jpeg_quality: int) ->
     """Normalize orientation and size, then return a JPEG data URL."""
     path = Path(image_path)
     if not path.is_file():
-        raise VisionRecognitionError("Image file does not exist")
+        raise VisionRecognitionError(
+            "image_preprocessing_failed", "图片处理失败，请重新拍摄后提交"
+        )
 
     try:
         with Image.open(path) as source:
@@ -630,7 +638,9 @@ def prepare_image_data_url(image_path: str, max_edge: int, jpeg_quality: int) ->
             output = io.BytesIO()
             image.save(output, format="JPEG", quality=jpeg_quality, optimize=True)
     except (OSError, ValueError) as exc:
-        raise VisionRecognitionError("Image preprocessing failed") from exc
+        raise VisionRecognitionError(
+            "image_preprocessing_failed", "图片处理失败，请重新拍摄后提交"
+        ) from exc
 
     encoded = base64.b64encode(output.getvalue()).decode("ascii")
     return "data:image/jpeg;base64," + encoded
@@ -638,7 +648,7 @@ def prepare_image_data_url(image_path: str, max_edge: int, jpeg_quality: int) ->
 
 def _extract_json(content: str) -> dict:
     if not isinstance(content, str) or not content.strip():
-        raise VisionRecognitionError("MiniMax returned empty content")
+        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
 
     candidate = content.strip()
     output_match = OUTPUT_RE.fullmatch(candidate)
@@ -651,9 +661,9 @@ def _extract_json(content: str) -> dict:
     try:
         data = json.loads(candidate)
     except json.JSONDecodeError as exc:
-        raise VisionRecognitionError("MiniMax returned invalid structured content") from exc
+        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试") from exc
     if not isinstance(data, dict):
-        raise VisionRecognitionError("MiniMax returned invalid structured content")
+        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
     return data
 
 
@@ -699,7 +709,9 @@ class MiniMaxVisionClient:
         recognition_correction: Optional[str] = None,
     ) -> VisionResult:
         if not self.api_key or not self.api_host:
-            raise VisionRecognitionError("MiniMax vision is not configured")
+            raise VisionRecognitionError(
+                "vision_not_configured", "识别服务尚未配置，请联系管理员"
+            )
 
         image_url = prepare_image_data_url(image_path, self.max_edge, self.jpeg_quality)
         correction_instruction = recognition_correction_instruction(
@@ -759,21 +771,38 @@ class MiniMaxVisionClient:
                     self.sleep(self.retry_delay_seconds)
                     continue
                 if response.status_code < 200 or response.status_code >= 300:
-                    raise VisionRecognitionError("MiniMax vision request failed with HTTP %s" % response.status_code)
+                    if response.status_code == 429:
+                        raise VisionRecognitionError(
+                            "vision_rate_limited", "识别服务繁忙，请稍后重试"
+                        )
+                    if 500 <= response.status_code < 600:
+                        raise VisionRecognitionError(
+                            "vision_service_unavailable", "识别服务暂时不可用，请稍后重试"
+                        )
+                    raise VisionRecognitionError(
+                        "vision_response_invalid", "识别结果异常，请稍后重试"
+                    )
                 raw = self._parse_response_content(response)
                 try:
                     return result_model.model_validate(raw)
                 except ValidationError as exc:
                     raise VisionRecognitionError(
-                        "MiniMax recognition result failed validation"
+                        "vision_response_invalid", "识别结果异常，请稍后重试"
                     ) from exc
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 if attempt < self.max_retries:
                     self.sleep(self.retry_delay_seconds)
                     continue
-                raise VisionRecognitionError("MiniMax vision request failed") from exc
+                code, message = (
+                    ("vision_timeout", "识别服务响应超时，请稍后重试")
+                    if isinstance(exc, httpx.TimeoutException)
+                    else ("vision_service_unavailable", "识别服务暂时不可用，请稍后重试")
+                )
+                raise VisionRecognitionError(code, message) from exc
 
-        raise VisionRecognitionError("MiniMax vision request failed")
+        raise VisionRecognitionError(
+            "vision_service_unavailable", "识别服务暂时不可用，请稍后重试"
+        )
 
     def _post(self, payload):
         headers = {
@@ -789,13 +818,13 @@ class MiniMaxVisionClient:
         try:
             data = response.json()
         except ValueError as exc:
-            raise VisionRecognitionError("MiniMax returned an invalid response") from exc
+            raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试") from exc
         if not isinstance(data, dict):
-            raise VisionRecognitionError("MiniMax returned an invalid response")
+            raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
 
         base_resp = data.get("base_resp") or {}
         status_code = base_resp.get("status_code")
         if status_code not in (None, 0):
-            raise VisionRecognitionError("MiniMax vision API rejected the request with code %s" % status_code)
+            raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
 
         return _extract_json(data.get("content", ""))

@@ -40,6 +40,22 @@ def serialize_image_status(image: WrongImage) -> dict:
     }
 
 
+@router.get("/images/incomplete")
+async def get_incomplete_image_statuses(
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(WrongImage)
+        .where(
+            WrongImage.student_id == student.id,
+            WrongImage.status.in_(("pending", "segmented", "needs_review", "failed")),
+        )
+        .order_by(WrongImage.created_at.desc())
+    )
+    return [serialize_image_status(image) for image in result.scalars().all()]
+
+
 @router.get("/images/status")
 async def get_image_statuses(
     image_ids: list[str] = Query(..., min_length=1, max_length=9),
