@@ -205,8 +205,15 @@ def test_rejects_missing_duplicate_and_out_of_range_indexes(items, item_count):
 
     result = LocalizationResult(items=items)
 
-    with pytest.raises(VisionRecognitionError):
+    with pytest.raises(VisionRecognitionError) as exc_info:
         validated_localizations(result, item_count=item_count, marks={0: _error_mark()})
+
+    assert exc_info.value.code == "vision_localization_invalid"
+    assert exc_info.value.diagnostic["reason"] in {
+        "index_count_mismatch",
+        "index_set_mismatch",
+    }
+    assert exc_info.value.diagnostic["item_count"] == item_count
 
 
 def test_localization_requires_assigned_mark_center_inside_bbox():
@@ -277,8 +284,11 @@ def test_rejects_duplicate_mark_assignment_across_items():
         ]
     )
 
-    with pytest.raises(VisionRecognitionError):
+    with pytest.raises(VisionRecognitionError) as exc_info:
         validated_localizations(result, item_count=2, marks={0: _error_mark()})
+
+    assert exc_info.value.code == "vision_localization_invalid"
+    assert exc_info.value.diagnostic["reason"] == "duplicate_mark_assignment"
 
 
 def test_rejects_valid_mark_that_was_not_assigned_to_any_item():
@@ -302,7 +312,7 @@ def test_rejects_valid_mark_that_was_not_assigned_to_any_item():
         ]
     )
 
-    with pytest.raises(VisionRecognitionError):
+    with pytest.raises(VisionRecognitionError) as exc_info:
         validated_localizations(
             result,
             item_count=1,
@@ -311,3 +321,6 @@ def test_rejects_valid_mark_that_was_not_assigned_to_any_item():
                 1: _error_mark(1, [0.6, 0.25, 0.7, 0.35]),
             },
         )
+
+    assert exc_info.value.code == "vision_localization_invalid"
+    assert exc_info.value.diagnostic["reason"] == "unassigned_mark"

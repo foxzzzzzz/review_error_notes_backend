@@ -120,13 +120,44 @@ __INPUT__
 class VisionRecognitionError(RuntimeError):
     """Safe recognition error that never contains credentials or image bytes."""
 
-    def __init__(self, code: str, user_message: str | None = None):
+    def __init__(
+        self,
+        code: str,
+        user_message: str | None = None,
+        diagnostic: dict | None = None,
+    ):
         if user_message is None:
             code = "vision_response_invalid"
             user_message = "识别结果异常，请稍后重试"
         self.code = code
         self.user_message = user_message
+        self.diagnostic = diagnostic or {}
         super().__init__(user_message)
+
+
+SAFE_RECOGNITION_DIAGNOSTIC_KEYS = {
+    "operation",
+    "status_code",
+    "provider_status_code",
+    "validation_fields",
+    "reason",
+    "source_width",
+    "source_height",
+    "prepared_width",
+    "prepared_height",
+    "candidate_count",
+    "mark_count",
+}
+
+
+def safe_recognition_diagnostic(error: Exception) -> dict:
+    if not isinstance(error, VisionRecognitionError):
+        return {}
+    return {
+        key: value
+        for key, value in error.diagnostic.items()
+        if key in SAFE_RECOGNITION_DIAGNOSTIC_KEYS
+    }
 
 
 def validate_normalized_bbox(value: List[float]) -> List[float]:
@@ -246,20 +277,32 @@ def validated_localizations(
     item_count: int,
     marks: dict[int, ErrorMark],
 ) -> dict[int, LocalizationItem]:
+    def localization_error(reason: str) -> VisionRecognitionError:
+        return VisionRecognitionError(
+            "vision_localization_invalid",
+            "题目定位结果不完整，请稍后重试",
+            diagnostic={
+                "operation": "localization",
+                "reason": reason,
+                "item_count": item_count,
+                "mark_count": len(marks),
+            },
+        )
+
     indexes = [item.index for item in result.items]
     if len(indexes) != item_count or len(set(indexes)) != len(indexes):
-        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
+        raise localization_error("index_count_mismatch")
     if set(indexes) != set(range(item_count)):
-        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
+        raise localization_error("index_set_mismatch")
     assigned_mark_ids = [
         mark_id
         for item in result.items
         for mark_id in item.mark_ids
     ]
     if len(assigned_mark_ids) != len(set(assigned_mark_ids)):
-        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
+        raise localization_error("duplicate_mark_assignment")
     if set(assigned_mark_ids) != set(marks):
-        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
+        raise localization_error("unassigned_mark")
     return {item.index: item for item in result.items}
 
 
@@ -621,7 +664,12 @@ def image_status_for(question_values: List[dict]) -> str:
     return "confirmed"
 
 
-def prepare_image_data_url(image_path: str, max_edge: int, jpeg_quality: int) -> str:
+def prepare_image_data_url(
+    image_path: str,
+    max_edge: int,
+    jpeg_quality: int,
+    diagnostic: dict | None = None,
+) -> str:
     """Normalize orientation and size, then return a JPEG data URL."""
     path = Path(image_path)
     if not path.is_file():
@@ -632,9 +680,23 @@ def prepare_image_data_url(image_path: str, max_edge: int, jpeg_quality: int) ->
     try:
         with Image.open(path) as source:
             image = ImageOps.exif_transpose(source).convert("RGB")
+            if diagnostic is not None:
+                diagnostic.update(
+                    {
+                        "source_width": source.width,
+                        "source_height": source.height,
+                    }
+                )
             if max(image.size) > max_edge:
                 resampling = getattr(Image, "Resampling", Image).LANCZOS
                 image.thumbnail((max_edge, max_edge), resampling)
+            if diagnostic is not None:
+                diagnostic.update(
+                    {
+                        "prepared_width": image.width,
+                        "prepared_height": image.height,
+                    }
+                )
             output = io.BytesIO()
             image.save(output, format="JPEG", quality=jpeg_quality, optimize=True)
     except (OSError, ValueError) as exc:
@@ -646,9 +708,13 @@ def prepare_image_data_url(image_path: str, max_edge: int, jpeg_quality: int) ->
     return "data:image/jpeg;base64," + encoded
 
 
-def _extract_json(content: str) -> dict:
+def _extract_json(content: str, diagnostic: dict | None = None) -> dict:
     if not isinstance(content, str) or not content.strip():
-        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
+        raise VisionRecognitionError(
+            "vision_response_empty",
+            "识别结果为空，请稍后重试",
+            diagnostic,
+        )
 
     candidate = content.strip()
     output_match = OUTPUT_RE.fullmatch(candidate)
@@ -661,9 +727,17 @@ def _extract_json(content: str) -> dict:
     try:
         data = json.loads(candidate)
     except json.JSONDecodeError as exc:
-        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试") from exc
+        raise VisionRecognitionError(
+            "vision_response_json_invalid",
+            "识别结果格式异常，请稍后重试",
+            diagnostic,
+        ) from exc
     if not isinstance(data, dict):
-        raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
+        raise VisionRecognitionError(
+            "vision_response_json_invalid",
+            "识别结果格式异常，请稍后重试",
+            diagnostic,
+        )
     return data
 
 
@@ -713,7 +787,13 @@ class MiniMaxVisionClient:
                 "vision_not_configured", "识别服务尚未配置，请联系管理员"
             )
 
-        image_url = prepare_image_data_url(image_path, self.max_edge, self.jpeg_quality)
+        diagnostic = {"operation": "recognition"}
+        image_url = prepare_image_data_url(
+            image_path,
+            self.max_edge,
+            self.jpeg_quality,
+            diagnostic,
+        )
         correction_instruction = recognition_correction_instruction(
             recognition_correction
         )
@@ -723,7 +803,7 @@ class MiniMaxVisionClient:
             "image_url": image_url,
         }
 
-        return self._request(payload, VisionResult)
+        return self._request(payload, VisionResult, diagnostic)
 
     def localize(
         self,
@@ -731,7 +811,17 @@ class MiniMaxVisionClient:
         items: List[VisionItem],
         error_marks: List[ErrorMark],
     ) -> LocalizationResult:
-        image_url = prepare_image_data_url(image_path, self.max_edge, self.jpeg_quality)
+        diagnostic = {
+            "operation": "localization",
+            "candidate_count": len(items),
+            "mark_count": len(error_marks),
+        }
+        image_url = prepare_image_data_url(
+            image_path,
+            self.max_edge,
+            self.jpeg_quality,
+            diagnostic,
+        )
         item_summaries = [
             {
                 "index": index,
@@ -760,9 +850,10 @@ class MiniMaxVisionClient:
         return self._request(
             {"prompt": prompt, "image_url": image_url},
             LocalizationResult,
+            diagnostic,
         )
 
-    def _request(self, payload, result_model):
+    def _request(self, payload, result_model, diagnostic: dict):
         for attempt in range(self.max_retries + 1):
             try:
                 response = self._post(payload)
@@ -773,21 +864,31 @@ class MiniMaxVisionClient:
                 if response.status_code < 200 or response.status_code >= 300:
                     if response.status_code == 429:
                         raise VisionRecognitionError(
-                            "vision_rate_limited", "识别服务繁忙，请稍后重试"
+                            "vision_rate_limited", "识别服务繁忙，请稍后重试", diagnostic
                         )
                     if 500 <= response.status_code < 600:
                         raise VisionRecognitionError(
-                            "vision_service_unavailable", "识别服务暂时不可用，请稍后重试"
+                            "vision_service_unavailable", "识别服务暂时不可用，请稍后重试", diagnostic
                         )
                     raise VisionRecognitionError(
-                        "vision_response_invalid", "识别结果异常，请稍后重试"
+                        "vision_http_rejected",
+                        "识别服务返回异常，请稍后重试",
+                        {**diagnostic, "status_code": response.status_code},
                     )
-                raw = self._parse_response_content(response)
+                raw = self._parse_response_content(response, diagnostic)
                 try:
                     return result_model.model_validate(raw)
                 except ValidationError as exc:
                     raise VisionRecognitionError(
-                        "vision_response_invalid", "识别结果异常，请稍后重试"
+                        "vision_response_schema_invalid",
+                        "识别结果格式不完整，请稍后重试",
+                        {
+                            **diagnostic,
+                            "validation_fields": [
+                                ".".join(str(part) for part in error["loc"])
+                                for error in exc.errors()[:5]
+                            ],
+                        },
                     ) from exc
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 if attempt < self.max_retries:
@@ -798,7 +899,7 @@ class MiniMaxVisionClient:
                     if isinstance(exc, httpx.TimeoutException)
                     else ("vision_service_unavailable", "识别服务暂时不可用，请稍后重试")
                 )
-                raise VisionRecognitionError(code, message) from exc
+                raise VisionRecognitionError(code, message, diagnostic) from exc
 
         raise VisionRecognitionError(
             "vision_service_unavailable", "识别服务暂时不可用，请稍后重试"
@@ -814,17 +915,29 @@ class MiniMaxVisionClient:
             return client.post(self.api_host + VISION_PATH, headers=headers, json=payload)
 
     @staticmethod
-    def _parse_response_content(response: httpx.Response) -> dict:
+    def _parse_response_content(response: httpx.Response, diagnostic: dict) -> dict:
         try:
             data = response.json()
         except ValueError as exc:
-            raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试") from exc
+            raise VisionRecognitionError(
+                "vision_response_envelope_invalid",
+                "识别服务返回格式异常，请稍后重试",
+                diagnostic,
+            ) from exc
         if not isinstance(data, dict):
-            raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
+            raise VisionRecognitionError(
+                "vision_response_envelope_invalid",
+                "识别服务返回格式异常，请稍后重试",
+                diagnostic,
+            )
 
         base_resp = data.get("base_resp") or {}
         status_code = base_resp.get("status_code")
         if status_code not in (None, 0):
-            raise VisionRecognitionError("vision_response_invalid", "识别结果异常，请稍后重试")
+            raise VisionRecognitionError(
+                "vision_upstream_rejected",
+                "识别服务返回异常，请稍后重试",
+                {**diagnostic, "provider_status_code": status_code},
+            )
 
-        return _extract_json(data.get("content", ""))
+        return _extract_json(data.get("content", ""), diagnostic)

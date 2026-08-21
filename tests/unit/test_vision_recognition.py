@@ -354,7 +354,7 @@ def test_client_errors_do_not_expose_key_or_image_payload(tmp_path):
     message = str(exc_info.value)
     assert "never-log-this-key" not in message
     assert "base64" not in message
-    assert message == "识别结果异常，请稍后重试"
+    assert message == "识别服务返回异常，请稍后重试"
 
 
 def test_recognition_error_exposes_only_its_safe_category_and_message():
@@ -370,12 +370,122 @@ def test_recognition_error_exposes_only_its_safe_category_and_message():
     assert str(error) == "识别服务响应超时，请稍后重试"
 
 
+def test_safe_recognition_diagnostic_excludes_provider_response_content():
+    from app.services.vision_recognition import (
+        VisionRecognitionError,
+        safe_recognition_diagnostic,
+    )
+
+    diagnostic = safe_recognition_diagnostic(
+        VisionRecognitionError(
+            "vision_response_schema_invalid",
+            "识别结果格式不完整，请稍后重试",
+            diagnostic={
+                "operation": "recognition",
+                "prepared_width": 1475,
+                "prepared_height": 2048,
+                "validation_fields": ["items.0.raw_text"],
+                "raw_response": "provider-private-response",
+            },
+        )
+    )
+
+    assert diagnostic == {
+        "operation": "recognition",
+        "prepared_width": 1475,
+        "prepared_height": 2048,
+        "validation_fields": ["items.0.raw_text"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_code", "expected_message"),
+    [
+        ("", "vision_response_empty", "识别结果为空，请稍后重试"),
+        (
+            "provider-private-response",
+            "vision_response_json_invalid",
+            "识别结果格式异常，请稍后重试",
+        ),
+    ],
+)
+def test_client_classifies_empty_or_non_json_content_without_exposing_response(
+    tmp_path,
+    content,
+    expected_code,
+    expected_message,
+):
+    from app.services.vision_recognition import MiniMaxVisionClient, VisionRecognitionError
+
+    source = tmp_path / "question.jpg"
+    _write_image(source, (400, 300))
+    client = MiniMaxVisionClient(
+        api_key="secret-token",
+        api_host="https://api.minimaxi.com",
+        timeout_seconds=5,
+        max_retries=0,
+        max_edge=1200,
+        jpeg_quality=90,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "content": content,
+                    "base_resp": {"status_code": 0},
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(VisionRecognitionError) as exc_info:
+        client.recognize(str(source))
+
+    assert exc_info.value.code == expected_code
+    assert exc_info.value.user_message == expected_message
+    assert exc_info.value.diagnostic["operation"] == "recognition"
+    if content:
+        assert content not in str(exc_info.value)
+        assert content not in str(exc_info.value.diagnostic)
+
+
+def test_client_classifies_schema_mismatch_with_safe_context(tmp_path):
+    from app.services.vision_recognition import MiniMaxVisionClient, VisionRecognitionError
+
+    source = tmp_path / "question.jpg"
+    _write_image(source, (400, 300))
+    payload = _valid_payload()
+    payload["items"][0].pop("raw_text")
+    client = MiniMaxVisionClient(
+        api_key="secret-token",
+        api_host="https://api.minimaxi.com",
+        timeout_seconds=5,
+        max_retries=0,
+        max_edge=1200,
+        jpeg_quality=90,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={"content": json.dumps(payload), "base_resp": {"status_code": 0}},
+            )
+        ),
+    )
+
+    with pytest.raises(VisionRecognitionError) as exc_info:
+        client.recognize(str(source))
+
+    assert exc_info.value.code == "vision_response_schema_invalid"
+    assert exc_info.value.user_message == "识别结果格式不完整，请稍后重试"
+    assert exc_info.value.diagnostic["operation"] == "recognition"
+    assert "items.0.raw_text" in exc_info.value.diagnostic["validation_fields"]
+    assert "secret-token" not in str(exc_info.value.diagnostic)
+
+
 @pytest.mark.parametrize(
     ("status_code", "expected_code", "expected_message"),
     [
         (429, "vision_rate_limited", "识别服务繁忙，请稍后重试"),
         (503, "vision_service_unavailable", "识别服务暂时不可用，请稍后重试"),
-        (401, "vision_response_invalid", "识别结果异常，请稍后重试"),
+        (401, "vision_http_rejected", "识别服务返回异常，请稍后重试"),
     ],
 )
 def test_client_classifies_unsuccessful_minimax_responses(

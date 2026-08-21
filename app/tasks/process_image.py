@@ -21,11 +21,11 @@ from app.services.vision_recognition import (
     VisionRecognitionError,
     image_status_for,
     recognize_question_batch,
+    safe_recognition_diagnostic,
 )
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
-
 
 def processing_failure_for(error: Exception) -> tuple[str, str]:
     if isinstance(error, VisionRecognitionError):
@@ -211,11 +211,16 @@ def process_image(self, image_id: str, filepath: str):
                     claimed_image.error_message = error_message
                     db.commit()
         logger.exception(
-            "image_recognition_failed image_id=%s stage=%s error_code=%s error_type=%s",
+            "image_recognition_failed image_id=%s stage=%s error_code=%s error_type=%s diagnostic=%s",
             image_id,
             stage,
             processing_failure_for(exc)[0],
             type(exc).__name__,
+            json.dumps(
+                safe_recognition_diagnostic(exc),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
         )
     finally:
         engine.dispose()
