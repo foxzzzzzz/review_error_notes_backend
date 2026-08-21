@@ -52,6 +52,7 @@ async def get_incomplete_image_statuses(
             WrongImage.status.in_(("pending", "segmented", "needs_review", "failed")),
         )
         .order_by(WrongImage.created_at.desc())
+        .limit(settings.INCOMPLETE_IMAGE_STATUS_LIMIT)
     )
     return [serialize_image_status(image) for image in result.scalars().all()]
 

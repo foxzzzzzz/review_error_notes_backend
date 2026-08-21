@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -107,6 +108,14 @@ def test_incomplete_image_statuses_exclude_confirmed_and_other_students():
     for status in ("pending", "segmented", "needs_review", "failed"):
         assert status in compiled
     assert "confirmed" not in compiled
+
+
+def test_incomplete_image_statuses_limit_the_initial_restore_payload():
+    from app.api import upload as upload_api
+
+    source = inspect.getsource(upload_api.get_incomplete_image_statuses)
+
+    assert "limit(" in source
 
 
 def test_retry_only_requeues_a_failed_image(monkeypatch):

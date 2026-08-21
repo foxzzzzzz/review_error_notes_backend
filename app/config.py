@@ -87,6 +87,7 @@ class Settings(BaseSettings):
     SHEET_DERIVATIVE_MAX_CONCURRENCY: int = Field(default=3, ge=1, le=8)
     UPLOAD_DIR: str = "./uploads"
     UPLOAD_MAX_BYTES: int = Field(default=10_485_760, gt=0)
+    INCOMPLETE_IMAGE_STATUS_LIMIT: int = Field(default=100, ge=1, le=500)
     PDF_DIR: str = "./pdfs"
     AVATAR_DIR: str = "./avatars"
     AVATAR_MAX_BYTES: int = Field(default=5_242_880, gt=0)
