@@ -118,6 +118,51 @@ def test_incomplete_image_statuses_limit_the_initial_restore_payload():
     assert "limit(" in source
 
 
+def test_cancelling_review_image_ignores_pending_candidates_and_keeps_collected():
+    from app.api.upload import cancel_image_tasks
+
+    image = SimpleNamespace(
+        id="image-1",
+        status="needs_review",
+        error_code="vision_timeout",
+        error_message="识别服务响应超时，请稍后重试",
+    )
+    pending_question = SimpleNamespace(
+        image_id="image-1",
+        collection_status="pending_review",
+    )
+    collected_question = SimpleNamespace(
+        image_id="image-1",
+        collection_status="collected",
+    )
+
+    cancelled = cancel_image_tasks(
+        [image],
+        [pending_question, collected_question],
+    )
+
+    assert cancelled == ["image-1"]
+    assert image.status == "cancelled"
+    assert image.error_code is None
+    assert image.error_message is None
+    assert pending_question.collection_status == "ignored"
+    assert collected_question.collection_status == "collected"
+
+
+def test_cancelling_skips_images_that_are_already_terminal():
+    from app.api.upload import cancel_image_tasks
+
+    image = SimpleNamespace(
+        id="image-1",
+        status="confirmed",
+        error_code=None,
+        error_message=None,
+    )
+
+    assert cancel_image_tasks([image], []) == []
+    assert image.status == "confirmed"
+
+
 def test_retry_only_requeues_a_failed_image(monkeypatch):
     from app.api import upload as upload_api
 

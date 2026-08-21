@@ -19,6 +19,7 @@ class WrongImage(Base, TimestampMixin):
             "needs_review",
             "confirmed",
             "failed",
+            "cancelled",
             name="image_status_enum",
         ),
         default="pending",

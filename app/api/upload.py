@@ -4,17 +4,24 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.api.deps import get_default_student
 from app.models.wrong_image import WrongImage
+from app.models.wrong_question import WrongQuestion
 from app.models.student import Student
 from app.tasks.process_image import process_image
 from app.config import settings
 from PIL import Image, UnidentifiedImageError
 
 router = APIRouter(prefix="/upload", tags=["upload"])
+ACTIVE_IMAGE_STATUSES = ("pending", "segmented", "needs_review", "failed")
+
+
+class CancelImagesRequest(BaseModel):
+    image_ids: list[str] = Field(min_length=1, max_length=100)
 
 
 def _validated_image_upload(file_data: bytes) -> str:
@@ -40,6 +47,26 @@ def serialize_image_status(image: WrongImage) -> dict:
     }
 
 
+def cancel_image_tasks(images: list[WrongImage], questions: list[WrongQuestion]) -> list[str]:
+    """Cancel active images and reject only their still-pending review candidates."""
+    cancelled_image_ids = []
+    cancelled_ids = {image.id for image in images if image.status in ACTIVE_IMAGE_STATUSES}
+    for question in questions:
+        if (
+            question.image_id in cancelled_ids
+            and question.collection_status == "pending_review"
+        ):
+            question.collection_status = "ignored"
+    for image in images:
+        if image.id not in cancelled_ids:
+            continue
+        image.status = "cancelled"
+        image.error_code = None
+        image.error_message = None
+        cancelled_image_ids.append(str(image.id))
+    return cancelled_image_ids
+
+
 @router.get("/images/incomplete")
 async def get_incomplete_image_statuses(
     student: Student = Depends(get_default_student),
@@ -49,12 +76,44 @@ async def get_incomplete_image_statuses(
         select(WrongImage)
         .where(
             WrongImage.student_id == student.id,
-            WrongImage.status.in_(("pending", "segmented", "needs_review", "failed")),
+            WrongImage.status.in_(ACTIVE_IMAGE_STATUSES),
         )
         .order_by(WrongImage.created_at.desc())
         .limit(settings.INCOMPLETE_IMAGE_STATUS_LIMIT)
     )
     return [serialize_image_status(image) for image in result.scalars().all()]
+
+
+@router.post("/images/cancel")
+async def cancel_images(
+    data: CancelImagesRequest,
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    image_result = await db.execute(
+        select(WrongImage)
+        .where(
+            WrongImage.id.in_(data.image_ids),
+            WrongImage.student_id == student.id,
+            WrongImage.status.in_(ACTIVE_IMAGE_STATUSES),
+        )
+        .with_for_update()
+    )
+    images = image_result.scalars().all()
+    image_ids = [image.id for image in images]
+    question_result = await db.execute(
+        select(WrongQuestion)
+        .where(
+            WrongQuestion.image_id.in_(image_ids),
+            WrongQuestion.student_id == student.id,
+            WrongQuestion.collection_status == "pending_review",
+            WrongQuestion.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )
+    cancelled_image_ids = cancel_image_tasks(images, question_result.scalars().all())
+    await db.commit()
+    return {"cancelled_image_ids": cancelled_image_ids}
 
 
 @router.get("/images/status")
