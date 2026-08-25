@@ -67,12 +67,12 @@ def test_profile_response_exposes_account_student_prompt_and_real_stats():
         stats={
             "total": 12,
             "month_new": 4,
-            "needs_review": 2,
+            "learning": 9,
             "mastered": 3,
         },
     )
 
     assert profile.stats.total == 12
     assert profile.stats.month_new == 4
-    assert profile.stats.needs_review == 2
+    assert profile.stats.learning == 9
     assert profile.stats.mastered == 3

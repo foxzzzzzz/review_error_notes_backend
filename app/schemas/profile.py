@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 class ProfileStats(BaseModel):
     total: int = 0
     month_new: int = 0
-    needs_review: int = 0
+    learning: int = 0
     mastered: int = 0
 
 

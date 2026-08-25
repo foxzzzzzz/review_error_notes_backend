@@ -41,7 +41,7 @@ async def load_profile_stats(
             WrongQuestion.created_at >= month_start
         ),
         func.count(WrongQuestion.id).filter(
-            WrongQuestion.review_status == "needs_review"
+            WrongQuestion.mastery_status == "learning"
         ),
         func.count(WrongQuestion.id).filter(
             WrongQuestion.mastery_status == "mastered"
@@ -55,7 +55,7 @@ async def load_profile_stats(
     return ProfileStats(
         total=row[0] or 0,
         month_new=row[1] or 0,
-        needs_review=row[2] or 0,
+        learning=row[2] or 0,
         mastered=row[3] or 0,
     )
 

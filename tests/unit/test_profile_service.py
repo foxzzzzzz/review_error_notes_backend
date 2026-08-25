@@ -8,7 +8,7 @@ from app.schemas.profile import ProfileStats, ProfileUpdate
 
 class Result:
     def one(self):
-        return (12, 4, 2, 3)
+        return (12, 4, 9, 3)
 
 
 class StatsDB:
@@ -28,7 +28,7 @@ def test_beijing_month_start_is_converted_to_utc_naive():
     assert beijing_month_start_utc_naive(now) == datetime(2026, 7, 31, 16, 0)
 
 
-def test_profile_statistics_count_only_visible_current_student_questions():
+def test_profile_statistics_expose_learning_questions_for_practice():
     from app.services.profile import load_profile_stats
 
     db = StatsDB()
@@ -44,13 +44,12 @@ def test_profile_statistics_count_only_visible_current_student_questions():
     assert stats.model_dump() == {
         "total": 12,
         "month_new": 4,
-        "needs_review": 2,
+        "learning": 9,
         "mastered": 3,
     }
     assert "wrong_questions.student_id" in sql
     assert "wrong_questions.deleted_at IS NULL" in sql
     assert "wrong_questions.created_at >=" in sql
-    assert "wrong_questions.review_status" in sql
     assert "wrong_questions.mastery_status" in sql
 
 
