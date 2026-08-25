@@ -61,7 +61,7 @@ RECOGNITION_PROMPT = """你是小学错题内容与红色批改标记识别器�
 10. 所有字段必须从当前图片可见内容提取，不得复用提示中的示例或臆造图片中不存在的词语。
 11. 若没有发现明确的红色错误标记，输出图片中的所有最小可独立作答单元，每个单元一个 item。
 12. 红色批改符号本身不要写入 raw_text；老师写出的纠正内容可作为 answer 的参考。
-13. raw_text 必须忠实抄录学生实际书写，包括错字、漏字、错误拼音和错误答案；禁止自动改正后覆盖原文。
+13. raw_text 必须忠实抄录学生实际书写，包括错字、漏字、错误拼音和错误答案；禁止自动改正后覆盖原文。题目未作答时必须输出 "raw_text": ""，不得遗漏该字段或编造内容。
 14. instruction 必须填写图片中可见的原始练习要求；prompt_text 必须填写重新出卷时展示的干净提示材料。二者不得包含学生作答、正确答案或老师批改笔迹。
 15. question_type 只能是 write_pinyin、write_word、fill_blank、calculation、other 之一。无法确认的内容保留原样并写入 uncertain_segments。
 16. confidence 范围为 0 到 1。difficulty 必须是 1 到 5 的整数，1 表示很简单，5 表示很难。
@@ -191,7 +191,7 @@ class VisionItem(BaseModel):
             return max(1, min(5, value))
         return value
 
-    @field_validator("raw_text", "instruction", "prompt_text")
+    @field_validator("instruction", "prompt_text")
     @classmethod
     def text_fields_must_not_be_blank(cls, value):
         value = value.strip()

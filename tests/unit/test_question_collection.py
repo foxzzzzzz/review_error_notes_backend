@@ -31,6 +31,14 @@ def test_mismatched_answer_with_reliable_error_mark_is_collected():
     ) == "collected"
 
 
+def test_unanswered_question_is_pending_review():
+    from app.services.question_collection import collection_status_for
+
+    assert collection_status_for(
+        _values(raw_text="", answer="xìng yùn", reliable_mark=True)
+    ) == "pending_review"
+
+
 def test_uncertain_or_conflicting_item_requires_manual_review():
     from app.services.question_collection import collection_status_for
 

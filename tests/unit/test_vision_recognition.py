@@ -112,6 +112,22 @@ def test_vision_item_requires_clean_practice_prompt_fields(missing_field):
         VisionItem(**item)
 
 
+def test_vision_item_allows_empty_raw_text_for_an_unanswered_question():
+    from app.services.vision_recognition import VisionItem
+
+    item = _valid_payload()["items"][0]
+    item["raw_text"] = ""
+
+    assert VisionItem(**item).raw_text == ""
+
+
+def test_recognition_prompt_requires_an_empty_raw_text_for_unanswered_questions():
+    from app.services.vision_recognition import RECOGNITION_PROMPT
+
+    assert '"raw_text": ""' in RECOGNITION_PROMPT
+    assert "未作答" in RECOGNITION_PROMPT
+
+
 def test_first_stage_returns_error_marks_but_question_items_have_no_bbox():
     from app.services.vision_recognition import ErrorMark, VisionItem, VisionResult
 
@@ -282,7 +298,6 @@ def test_client_rejects_prose_around_json(tmp_path, content):
     "payload",
     [
         {**_valid_payload(), "items": []},
-        {**_valid_payload(), "items": [{**_valid_payload()["items"][0], "raw_text": ""}]},
         {**_valid_payload(), "items": [{**_valid_payload()["items"][0], "confidence": 1.5}]},
         {**_valid_payload(), "items": [{**_valid_payload()["items"][0], "confidence": "0.9"}]},
         {**_valid_payload(), "items": [{**_valid_payload()["items"][0], "unexpected": "value"}]},
