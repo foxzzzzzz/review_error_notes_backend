@@ -4,7 +4,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import aliased
 from app.database import get_db
 from app.api.deps import get_default_student
@@ -42,6 +42,7 @@ async def list_questions(
     status: str = None,
     mastery_status: Literal["learning", "mastered"] | None = Query(None),
     tag: str = None,
+    keyword: str | None = Query(None, max_length=100),
     limit: int = Query(20, le=100),
     offset: int = 0,
     created_from: datetime = None,
@@ -65,6 +66,24 @@ async def list_questions(
         q = q.where(WrongQuestion.mastery_status == mastery_status)
     if tag:
         q = q.where(WrongQuestion.tags.any(tag))
+    if keyword and keyword.strip():
+        escaped_keyword = (
+            keyword.strip()
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        pattern = f"%{escaped_keyword}%"
+        q = q.where(
+            or_(
+                WrongQuestion.ocr_text.ilike(pattern, escape="\\"),
+                WrongQuestion.ocr_answer.ilike(pattern, escape="\\"),
+                func.array_to_string(WrongQuestion.tags, " ").ilike(
+                    pattern,
+                    escape="\\",
+                ),
+            )
+        )
     if created_from:
         q = q.where(WrongQuestion.created_at >= _normalize_created_from(created_from))
     q = q.order_by(

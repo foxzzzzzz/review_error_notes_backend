@@ -149,7 +149,9 @@ class TestListQuestions:
                 grade=None,
                 semester=None,
                 status=None,
+                mastery_status=None,
                 tag=None,
+                keyword=None,
                 limit=20,
                 offset=0,
                 created_from=created_from,
@@ -162,6 +164,48 @@ class TestListQuestions:
         query_sql = str(compiled)
         assert "wrong_questions.created_at >=" in query_sql
         assert expected_created_from in compiled.params.values()
+
+    def test_keyword_filter_matches_wrong_answer_and_tags(self):
+        from app.api.questions import list_questions
+
+        class EmptyResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        class CapturingDB:
+            query = None
+
+            async def execute(self, query):
+                self.query = query
+                return EmptyResult()
+
+        db = CapturingDB()
+        asyncio.run(
+            list_questions(
+                keyword="荷花",
+                subject=None,
+                grade=None,
+                semester=None,
+                status=None,
+                mastery_status=None,
+                tag=None,
+                limit=20,
+                offset=0,
+                created_from=None,
+                student=SimpleNamespace(id="student-id"),
+                db=db,
+            )
+        )
+
+        compiled = db.query.compile(dialect=postgresql.dialect())
+        query_sql = str(compiled)
+        assert "wrong_questions.ocr_text" in query_sql
+        assert "wrong_questions.ocr_answer" in query_sql
+        assert "array_to_string" in query_sql
+        assert "%荷花%" in compiled.params.values()
 
     def test_list_empty(self, client, auth_header):
         resp = client.get("/api/questions", headers=auth_header)
