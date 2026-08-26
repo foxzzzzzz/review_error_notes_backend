@@ -51,6 +51,8 @@ services:
       - ./alembic:/app/alembic
       - ./templates:/app/templates
       - ./tests:/app/tests
+      - ./docker-compose.yml:/app/docker-compose.yml:ro
+      - ./.env.example:/app/.env.example:ro
       - uploads:/app/uploads
       - pdfs:/app/pdfs
       - avatars:/app/avatars
