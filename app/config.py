@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     SHEET_DERIVATIVE_GENERATION_MODE: Literal["serial", "batch"] = "serial"
     SHEET_DERIVATIVE_BATCH_SIZE: int = Field(default=8, ge=1, le=20)
     SHEET_DERIVATIVE_MAX_CONCURRENCY: int = Field(default=3, ge=1, le=8)
+    SHEET_DERIVATIVE_RESPONSE_VALIDATION_RETRY_COUNT: int = Field(
+        default=2,
+        ge=0,
+        le=3,
+        description="Extra retries for malformed or schema-invalid derivative batch responses.",
+    )
     UPLOAD_DIR: str = "./uploads"
     UPLOAD_MAX_BYTES: int = Field(default=10_485_760, gt=0)
     INCOMPLETE_IMAGE_STATUS_LIMIT: int = Field(default=100, ge=1, le=500)

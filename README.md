@@ -374,7 +374,7 @@ cd miniprogram
 
 `POST /api/sheets` 校验成功后以 HTTP 202 创建等待记录；衍生题和 PDF 由 Celery Worker 后台生成。Worker 逐原题更新进度，失败时写入安全提示且不保留部分题目或半成品 PDF。`LLM_API_KEY`、`LLM_API_BASE`、`LLM_MODEL` 必须注入 Worker，单任务软超时由 `SHEET_GENERATION_SOFT_TIME_LIMIT_SECONDS` 配置。
 
-衍生题默认使用 `SHEET_DERIVATIVE_GENERATION_MODE=serial` 保持逐题串行行为。云服务器完成小样本验证后可改为 `batch`，并通过 `SHEET_DERIVATIVE_BATCH_SIZE` 和 `SHEET_DERIVATIVE_MAX_CONCURRENCY` 控制每批题数及同一错题集内的最大并发批次数；修改这些变量后必须重启 Worker。单次 LLM HTTP 请求超时由 `LLM_REQUEST_TIMEOUT_SECONDS` 配置。
+衍生题默认使用 `SHEET_DERIVATIVE_GENERATION_MODE=serial` 保持逐题串行行为。云服务器完成小样本验证后可改为 `batch`，并通过 `SHEET_DERIVATIVE_BATCH_SIZE` 和 `SHEET_DERIVATIVE_MAX_CONCURRENCY` 控制每批题数及同一错题集内的最大并发批次数；修改这些变量后必须重启 Worker。单次 LLM HTTP 请求超时由 `LLM_REQUEST_TIMEOUT_SECONDS` 配置。批量响应的 JSON 解析或结构校验失败时，可由 `SHEET_DERIVATIVE_RESPONSE_VALIDATION_RETRY_COUNT` 控制同一批次的额外重试次数；重复题、题目数量不匹配等业务校验失败不会重试。
 
 批量模式首次上线按以下顺序验证：先保留 `serial` 部署并用 8 道原题×每题 1 道衍生题确认原流程正常；再设置 `SHEET_DERIVATIVE_GENERATION_MODE=batch`、`SHEET_DERIVATIVE_BATCH_SIZE=8`、`SHEET_DERIVATIVE_MAX_CONCURRENCY=3` 并仅重启 Worker，依次使用 8、24、57 道原题且每题 1 道衍生题验证数量、顺序、内容和耗时，57 道目标为 180 秒以内。出现 HTTP 429 或排队时先把并发数降至 `2`；出现响应截断、缺题或结构校验失败时先把批大小降至 `6`。批量失败不会静默回退串行，避免任务在用户不知情时再次运行约 30 分钟。
 
@@ -466,6 +466,7 @@ student (学生)
 | `SHEET_DERIVATIVE_GENERATION_MODE` | 衍生题生成模式：`serial` 或 `batch` | `serial` |
 | `SHEET_DERIVATIVE_BATCH_SIZE` | 批量模式每个 Prompt 的原题数 | `8` |
 | `SHEET_DERIVATIVE_MAX_CONCURRENCY` | 同一错题集最大并发批次数 | `3` |
+| `SHEET_DERIVATIVE_RESPONSE_VALIDATION_RETRY_COUNT` | 批量响应 JSON/结构校验失败时的额外重试次数（0-3） | `2` |
 | `DEV_MODE` | 开发模式（启用 dev-login） | `false` |
 | `WECHAT_APP_ID` | 小程序 AppID | - |
 | `WECHAT_APP_SECRET` | 小程序 Secret | - |

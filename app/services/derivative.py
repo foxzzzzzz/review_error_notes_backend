@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from app.services.practice_question import (
     PrintableQuestion,
@@ -125,6 +125,7 @@ async def generate_derivative_batch(
     count: int,
     llm_generator=None,
     client=None,
+    response_validation_retry_count: int = 0,
 ) -> DerivativeBatchGenerationResult:
     """Generate and validate derivatives for multiple source questions."""
     requested_ids = [item.source_id for item in items]
@@ -132,6 +133,10 @@ async def generate_derivative_batch(
         raise DerivativeGenerationError("Batch input contains duplicate source IDs")
     if count < 0:
         raise DerivativeGenerationError("Derivative count must not be negative")
+    if response_validation_retry_count < 0:
+        raise DerivativeGenerationError(
+            "Response validation retry count must not be negative"
+        )
     if count == 0:
         return DerivativeBatchGenerationResult(
             variants_by_source_id={source_id: [] for source_id in requested_ids},
@@ -140,15 +145,20 @@ async def generate_derivative_batch(
     if llm_generator is None:
         from app.services.llm import generate_derivative_batch as llm_generator
 
-    try:
-        raw_payload, raw_usage = await llm_generator(
-            items=items,
-            count=count,
-            client=client,
-        )
-        payload = DerivativeBatchPayload.model_validate(raw_payload)
-    except Exception as exc:
-        raise DerivativeGenerationError("Batch derivative generation failed validation") from exc
+    for attempt in range(response_validation_retry_count + 1):
+        try:
+            raw_payload, raw_usage = await llm_generator(
+                items=items,
+                count=count,
+                client=client,
+            )
+            payload = DerivativeBatchPayload.model_validate(raw_payload)
+            break
+        except (ValidationError, ValueError) as exc:
+            if attempt == response_validation_retry_count:
+                raise DerivativeGenerationError(
+                    "Batch derivative generation failed validation"
+                ) from exc
 
     returned_ids = [item.source_id for item in payload.items]
     if len(set(returned_ids)) != len(returned_ids):

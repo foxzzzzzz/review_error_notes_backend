@@ -213,6 +213,7 @@ def test_sheet_derivative_batch_configuration_defaults_and_bounds():
     assert values.SHEET_DERIVATIVE_GENERATION_MODE == "serial"
     assert values.SHEET_DERIVATIVE_BATCH_SIZE == 8
     assert values.SHEET_DERIVATIVE_MAX_CONCURRENCY == 3
+    assert values.SHEET_DERIVATIVE_RESPONSE_VALIDATION_RETRY_COUNT == 2
     assert values.LLM_REQUEST_TIMEOUT_SECONDS == 60
 
     with pytest.raises(ValidationError):
@@ -221,6 +222,8 @@ def test_sheet_derivative_batch_configuration_defaults_and_bounds():
         Settings(_env_file=None, SHEET_DERIVATIVE_BATCH_SIZE=21)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, SHEET_DERIVATIVE_MAX_CONCURRENCY=9)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, SHEET_DERIVATIVE_RESPONSE_VALIDATION_RETRY_COUNT=-1)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, LLM_REQUEST_TIMEOUT_SECONDS=0)
 
@@ -234,6 +237,7 @@ def test_worker_receives_documented_batch_generation_settings():
         "SHEET_DERIVATIVE_GENERATION_MODE",
         "SHEET_DERIVATIVE_BATCH_SIZE",
         "SHEET_DERIVATIVE_MAX_CONCURRENCY",
+        "SHEET_DERIVATIVE_RESPONSE_VALIDATION_RETRY_COUNT",
         "LLM_REQUEST_TIMEOUT_SECONDS",
     ):
         assert name in compose
@@ -545,7 +549,10 @@ def test_worker_failure_log_does_not_include_provider_or_question_content(caplog
     repository = _GenerationRepository(_generation_request(question_count=1))
 
     async def batch_generator(**_kwargs):
-        raise DerivativeGenerationError("secret-answer provider-response")
+        try:
+            raise ValueError("secret-answer")
+        except ValueError as exc:
+            raise DerivativeGenerationError("provider-response") from exc
 
     with caplog.at_level(logging.ERROR):
         asyncio.run(
@@ -562,6 +569,8 @@ def test_worker_failure_log_does_not_include_provider_or_question_content(caplog
         )
 
     assert "error_type=DerivativeGenerationError" in caplog.text
+    assert "cause_types=DerivativeGenerationError->ValueError" in caplog.text
+    assert "question_ids=['question-0']" in caplog.text
     assert "secret-answer" not in caplog.text
     assert "provider-response" not in caplog.text
     assert "0 + 1" not in caplog.text

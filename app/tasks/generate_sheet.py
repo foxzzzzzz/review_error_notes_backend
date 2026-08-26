@@ -37,6 +37,18 @@ from app.tasks.celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 
+def _exception_type_chain(error: BaseException) -> str:
+    """Return exception types only so diagnostic logs cannot expose payloads."""
+    types = []
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        types.append(type(current).__name__)
+        current = current.__cause__ or current.__context__
+    return "->".join(types)
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -335,16 +347,22 @@ async def _generate_batch_groups(
                         items=items,
                         count=request.derived_per_original,
                         client=client,
+                        response_validation_retry_count=(
+                            settings.SHEET_DERIVATIVE_RESPONSE_VALIDATION_RETRY_COUNT
+                        ),
                     )
                 except Exception as exc:
                     logger.error(
                         "sheet derivative batch failed sheet_id=%s batch_index=%s "
-                        "question_count=%s duration_ms=%s error_type=%s",
+                        "question_count=%s question_ids=%s duration_ms=%s "
+                        "error_type=%s cause_types=%s",
                         sheet_id,
                         batch_index,
                         len(questions),
+                        [question.id for question in questions],
                         round((time.perf_counter() - started_at) * 1000),
                         type(exc).__name__,
+                        _exception_type_chain(exc),
                     )
                     raise
                 logger.info(

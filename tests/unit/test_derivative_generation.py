@@ -135,6 +135,29 @@ def test_generate_batch_maps_provider_response_back_to_request_order():
     assert result.usage == {"prompt_tokens": 120, "completion_tokens": 80}
 
 
+def test_generate_batch_retries_invalid_model_response():
+    calls = 0
+
+    async def generate(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise json.JSONDecodeError("invalid JSON", "{", 1)
+        return _batch_response(), {}
+
+    result = asyncio.run(
+        derivative.generate_derivative_batch(
+            items=_batch_inputs(),
+            count=1,
+            llm_generator=generate,
+            response_validation_retry_count=1,
+        )
+    )
+
+    assert calls == 2
+    assert list(result.variants_by_source_id) == ["question-0", "question-1"]
+
+
 @pytest.mark.parametrize(
     "response",
     [
