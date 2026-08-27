@@ -86,6 +86,21 @@ def log_mark_validation_diagnostics(
         image_id,
         json.dumps(diagnostics, ensure_ascii=False, separators=(",", ":")),
     )
+    localization = (
+        question_values[0]["ocr_raw_json"].get("localization_batch_validation")
+        if question_values
+        else None
+    )
+    if localization is not None:
+        logger.info(
+            "localization_validation image_id=%s diagnostic=%s",
+            image_id,
+            json.dumps(
+                localization,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
 
 
 @celery_app.task(bind=True)

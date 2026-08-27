@@ -362,3 +362,35 @@ def test_task_logs_mark_validation_diagnostics(caplog):
     assert '"mark_id":1' in caplog.text
     assert '"red_pixel_ratio":0.004' in caplog.text
     assert '"reason":"insufficient_red_pixels"' in caplog.text
+
+
+def test_task_logs_safe_localization_counts_without_recognized_text(caplog):
+    import logging
+
+    from app.tasks.process_image import log_mark_validation_diagnostics
+
+    question_values = [
+        {
+            "ocr_text": "学生隐私作答",
+            "ocr_raw_json": {
+                "error_mark_validation": [],
+                "localization_batch_validation": {
+                    "status": "validated",
+                    "error_code": None,
+                    "error_reason": None,
+                    "returned_count": 2,
+                    "validated_count": 2,
+                    "verified_count": 1,
+                    "reliable_mark_count": 1,
+                },
+            },
+        }
+    ]
+
+    with caplog.at_level(logging.INFO):
+        log_mark_validation_diagnostics("image-123", question_values)
+
+    assert "localization_validation image_id=image-123" in caplog.text
+    assert '"returned_count":2' in caplog.text
+    assert '"reliable_mark_count":1' in caplog.text
+    assert "学生隐私作答" not in caplog.text

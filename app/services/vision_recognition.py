@@ -187,6 +187,14 @@ SAFE_RECOGNITION_DIAGNOSTIC_KEYS = {
     "prepared_height",
     "candidate_count",
     "mark_count",
+    "localization_status",
+    "localization_error_code",
+    "localization_error_reason",
+    "localization_returned_count",
+    "localization_validated_count",
+    "localization_verified_count",
+    "localization_reliable_mark_count",
+    "localization_rejection_counts",
 }
 
 
@@ -455,18 +463,31 @@ def build_question_values(
     localization_red_verified: bool = False,
 ) -> dict:
     """Map a validated vision item to the existing question persistence contract."""
-    localization_verified = (
-        localization is not None
-        and localization.matched
-        and localization.bbox is not None
-        and localization.confidence >= localization_threshold
+    localization_present = localization is not None
+    localization_matched = bool(localization and localization.matched)
+    localization_has_bbox = bool(localization and localization.bbox is not None)
+    localization_confidence_passed = bool(
+        localization and localization.confidence >= localization_threshold
+    )
+    localization_geometry_passed = bool(
+        localization
         and localization_passes_geometry(
             localization,
             marks=marks,
             max_area_ratio=localization_max_area_ratio,
             allow_unassigned_marks=localization_red_verified,
         )
-        and localization_matches_evidence(localization, item)
+    )
+    localization_text_evidence_passed = bool(
+        localization and localization_matches_evidence(localization, item)
+    )
+    localization_verified = (
+        localization_present
+        and localization_matched
+        and localization_has_bbox
+        and localization_confidence_passed
+        and localization_geometry_passed
+        and localization_text_evidence_passed
     )
     needs_review = (
         item.confidence < confidence_threshold
@@ -534,6 +555,16 @@ def build_question_values(
         SimpleNamespace(**values, reliable_error_mark=reliable_error_mark)
     )
     values["ocr_raw_json"]["reliable_error_mark"] = reliable_error_mark
+    values["ocr_raw_json"]["localization_validation"] = {
+        "present": localization_present,
+        "matched": localization_matched,
+        "has_bbox": localization_has_bbox,
+        "confidence_passed": localization_confidence_passed,
+        "geometry_passed": localization_geometry_passed,
+        "text_evidence_passed": localization_text_evidence_passed,
+        "local_red_verified": localization_red_verified,
+        "verified": localization_verified,
+    }
     return values
 
 
@@ -629,14 +660,37 @@ def recognize_question_batch(
     marks_by_id = {mark.mark_id: mark for mark in valid_marks}
 
     localizations = {}
+    localization_batch_validation = {
+        "status": "skipped",
+        "error_code": None,
+        "error_reason": None,
+        "returned_count": 0,
+        "validated_count": 0,
+        "verified_count": 0,
+        "reliable_mark_count": 0,
+        "rejection_counts": {},
+    }
     try:
         if not result.error_marks or valid_marks:
+            localization_result = client.localize(
+                image_path,
+                result.items,
+                valid_marks,
+            )
+            localization_batch_validation["returned_count"] = len(
+                localization_result.items
+            )
             localizations = validated_localizations(
-                client.localize(image_path, result.items, valid_marks),
+                localization_result,
                 item_count=len(result.items),
                 marks=marks_by_id,
             )
-    except VisionRecognitionError:
+            localization_batch_validation["status"] = "validated"
+            localization_batch_validation["validated_count"] = len(localizations)
+    except VisionRecognitionError as exc:
+        localization_batch_validation["status"] = "rejected"
+        localization_batch_validation["error_code"] = exc.code
+        localization_batch_validation["error_reason"] = exc.diagnostic.get("reason")
         localizations = {}
 
     values = []
@@ -819,6 +873,77 @@ def recognize_question_batch(
             "discard": "ignored",
         }[decision.action]
         question_values["ocr_raw_json"]["collection_reason"] = decision.reason
+
+    validation_keys = (
+        "present",
+        "matched",
+        "has_bbox",
+        "confidence_passed",
+        "geometry_passed",
+        "text_evidence_passed",
+        "verified",
+    )
+    localization_batch_validation["verified_count"] = sum(
+        bool(candidate["ocr_raw_json"]["localization_validation"]["verified"])
+        for candidate in values
+    )
+    localization_batch_validation["reliable_mark_count"] = sum(
+        bool(candidate["ocr_raw_json"]["reliable_error_mark"])
+        for candidate in values
+    )
+    localization_batch_validation["rejection_counts"] = {
+        key: sum(
+            not bool(candidate["ocr_raw_json"]["localization_validation"][key])
+            for candidate in values
+        )
+        for key in validation_keys
+    }
+    for question_values in values:
+        question_values["ocr_raw_json"]["localization_batch_validation"] = dict(
+            localization_batch_validation
+        )
+
+    if (
+        mode == "marked"
+        and not legacy_mode
+        and valid_marks
+        and not any(
+            candidate["collection_status"] in {"collected", "pending_review"}
+            for candidate in values
+        )
+    ):
+        raise ImageReviewRequired(
+            "red_marks_unresolved",
+            "系统检测到批改痕迹，但没有找到可确认的错题区域。",
+            diagnostic={
+                "operation": "localization",
+                "reason": "marked_candidates_without_reliable_localization",
+                "candidate_count": len(result.items),
+                "mark_count": len(valid_marks),
+                "localization_status": localization_batch_validation["status"],
+                "localization_error_code": localization_batch_validation[
+                    "error_code"
+                ],
+                "localization_error_reason": localization_batch_validation[
+                    "error_reason"
+                ],
+                "localization_returned_count": localization_batch_validation[
+                    "returned_count"
+                ],
+                "localization_validated_count": localization_batch_validation[
+                    "validated_count"
+                ],
+                "localization_verified_count": localization_batch_validation[
+                    "verified_count"
+                ],
+                "localization_reliable_mark_count": localization_batch_validation[
+                    "reliable_mark_count"
+                ],
+                "localization_rejection_counts": localization_batch_validation[
+                    "rejection_counts"
+                ],
+            },
+        )
     return result, values
 
 

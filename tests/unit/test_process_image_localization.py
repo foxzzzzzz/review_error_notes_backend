@@ -239,6 +239,60 @@ def test_marked_mode_returns_image_issue_after_retry_exhaustion(tmp_path):
     assert client.recognize_calls == 2
 
 
+def test_marked_mode_returns_image_issue_when_localization_discards_every_candidate(
+    tmp_path,
+):
+    from app.services.vision_recognition import ImageReviewRequired
+
+    class RejectedLocalizationClient(FakeClient):
+        def localize(self, image_path, items, error_marks):
+            self.localize_calls += 1
+            raise VisionRecognitionError(
+                "vision_localization_invalid",
+                "题目定位结果不完整，请稍后重试",
+                diagnostic={
+                    "operation": "localization",
+                    "reason": "unassigned_mark",
+                    "candidate_count": len(items),
+                    "mark_count": len(error_marks),
+                },
+            )
+
+    with pytest.raises(ImageReviewRequired) as raised:
+        _run_batch(
+            tmp_path,
+            client=RejectedLocalizationClient(),
+            local_red_scan=_detected_red_scan(),
+        )
+
+    assert raised.value.code == "red_marks_unresolved"
+    assert raised.value.diagnostic == {
+        "operation": "localization",
+        "reason": "marked_candidates_without_reliable_localization",
+        "candidate_count": 2,
+        "mark_count": 2,
+        "localization_status": "rejected",
+        "localization_error_code": "vision_localization_invalid",
+        "localization_error_reason": "unassigned_mark",
+        "localization_returned_count": 0,
+        "localization_validated_count": 0,
+        "localization_verified_count": 0,
+        "localization_reliable_mark_count": 0,
+        "localization_rejection_counts": {
+            "present": 2,
+            "matched": 2,
+            "has_bbox": 2,
+            "confidence_passed": 2,
+            "geometry_passed": 2,
+            "text_evidence_passed": 2,
+            "verified": 2,
+        },
+    }
+    from app.services.vision_recognition import safe_recognition_diagnostic
+
+    assert safe_recognition_diagnostic(raised.value) == raised.value.diagnostic
+
+
 def test_unmarked_mode_uses_one_page_ocr_and_at_most_three_crop_rechecks(tmp_path):
     from app.services.error_mark_validation import RedMarkScanResult
     from app.services.local_ocr_verification import OCRPageEvidence
