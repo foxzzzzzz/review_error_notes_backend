@@ -46,3 +46,12 @@ class TestUploadImage:
             headers=auth_header,
         )
         assert resp.status_code == 200
+def test_original_image_route_is_owner_scoped_and_uses_safe_basename():
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / "app" / "api" / "upload.py").read_text(encoding="utf-8")
+
+    assert '@router.get("/images/{image_id}/original")' in source
+    assert "WrongImage.student_id == student.id" in source
+    assert "Path(image.original_url).name" in source
+    assert "FileResponse" in source

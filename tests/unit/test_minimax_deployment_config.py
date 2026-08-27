@@ -8,6 +8,18 @@ from app.config import Settings
 
 BACKEND_ROOT = Path(__file__).parents[2]
 
+EXPECTED_ADAPTIVE_EVIDENCE_SETTINGS = {
+    "LOCAL_OCR_ENABLED": "true",
+    "LOCAL_OCR_FULL_PAGE_MAX_EDGE": "1600",
+    "LOCAL_OCR_CROP_RECHECK_LIMIT": "3",
+    "LOCAL_RED_SCAN_MAX_EDGE": "1600",
+    "LOCAL_RED_COMPONENT_MIN_PIXELS": "12",
+    "LOCAL_RED_COMPONENT_MAX_AREA_RATIO": "0.08",
+    "LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO": "18",
+    "MINIMAX_MARK_MISMATCH_RETRY_COUNT": "1",
+    "CELERY_WORKER_CONCURRENCY": "2",
+}
+
 
 def test_worker_receives_every_minimax_setting_without_a_secret_value():
     compose = (BACKEND_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
@@ -47,6 +59,42 @@ def test_worker_receives_every_minimax_setting_without_a_secret_value():
     assert "secret-token" not in compose
     assert "./config:/app/config:ro" in worker
     assert "TAG_ALIAS_CONFIG_PATH: ${TAG_ALIAS_CONFIG_PATH:-/app/config/tag-aliases.json}" in worker
+
+
+def test_adaptive_local_evidence_settings_have_documented_safe_defaults():
+    compose = (BACKEND_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    env_example = (BACKEND_ROOT / ".env.example").read_text(encoding="utf-8")
+    readme = (BACKEND_ROOT / "README.md").read_text(encoding="utf-8")
+    config = (BACKEND_ROOT / "app" / "config.py").read_text(encoding="utf-8")
+    worker = compose.split("  worker:", 1)[1].split("  beat:", 1)[0]
+
+    for name, default in EXPECTED_ADAPTIVE_EVIDENCE_SETTINGS.items():
+        assert name in config
+        assert f"{name}={default}" in env_example
+        assert f"`{name}`" in readme
+        if name != "CELERY_WORKER_CONCURRENCY":
+            assert f"{name}: ${{{name}:-{default}}}" in worker
+
+    assert "--concurrency=${CELERY_WORKER_CONCURRENCY:-2}" in worker
+    assert "LOCAL_OCR_ENABLED: ${LOCAL_OCR_ENABLED:-false}" not in worker
+
+
+def test_adaptive_local_evidence_settings_are_bounded():
+    settings = Settings(_env_file=None)
+
+    assert settings.LOCAL_OCR_ENABLED is True
+    assert settings.LOCAL_OCR_FULL_PAGE_MAX_EDGE == 1600
+    assert settings.LOCAL_OCR_CROP_RECHECK_LIMIT == 3
+    assert settings.CELERY_WORKER_CONCURRENCY == 2
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, LOCAL_OCR_FULL_PAGE_MAX_EDGE=639)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, LOCAL_OCR_CROP_RECHECK_LIMIT=21)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, LOCAL_RED_COMPONENT_MAX_AREA_RATIO=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, CELERY_WORKER_CONCURRENCY=17)
 
 
 def test_marker_focused_crop_padding_is_external_and_validated():

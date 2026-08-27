@@ -44,4 +44,9 @@ class ReviewDecisionRequest(BaseModel):
 
 
 class ReviewImageReprocessRequest(BaseModel):
-    correction: Literal["missed_errors", "false_positives", "both"]
+    correction: Literal[
+        "missed_errors",
+        "false_positives",
+        "both",
+        "force_unmarked",
+    ]

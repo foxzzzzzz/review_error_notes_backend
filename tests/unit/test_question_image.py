@@ -7,6 +7,7 @@ from app.services.question_image import (
     QuestionImageInvalid,
     QuestionImageNotFound,
     load_cropped_rgb_image,
+    load_resized_rgb_image,
     render_question_image,
 )
 
@@ -47,6 +48,15 @@ def test_in_memory_crop_uses_the_same_normalized_coordinates(tmp_path):
 
     assert crop.mode == "RGB"
     assert crop.size == (50, 40)
+
+
+def test_in_memory_page_resize_preserves_aspect_ratio(tmp_path):
+    source = tmp_path / "large.jpg"
+    _save_image(source, size=(2000, 1000))
+
+    image = load_resized_rgb_image(source, max_edge=1600, max_pixels=40_000_000)
+
+    assert image.size == (1600, 800)
 
 
 def test_original_view_returns_the_complete_image(tmp_path):

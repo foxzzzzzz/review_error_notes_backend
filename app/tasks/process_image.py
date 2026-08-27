@@ -15,8 +15,10 @@ from app.models.sheet_item import SheetItem  # noqa: F401
 from app.models.student import Student  # noqa: F401
 from app.models.wrong_image import WrongImage
 from app.models.wrong_question import WrongQuestion
+from app.services.error_mark_validation import scan_red_mark_regions
 from app.services.local_ocr_verification import RapidOCRVerifier
 from app.services.vision_recognition import (
+    ImageReviewRequired,
     MiniMaxVisionClient,
     VisionRecognitionError,
     image_status_for,
@@ -33,17 +35,9 @@ def processing_failure_for(error: Exception) -> tuple[str, str]:
     return "recognition_internal_error", "识别暂时失败，请稍后重试"
 
 
-def collection_status_to_persist(collection_status: str) -> str:
-    """Keep recognized candidates available for an explicit user decision."""
-    return "pending_review" if collection_status == "ignored" else collection_status
-
-
 def should_persist_candidate(values: dict, recognition_correction: str | None) -> bool:
-    """Strict correction modes discard candidates previously judged as correct."""
-    return not (
-        recognition_correction in {"false_positives", "both"}
-        and values["collection_status"] == "ignored"
-    )
+    """Never persist candidates explicitly discarded by the evidence policy."""
+    return values["collection_status"] != "ignored"
 
 
 def candidate_identity_for(values: dict) -> tuple[str, str, str, str, str]:
@@ -121,6 +115,13 @@ def process_image(self, image_id: str, filepath: str):
             claimed = True
 
         stage = "recognition"
+        local_red_scan = scan_red_mark_regions(
+            filepath,
+            max_edge=settings.LOCAL_RED_SCAN_MAX_EDGE,
+            min_component_pixels=settings.LOCAL_RED_COMPONENT_MIN_PIXELS,
+            max_component_area_ratio=settings.LOCAL_RED_COMPONENT_MAX_AREA_RATIO,
+            max_thinness_ratio=settings.LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO,
+        )
         result, question_values = recognize_question_batch(
             client=MiniMaxVisionClient.from_settings(),
             image_path=filepath,
@@ -147,6 +148,13 @@ def process_image(self, image_id: str, filepath: str):
                 contradiction_similarity_threshold=settings.LOCAL_OCR_CONTRADICTION_SIMILARITY_THRESHOLD,
             ),
             recognition_correction=recognition_correction,
+            local_red_scan=local_red_scan,
+            mark_mismatch_retry_count=settings.MINIMAX_MARK_MISMATCH_RETRY_COUNT,
+            ocr_full_page_max_edge=settings.LOCAL_OCR_FULL_PAGE_MAX_EDGE,
+            ocr_crop_recheck_limit=settings.LOCAL_OCR_CROP_RECHECK_LIMIT,
+            force_mode=(
+                "unmarked" if recognition_correction == "force_unmarked" else None
+            ),
         )
         log_mark_validation_diagnostics(image_id, question_values)
         question_values = discard_pending_duplicates_of_collected(question_values)
@@ -169,9 +177,7 @@ def process_image(self, image_id: str, filepath: str):
                 values["ocr_raw_json"]["ignored_text"] = result.ignored_text
                 if not should_persist_candidate(values, recognition_correction):
                     continue
-                collection_status = collection_status_to_persist(
-                    values["collection_status"]
-                )
+                collection_status = values["collection_status"]
                 values["collection_status"] = collection_status
                 question_values_for_db = {
                     key: value
@@ -191,11 +197,69 @@ def process_image(self, image_id: str, filepath: str):
 
             image.question_count = len(persisted_values)
             image.status = image_status_for(question_values)
+            recognition_mode = (
+                question_values[0]["ocr_raw_json"].get("recognition_mode", "unknown")
+                if question_values
+                else "unknown"
+            )
+            page_diagnostic = (
+                question_values[0]["ocr_raw_json"].get("local_ocr_page")
+                if question_values
+                else None
+            )
+            crop_ocr_durations = [
+                values["ocr_raw_json"].get("local_ocr", {}).get("duration_ms", 0)
+                for values in question_values
+            ]
+            ocr_calls = sum(duration > 0 for duration in crop_ocr_durations)
+            ocr_ms = sum(crop_ocr_durations)
+            if page_diagnostic and page_diagnostic.get("status") == "available":
+                ocr_calls += 1
+                ocr_ms += page_diagnostic.get("duration_ms", 0)
+            final_status = image.status
+            image.error_code = None
+            image.error_message = None
             image.recognition_correction = None
             if not image.subject:
                 image.subject = result.items[0].subject
             db.commit()
             claimed = False
+        logger.info(
+            "image_recognition_summary image_id=%s mode=%s red_scan_ms=%.2f ocr_ms=%.2f ocr_calls=%s candidate_count=%s persisted_count=%s status=%s",
+            image_id,
+            recognition_mode,
+            local_red_scan.duration_ms,
+            ocr_ms,
+            ocr_calls,
+            len(question_values),
+            len(persisted_values),
+            final_status,
+        )
+    except ImageReviewRequired as exc:
+        if claimed:
+            with Session(engine) as db:
+                claimed_image = db.scalar(
+                    select(WrongImage)
+                    .where(WrongImage.id == image_id)
+                    .with_for_update()
+                )
+                if claimed_image and claimed_image.status == "segmented":
+                    claimed_image.status = "needs_review"
+                    claimed_image.question_count = 0
+                    claimed_image.error_code = exc.code
+                    claimed_image.error_message = exc.user_message
+                    claimed_image.recognition_correction = None
+                    db.commit()
+        logger.info(
+            "image_recognition_needs_review image_id=%s error_code=%s diagnostic=%s",
+            image_id,
+            exc.code,
+            json.dumps(
+                safe_recognition_diagnostic(exc),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
     except Exception as exc:
         if claimed:
             with Session(engine) as db:

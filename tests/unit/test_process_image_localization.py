@@ -150,6 +150,9 @@ def _run_batch(
     client=None,
     ocr_verifier=None,
     crop_context_padding_ratio=0.0,
+    local_red_scan=None,
+    mark_mismatch_retry_count=0,
+    force_mode=None,
 ):
     from app.services.vision_recognition import recognize_question_batch
 
@@ -166,7 +169,155 @@ def _run_batch(
         tag_config_path=_write_tag_config(tmp_path),
         ocr_verifier=ocr_verifier or FakeOCRVerifier(),
         crop_context_padding_ratio=crop_context_padding_ratio,
+        local_red_scan=local_red_scan,
+        mark_mismatch_retry_count=mark_mismatch_retry_count,
+        force_mode=force_mode,
     )
+
+
+def _detected_red_scan():
+    from app.services.error_mark_validation import RedMarkRegion, RedMarkScanResult
+
+    return RedMarkScanResult(
+        status="detected",
+        regions=[
+            RedMarkRegion(
+                bbox=[0.2, 0.23, 0.3, 0.34],
+                pixel_count=100,
+                area_ratio=0.011,
+                thinness_ratio=1.1,
+            )
+        ],
+        red_pixel_count=100,
+        scanned_width=400,
+        scanned_height=300,
+        duration_ms=1.0,
+    )
+
+
+def test_marked_mode_retries_once_when_model_misses_local_red_mark(tmp_path):
+    class RetryClient(FakeClient):
+        def recognize(self, image_path, subject_hint=None, **_kwargs):
+            self.recognize_calls += 1
+            result = _vision_result()
+            if self.recognize_calls == 1:
+                result.error_marks = []
+            return result
+
+    client = RetryClient()
+    _result, values = _run_batch(
+        tmp_path,
+        client=client,
+        local_red_scan=_detected_red_scan(),
+        mark_mismatch_retry_count=1,
+    )
+
+    assert client.recognize_calls == 2
+    assert values
+
+
+def test_marked_mode_returns_image_issue_after_retry_exhaustion(tmp_path):
+    from app.services.vision_recognition import ImageReviewRequired
+
+    class MissingMarkClient(FakeClient):
+        def recognize(self, image_path, subject_hint=None, **_kwargs):
+            self.recognize_calls += 1
+            result = _vision_result()
+            result.error_marks = []
+            return result
+
+    client = MissingMarkClient()
+    with pytest.raises(ImageReviewRequired) as raised:
+        _run_batch(
+            tmp_path,
+            client=client,
+            local_red_scan=_detected_red_scan(),
+            mark_mismatch_retry_count=1,
+        )
+
+    assert raised.value.code == "red_marks_unresolved"
+    assert client.recognize_calls == 2
+
+
+def test_unmarked_mode_uses_one_page_ocr_and_at_most_three_crop_rechecks(tmp_path):
+    from app.services.error_mark_validation import RedMarkScanResult
+    from app.services.local_ocr_verification import OCRPageEvidence
+
+    items = [
+        _vision_result().items[0].model_copy(
+            update={
+                "prompt_text": f"提示{index}",
+                "raw_text": f"作答{index}",
+                "answer": f"作答{index}",
+                "confidence": 0.99 - index / 1000,
+            }
+        )
+        for index in range(20)
+    ]
+
+    class UnmarkedClient(FakeClient):
+        def recognize(self, image_path, subject_hint=None, **_kwargs):
+            return VisionResult(items=items, error_marks=[], ignored_text=[])
+
+        def localize(self, image_path, recognized_items, error_marks):
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=index,
+                        matched=True,
+                        mark_ids=[],
+                        bbox=[0.05, 0.02 + index * 0.045, 0.95, 0.055 + index * 0.045],
+                        observed_prompt_text=item.prompt_text,
+                        observed_raw_text=item.raw_text,
+                        confidence=0.95,
+                    )
+                    for index, item in enumerate(recognized_items)
+                ]
+            )
+
+    class CountingOCR(FakeOCRVerifier):
+        enabled = True
+        line_confidence_threshold = 0.85
+        min_effective_characters = 2
+        support_similarity_threshold = 0.8
+        contradiction_similarity_threshold = 0.9
+
+        def __init__(self):
+            super().__init__()
+            self.page_calls = 0
+            self.crop_calls = 0
+
+        def recognize_page(self, image_path, max_edge):
+            self.page_calls += 1
+            return OCRPageEvidence(
+                status="available",
+                lines=[],
+                duration_ms=1.0,
+                prepared_size=[400, 300],
+            )
+
+        def verify_crop(self, image_path, bbox, target_index, items):
+            self.crop_calls += 1
+            return OCRVerification(status="inconclusive")
+
+    verifier = CountingOCR()
+    no_red = RedMarkScanResult(
+        status="none",
+        regions=[],
+        red_pixel_count=0,
+        scanned_width=400,
+        scanned_height=300,
+        duration_ms=1.0,
+    )
+    _run_batch(
+        tmp_path,
+        client=UnmarkedClient(),
+        ocr_verifier=verifier,
+        local_red_scan=no_red,
+    )
+
+    assert verifier.page_calls == 1
+    assert verifier.crop_calls == 3
 
 
 def test_pipeline_recognizes_and_localizes_once_per_image(tmp_path):
@@ -360,7 +511,7 @@ def test_ocr_contradiction_discards_localized_bbox(tmp_path):
     verifier = FakeOCRVerifier(
         {
             0: OCRVerification(
-                status="contradict",
+                status="wrong_candidate",
                 matched_index=1,
                 text_summary="算式",
                 confidence=0.98,

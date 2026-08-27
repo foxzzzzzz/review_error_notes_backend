@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -164,6 +165,33 @@ async def retry_image(
         await db.commit()
         raise HTTPException(status_code=503, detail=image.error_message)
     return {"image_id": str(image.id), "status": "pending"}
+
+
+@router.get("/images/{image_id}/original")
+async def get_original_image(
+    image_id: str,
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    image = await db.scalar(
+        select(WrongImage).where(
+            WrongImage.id == image_id,
+            WrongImage.student_id == student.id,
+        )
+    )
+    if image is None:
+        raise HTTPException(status_code=404, detail="Image not found")
+    filepath = Path(settings.UPLOAD_DIR) / Path(image.original_url).name
+    media_types = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }
+    media_type = media_types.get(filepath.suffix.lower())
+    if media_type is None or not filepath.is_file():
+        raise HTTPException(status_code=404, detail="Image file not found")
+    return FileResponse(filepath, media_type=media_type)
 
 
 @router.post("/image")

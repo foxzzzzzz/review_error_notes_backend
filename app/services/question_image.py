@@ -71,6 +71,14 @@ def load_cropped_rgb_image(image_path, bbox, max_pixels):
     return image.crop(crop_box)
 
 
+def load_resized_rgb_image(image_path, max_edge, max_pixels):
+    """Load an EXIF-corrected page and bound its longest edge for OCR."""
+    image = _load_rgb_image(image_path, max_pixels)
+    if max(image.size) > max_edge:
+        image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+    return image
+
+
 def render_question_image(image_path, crop_region, view, jpeg_quality, max_pixels):
     image = _load_rgb_image(image_path, max_pixels)
     if view == "crop":

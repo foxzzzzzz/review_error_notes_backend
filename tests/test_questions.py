@@ -22,6 +22,15 @@ def test_review_reprocess_route_replaces_only_pending_candidates():
     assert 'process_image.delay' in source
 
 
+def test_review_route_includes_zero_candidate_image_issues():
+    source = (Path(__file__).parents[1] / "app" / "api" / "questions.py").read_text(encoding="utf-8")
+
+    assert '"group_type": "image_issue"' in source
+    assert 'WrongImage.question_count == 0' in source
+    assert 'WrongImage.error_code.is_not(None)' in source
+    assert 'actionable_image_issue' in source
+
+
 def test_review_decision_locks_image_before_its_questions():
     source = (Path(__file__).parents[1] / "app" / "api" / "questions.py").read_text(encoding="utf-8")
     decision_source = source[

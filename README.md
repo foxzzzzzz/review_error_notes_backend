@@ -449,6 +449,7 @@ student (学生)
 | `MARK_RED_PIXEL_EXPANSION_RATIO` | 红色像素检查框向外扩展比例 | `0.08` |
 | `MINIMAX_IMAGE_MAX_EDGE` | 预处理图片最长边像素数 | `2048` |
 | `MINIMAX_IMAGE_JPEG_QUALITY` | 预处理 JPEG 质量 | `90` |
+| `MINIMAX_MARK_MISMATCH_RETRY_COUNT` | 本地检测到红标但模型未返回有效标记时的额外重试次数 | `1` |
 | `LOCAL_OCR_ENABLED` | 启用 RapidOCR 反证复核 | `true` |
 | `LOCAL_OCR_ENGINE` | RapidOCR 推理引擎 | `onnxruntime` |
 | `LOCAL_OCR_VERSION` | RapidOCR 固定版本 | `3.9.1` |
@@ -459,6 +460,13 @@ student (学生)
 | `LOCAL_OCR_MIN_EFFECTIVE_CHARACTERS` | 参与反证的最少有效字符数 | `2` |
 | `LOCAL_OCR_SUPPORT_SIMILARITY_THRESHOLD` | OCR 支持当前题目的相似度阈值 | `0.8` |
 | `LOCAL_OCR_CONTRADICTION_SIMILARITY_THRESHOLD` | OCR 明确匹配另一题的否决阈值 | `0.9` |
+| `LOCAL_OCR_FULL_PAGE_MAX_EDGE` | 无红标模式整页 OCR 的最长边像素数 | `1600` |
+| `LOCAL_OCR_CROP_RECHECK_LIMIT` | 单图最多补充裁图 OCR 次数 | `3` |
+| `LOCAL_RED_SCAN_MAX_EDGE` | 独立本地红标扫描的最长边像素数 | `1600` |
+| `LOCAL_RED_COMPONENT_MIN_PIXELS` | 红色连通区域最少像素数 | `12` |
+| `LOCAL_RED_COMPONENT_MAX_AREA_RATIO` | 红色连通区域最大整图面积比例 | `0.08` |
+| `LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO` | 红色连通区域最大长宽比 | `18` |
+| `CELERY_WORKER_CONCURRENCY` | CPU OCR Worker 并发数 | `2` |
 | `QUESTION_SOFT_DELETE_RETENTION_DAYS` | 软删除错题和无引用图片在物理清理前的保留天数 | `30` |
 | `QUESTION_CLEANUP_INTERVAL_SECONDS` | Beat 投递周期清理任务的间隔秒数 | `86400` |
 | `QUESTION_CLEANUP_BATCH_SIZE` | Worker 单次清理最多锁定和处理的记录数 | `100` |
@@ -470,3 +478,21 @@ student (学生)
 | `DEV_MODE` | 开发模式（启用 dev-login） | `false` |
 | `WECHAT_APP_ID` | 小程序 AppID | - |
 | `WECHAT_APP_SECRET` | 小程序 Secret | - |
+
+### 自适应 OCR 服务器验收
+
+代码部署到后端服务器后，传入一张或多张真实错题图片运行：
+
+```bash
+bash scripts/verify_adaptive_ocr_server.sh /path/to/image-1.jpg /path/to/image-2.jpg
+```
+
+脚本会构建 API/Worker 镜像、运行方案 B 聚焦测试、核对 `rapidocr==3.9.1` 与 `onnxruntime==1.27.0`，最后输出红标扫描和 1600 像素整页 OCR 的 p50/p95、调用次数及峰值内存。真实图片仅以只读文件挂载到临时容器，不会复制进镜像或仓库。
+
+默认只运行不依赖数据库的方案 B 聚焦测试和真实性能测试，不会操作服务器数据库。仅在 `DEV_MODE=true` 的非生产验收环境需要同时运行实时 API 测试时使用：
+
+```bash
+RUN_LIVE_API_TESTS=true bash scripts/verify_adaptive_ocr_server.sh /path/to/image-1.jpg /path/to/image-2.jpg
+```
+
+生产环境会拒绝执行实时 API 测试，避免测试账号和迁移操作进入生产数据库。实时套件暂时排除两项已记录的历史直调单测：它们把 FastAPI 的 `Query(None)` 默认对象直接传给接口函数，与本次 OCR 改造无关。

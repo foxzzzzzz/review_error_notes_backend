@@ -45,7 +45,7 @@ def test_text_matching_another_item_better_contradicts_crop():
 
     result = _classify([OCRLine(text="算式", confidence=0.98)])
 
-    assert result.status == "contradict"
+    assert result.status == "wrong_candidate"
     assert result.matched_index == 1
 
 
@@ -110,3 +110,101 @@ def test_verifier_returns_unavailable_when_engine_initialization_fails(tmp_path)
 
     assert result.status == "unavailable"
     assert result.text_summary == ""
+    assert result.error_code == "engine_initialization_failed"
+
+
+def _verifier(*, enabled=True, engine_factory):
+    from app.services.local_ocr_verification import RapidOCRVerifier
+
+    return RapidOCRVerifier(
+        enabled=enabled,
+        library_version="3.9.1",
+        engine_name="onnxruntime",
+        model_version="PP-OCRv5",
+        model_type="mobile",
+        model_path="models/ppocrv5",
+        max_pixels=40_000_000,
+        line_confidence_threshold=0.85,
+        min_effective_characters=2,
+        support_similarity_threshold=0.8,
+        contradiction_similarity_threshold=0.9,
+        engine_factory=engine_factory,
+    )
+
+
+def test_disabled_verifier_never_initializes_engine(tmp_path):
+    from PIL import Image
+
+    image_path = tmp_path / "image.jpg"
+    Image.new("RGB", (100, 100), "white").save(image_path)
+
+    def should_not_run():
+        raise AssertionError("engine must remain disabled")
+
+    verifier = _verifier(enabled=False, engine_factory=should_not_run)
+
+    assert verifier.verify_crop(
+        str(image_path), [0, 0, 1, 1], 0, [_item("课文", "kè wén")]
+    ).status == "disabled"
+    assert verifier.recognize_page(str(image_path), 1600).status == "disabled"
+
+
+def test_page_ocr_runs_once_and_returns_normalized_spatial_lines(tmp_path):
+    from types import SimpleNamespace
+    from PIL import Image
+
+    image_path = tmp_path / "image.jpg"
+    Image.new("RGB", (200, 100), "white").save(image_path)
+    calls = []
+
+    class Engine:
+        def __call__(self, image, use_cls=False):
+            calls.append(image.shape)
+            return SimpleNamespace(
+                txts=["课文", "算式"],
+                scores=[0.98, 0.97],
+                boxes=[
+                    [[10, 10], [90, 10], [90, 40], [10, 40]],
+                    [[110, 60], [190, 60], [190, 90], [110, 90]],
+                ],
+            )
+
+    verifier = _verifier(engine_factory=lambda: Engine())
+    page = verifier.recognize_page(str(image_path), 1600)
+
+    assert page.status == "available"
+    assert page.prepared_size == [200, 100]
+    assert page.lines[0].bbox == [0.05, 0.1, 0.45, 0.4]
+    assert len(calls) == 1
+
+
+def test_page_evidence_uses_only_lines_intersecting_candidate_bbox():
+    from app.services.local_ocr_verification import (
+        OCRLine,
+        OCRPageEvidence,
+        classify_page_evidence,
+    )
+
+    page = OCRPageEvidence(
+        status="available",
+        lines=[
+            OCRLine(text="课文", confidence=0.98, bbox=[0.0, 0.0, 0.45, 0.45]),
+            OCRLine(text="算式", confidence=0.98, bbox=[0.55, 0.55, 1.0, 1.0]),
+        ],
+        duration_ms=1,
+        prepared_size=[100, 100],
+    )
+
+    result = classify_page_evidence(
+        page,
+        [0.5, 0.5, 1.0, 1.0],
+        target_index=0,
+        items=[_item("课文", "kè wén"), _item("算式", "suàn shì")],
+        line_confidence_threshold=0.85,
+        min_effective_characters=2,
+        support_similarity_threshold=0.8,
+        contradiction_similarity_threshold=0.9,
+    )
+
+    assert result.status == "wrong_candidate"
+    assert result.matched_index == 1

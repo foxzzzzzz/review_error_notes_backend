@@ -19,8 +19,7 @@ def test_question_detail_exposes_structured_review_context():
     assert "ocr_raw_json" in fields
 
 
-def test_review_reprocessing_accepts_only_fixed_correction_reasons():
-    source = (Path(__file__).parents[2] / "app" / "schemas" / "question.py").read_text(encoding="utf-8")
+def test_review_reprocessing_accepts_force_unmarked_mode():
+    from app.schemas.question import ReviewImageReprocessRequest
 
-    assert "class ReviewImageReprocessRequest" in source
-    assert 'Literal["missed_errors", "false_positives", "both"]' in source
+    assert ReviewImageReprocessRequest(correction="force_unmarked").correction == "force_unmarked"

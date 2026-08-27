@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     MARK_RED_PIXEL_EXPANSION_RATIO: float = Field(default=0.08, ge=0, le=1)
     MINIMAX_IMAGE_MAX_EDGE: int = 2048
     MINIMAX_IMAGE_JPEG_QUALITY: int = 90
+    MINIMAX_MARK_MISMATCH_RETRY_COUNT: int = Field(default=1, ge=0, le=2)
     LOCAL_OCR_ENABLED: bool = True
     LOCAL_OCR_ENGINE: str = "onnxruntime"
     LOCAL_OCR_VERSION: str = "3.9.1"
@@ -59,6 +60,13 @@ class Settings(BaseSettings):
         ge=0,
         le=1,
     )
+    LOCAL_OCR_FULL_PAGE_MAX_EDGE: int = Field(default=1600, ge=640, le=4096)
+    LOCAL_OCR_CROP_RECHECK_LIMIT: int = Field(default=3, ge=0, le=20)
+    LOCAL_RED_SCAN_MAX_EDGE: int = Field(default=1600, ge=640, le=4096)
+    LOCAL_RED_COMPONENT_MIN_PIXELS: int = Field(default=12, ge=1)
+    LOCAL_RED_COMPONENT_MAX_AREA_RATIO: float = Field(default=0.08, gt=0, le=1)
+    LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO: float = Field(default=18, ge=1)
+    CELERY_WORKER_CONCURRENCY: int = Field(default=2, ge=1, le=16)
     TAG_ALIAS_CONFIG_PATH: str = "./config/tag-aliases.json"
     DEBUG_DATA_RESET_CONFIRMATION_PHRASE: str = "CLEAR_DEBUG_BUSINESS_DATA"
     QUESTION_IMAGE_MAX_PIXELS: int = 40_000_000

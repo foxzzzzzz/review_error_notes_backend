@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import inspect
 import re
 import time
 import unicodedata
@@ -26,10 +27,12 @@ from pydantic import (
 from app.config import settings
 from app.services.error_mark_validation import (
     ErrorMarkImageInvalid,
+    RedMarkScanResult,
     filter_valid_error_marks,
     validate_localization_red_evidence,
 )
 from app.services.question_collection import collection_reason_for, collection_status_for
+from app.services.recognition_policy import decide_candidate
 from app.services.tag_normalization import normalize_tags
 
 
@@ -59,7 +62,7 @@ RECOGNITION_PROMPT = """你是小学错题内容与红色批改标记识别器�
 8. 对于看词语写拼音、看拼音写词语等词语练习，最小可独立作答单元是完整词语格组。即使标记只覆盖单字、单音节或部分笔画，也要识别其所属完整词语；完整词语优先于红色标记的像素覆盖范围。
 9. 完整词语格组的各字段必须保持同一范围：raw_text 抄录学生对整个词语的实际作答，prompt_text 填写整个印刷提示，answer 填写整个正确答案，question_type 根据完整提示与完整作答判断。
 10. 所有字段必须从当前图片可见内容提取，不得复用提示中的示例或臆造图片中不存在的词语。
-11. 若没有发现明确的红色错误标记，输出图片中的所有最小可独立作答单元，每个单元一个 item。
+11. 本次是有红标作业识别：只输出与可靠红色错误标记关联的最小作答单元；禁止在没有可靠红标关联时回退输出整页题目。
 12. 红色批改符号本身不要写入 raw_text；老师写出的纠正内容可作为 answer 的参考。
 13. raw_text 必须忠实抄录学生实际书写，包括错字、漏字、错误拼音和错误答案；禁止自动改正后覆盖原文。题目未作答时必须输出 "raw_text": ""，不得遗漏该字段或编造内容。
 14. instruction 必须填写图片中可见的原始练习要求；prompt_text 必须填写重新出卷时展示的干净提示材料。二者不得包含学生作答、正确答案或老师批改笔迹。
@@ -94,6 +97,39 @@ JSON 格式：
 
 科目提示：{subject_hint}
 """
+
+
+def recognition_prompt_for(
+    mode: Literal["marked", "unmarked"],
+    subject_hint: Optional[str],
+    local_red_regions: List[List[float]],
+    correction: Optional[str] = None,
+) -> str:
+    """Build a mode-specific prompt from bounded local evidence."""
+    if mode == "marked":
+        mode_instruction = (
+            "本地红标扫描发现以下归一化候选区域："
+            + json.dumps(local_red_regions[:50], ensure_ascii=False, separators=(",", ":"))
+            + "。这些区域只是定位提示，仍须按图片核验；只输出与可靠红色错误标记关联的作答单元，禁止输出整页未标记题目。"
+        )
+    else:
+        mode_instruction = (
+            "本地未检测到可靠红色批改标记。本次按无红标作业分析：输出图片中的所有最小可独立作答单元，"
+            "分别忠实提取学生答案与参考答案供后端比较；不得把所有输出单元直接称为错题。"
+        )
+    correction_instruction = recognition_correction_instruction(correction)
+    base_prompt = RECOGNITION_PROMPT
+    if mode == "unmarked":
+        base_prompt = base_prompt.replace(
+            "本次是有红标作业识别：只输出与可靠红色错误标记关联的最小作答单元；禁止在没有可靠红标关联时回退输出整页题目。",
+            "本次是无红标作业分析：输出图片中的所有最小可独立作答单元，但不得把所有输出单元直接判为错题。",
+        )
+    return (
+        base_prompt.format(subject_hint=subject_hint or "自动判断")
+        + "\n\n识别模式要求："
+        + mode_instruction
+        + ("\n\n纠偏要求：" + correction_instruction if correction_instruction else "")
+    )
 
 LOCALIZATION_PROMPT = """你是小学错题区域定位器。请根据整张图片、已识别题目内容和独立红色错误标记，重新完成题目与标记匹配及作答单元定位。
 
@@ -133,6 +169,10 @@ class VisionRecognitionError(RuntimeError):
         self.user_message = user_message
         self.diagnostic = diagnostic or {}
         super().__init__(user_message)
+
+
+class ImageReviewRequired(VisionRecognitionError):
+    """A safe, actionable image-level issue rather than a processing failure."""
 
 
 SAFE_RECOGNITION_DIAGNOSTIC_KEYS = {
@@ -497,6 +537,29 @@ def build_question_values(
     return values
 
 
+def _recognize_with_mode(
+    client,
+    image_path: str,
+    subject_hint: Optional[str],
+    recognition_correction: Optional[str],
+    mode: Literal["marked", "unmarked"],
+    local_red_regions: List[List[float]],
+) -> VisionResult:
+    candidate_kwargs = {
+        "subject_hint": subject_hint,
+        "recognition_correction": recognition_correction,
+        "recognition_mode": mode,
+        "local_red_regions": local_red_regions,
+    }
+    supported = inspect.signature(client.recognize).parameters
+    kwargs = {
+        key: value
+        for key, value in candidate_kwargs.items()
+        if key in supported and value is not None
+    }
+    return client.recognize(image_path, **kwargs)
+
+
 def recognize_question_batch(
     client,
     image_path: str,
@@ -511,24 +574,58 @@ def recognize_question_batch(
     ocr_verifier,
     crop_context_padding_ratio: float = 0.0,
     recognition_correction: Optional[str] = None,
+    local_red_scan: Optional[RedMarkScanResult] = None,
+    mark_mismatch_retry_count: int = 0,
+    ocr_full_page_max_edge: int = 1600,
+    ocr_crop_recheck_limit: int = 3,
+    force_mode: Optional[Literal["marked", "unmarked"]] = None,
 ) -> tuple[VisionResult, List[dict]]:
-    """Recognize marks/content, independently localize, then OCR-check each crop."""
-    recognize_kwargs = {"subject_hint": subject_hint}
-    if recognition_correction:
-        recognize_kwargs["recognition_correction"] = recognition_correction
-    result = client.recognize(image_path, **recognize_kwargs)
-    try:
-        valid_marks, rejected_mark_ids, mark_diagnostics = filter_valid_error_marks(
+    """Recognize, localize, and apply adaptive local evidence policy."""
+    legacy_mode = local_red_scan is None
+    scan_detected = bool(local_red_scan and local_red_scan.status == "detected")
+    mode = force_mode or ("marked" if scan_detected or legacy_mode else "unmarked")
+    local_red_regions = [
+        list(region.bbox) for region in (local_red_scan.regions if local_red_scan else [])
+    ]
+
+    for attempt in range(mark_mismatch_retry_count + 1):
+        result = _recognize_with_mode(
+            client,
             image_path,
-            result.error_marks,
-            confidence_threshold=mark_confidence_threshold,
-            red_pixel_min_ratio=red_pixel_min_ratio,
-            expansion_ratio=red_pixel_expansion_ratio,
+            subject_hint,
+            recognition_correction,
+            mode,
+            local_red_regions,
         )
-    except ErrorMarkImageInvalid:
-        valid_marks = []
-        rejected_mark_ids = [mark.mark_id for mark in result.error_marks]
-        mark_diagnostics = []
+        try:
+            valid_marks, rejected_mark_ids, mark_diagnostics = filter_valid_error_marks(
+                image_path,
+                result.error_marks,
+                confidence_threshold=mark_confidence_threshold,
+                red_pixel_min_ratio=red_pixel_min_ratio,
+                expansion_ratio=red_pixel_expansion_ratio,
+            )
+        except ErrorMarkImageInvalid:
+            valid_marks = []
+            rejected_mark_ids = [mark.mark_id for mark in result.error_marks]
+            mark_diagnostics = []
+        if mode != "marked" or valid_marks or not scan_detected:
+            break
+        if attempt == mark_mismatch_retry_count:
+            raise ImageReviewRequired(
+                "red_marks_unresolved",
+                "系统检测到批改痕迹，但没有找到可确认的错题区域。",
+                diagnostic={
+                    "operation": "recognition",
+                    "reason": "local_red_marks_without_model_marks",
+                    "mark_count": len(result.error_marks),
+                },
+            )
+
+    if mode == "unmarked" and valid_marks and force_mode != "unmarked":
+        mode = "marked"
+    elif legacy_mode and not valid_marks:
+        mode = "unmarked"
     marks_by_id = {mark.mark_id: mark for mark in valid_marks}
 
     localizations = {}
@@ -591,34 +688,6 @@ def recognize_question_batch(
             crop_context_padding_ratio=crop_context_padding_ratio,
             localization_red_verified=localization_red_verified,
         )
-        local_ocr = {
-            "status": "unavailable",
-            "matched_index": None,
-            "text_summary": "",
-            "confidence": None,
-        }
-        proposed_bbox = (
-            localization.bbox
-            if localization is not None
-            and question_values["crop_region"].get("bbox") is not None
-            else None
-        )
-        if proposed_bbox is not None:
-            verification = ocr_verifier.verify(
-                image_path,
-                proposed_bbox,
-                target_index=index,
-                items=result.items,
-            )
-            local_ocr = verification.model_dump(mode="json")
-            if verification.status == "contradict":
-                question_values["crop_region"] = {
-                    "bbox_source": "unverified",
-                    "localization_status": "needs_review",
-                    "index": index,
-                }
-                question_values["review_status"] = "needs_review"
-
         question_values["ocr_raw_json"].update(
             {
                 "error_marks": [
@@ -633,20 +702,123 @@ def recognize_question_batch(
                     else None
                 ),
                 "localization_red_validation": localization_red_validation,
-                "local_ocr": local_ocr,
+                "recognition_mode": mode,
             }
         )
-        collection_subject = SimpleNamespace(
-            **question_values,
-            reliable_error_mark=question_values["ocr_raw_json"]["reliable_error_mark"],
-        )
-        question_values["collection_status"] = collection_status_for(
-            collection_subject
-        )
-        question_values["ocr_raw_json"]["collection_reason"] = (
-            collection_reason_for(collection_subject)
-        )
         values.append(question_values)
+
+    verifications = {}
+    page_diagnostic = None
+    ocr_enabled = bool(getattr(ocr_verifier, "enabled", True))
+    if mode == "unmarked" and hasattr(ocr_verifier, "recognize_page"):
+        from app.services.local_ocr_verification import classify_page_evidence
+
+        page = ocr_verifier.recognize_page(image_path, ocr_full_page_max_edge)
+        page_diagnostic = {
+            "status": page.status,
+            "duration_ms": page.duration_ms,
+            "error_code": page.error_code,
+            "prepared_size": page.prepared_size,
+        }
+        if page.status == "unavailable" and ocr_enabled:
+            raise ImageReviewRequired(
+                "local_ocr_unavailable",
+                "本地文字校验暂不可用，请稍后重试或人工确认。",
+                diagnostic={"operation": "local_ocr", "reason": page.error_code},
+            )
+        for index, question_values in enumerate(values):
+            localization = localizations.get(index)
+            if localization is not None and localization.bbox is not None:
+                verifications[index] = classify_page_evidence(
+                    page,
+                    localization.bbox,
+                    target_index=index,
+                    items=result.items,
+                    line_confidence_threshold=ocr_verifier.line_confidence_threshold,
+                    min_effective_characters=ocr_verifier.min_effective_characters,
+                    support_similarity_threshold=ocr_verifier.support_similarity_threshold,
+                    contradiction_similarity_threshold=ocr_verifier.contradiction_similarity_threshold,
+                )
+        inconclusive_indexes = sorted(
+            (
+                index
+                for index, verification in verifications.items()
+                if verification.status == "inconclusive"
+            ),
+            key=lambda index: (-result.items[index].confidence, index),
+        )[:ocr_crop_recheck_limit]
+        for index in inconclusive_indexes:
+            localization = localizations[index]
+            verifications[index] = ocr_verifier.verify_crop(
+                image_path,
+                localization.bbox,
+                target_index=index,
+                items=result.items,
+            )
+
+    for index, question_values in enumerate(values):
+        reliable_mark = question_values["ocr_raw_json"]["reliable_error_mark"]
+        localization = localizations.get(index)
+        proposed_bbox = (
+            localization.bbox
+            if localization is not None
+            and question_values["crop_region"].get("bbox") is not None
+            else None
+        )
+        if mode == "marked" and reliable_mark and proposed_bbox is not None:
+            verify_crop = getattr(ocr_verifier, "verify_crop", ocr_verifier.verify)
+            verifications[index] = verify_crop(
+                image_path,
+                proposed_bbox,
+                target_index=index,
+                items=result.items,
+            )
+        elif mode == "unmarked" and not hasattr(ocr_verifier, "recognize_page") and proposed_bbox:
+            verifications[index] = ocr_verifier.verify(
+                image_path,
+                proposed_bbox,
+                target_index=index,
+                items=result.items,
+            )
+
+        verification = verifications.get(index)
+        local_ocr = (
+            verification.model_dump(mode="json")
+            if verification is not None
+            else {
+                "status": "disabled" if not ocr_enabled else "inconclusive",
+                "matched_index": None,
+                "text_summary": "",
+                "confidence": None,
+                "error_code": None,
+                "duration_ms": 0.0,
+            }
+        )
+        if local_ocr["status"] in {"wrong_candidate", "text_mismatch"}:
+            question_values["crop_region"] = {
+                "bbox_source": "unverified",
+                "localization_status": "needs_review",
+                "index": index,
+            }
+            question_values["review_status"] = "needs_review"
+        question_values["ocr_raw_json"]["local_ocr"] = local_ocr
+        question_values["ocr_raw_json"]["local_ocr_page"] = page_diagnostic
+        decision = decide_candidate(
+            mode=mode,
+            student_answer=result.items[index].raw_text,
+            reference_answer=result.items[index].answer,
+            unanswered=not bool(result.items[index].raw_text.strip()),
+            review_status=question_values["review_status"],
+            reliable_error_mark=reliable_mark,
+            local_ocr_status=local_ocr["status"],
+            ocr_enabled=ocr_enabled,
+        )
+        question_values["collection_status"] = {
+            "collect": "collected",
+            "review": "pending_review",
+            "discard": "ignored",
+        }[decision.action]
+        question_values["ocr_raw_json"]["collection_reason"] = decision.reason
     return result, values
 
 
@@ -781,6 +953,8 @@ class MiniMaxVisionClient:
         image_path: str,
         subject_hint: Optional[str] = None,
         recognition_correction: Optional[str] = None,
+        recognition_mode: Literal["marked", "unmarked"] = "marked",
+        local_red_regions: Optional[List[List[float]]] = None,
     ) -> VisionResult:
         if not self.api_key or not self.api_host:
             raise VisionRecognitionError(
@@ -794,12 +968,13 @@ class MiniMaxVisionClient:
             self.jpeg_quality,
             diagnostic,
         )
-        correction_instruction = recognition_correction_instruction(
-            recognition_correction
-        )
         payload = {
-            "prompt": RECOGNITION_PROMPT.format(subject_hint=subject_hint or "自动判断")
-            + ("\n\n纠偏要求：" + correction_instruction if correction_instruction else ""),
+            "prompt": recognition_prompt_for(
+                recognition_mode,
+                subject_hint,
+                local_red_regions or [],
+                recognition_correction,
+            ),
             "image_url": image_url,
         }
 

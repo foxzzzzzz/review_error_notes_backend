@@ -42,16 +42,30 @@ def _valid_payload():
     }
 
 
-def test_prompt_prioritizes_red_error_marks_and_falls_back_to_all_questions():
+def test_prompt_prioritizes_red_error_marks_without_full_page_fallback():
     from app.services.vision_recognition import RECOGNITION_PROMPT
 
     assert "红圈" in RECOGNITION_PROMPT
     assert "红叉" in RECOGNITION_PROMPT
     assert "每个被标记的独立作答单元输出一个 item" in RECOGNITION_PROMPT
-    assert "没有发现明确的红色错误标记" in RECOGNITION_PROMPT
-    assert "输出图片中的所有最小可独立作答单元" in RECOGNITION_PROMPT
+    assert "禁止在没有可靠红标关联时回退输出整页题目" in RECOGNITION_PROMPT
     assert "红色对勾" in RECOGNITION_PROMPT
     assert "[left, top, right, bottom]" in RECOGNITION_PROMPT
+
+
+def test_mode_prompts_separate_marked_and_unmarked_behavior():
+    from app.services.vision_recognition import recognition_prompt_for
+
+    marked = recognition_prompt_for(
+        "marked", "chinese", [[0.1, 0.2, 0.3, 0.4]], None
+    )
+    unmarked = recognition_prompt_for("unmarked", "chinese", [], None)
+
+    assert "[0.1,0.2,0.3,0.4]" in marked
+    assert "禁止输出整页未标记题目" in marked
+    assert "输出图片中的所有最小可独立作答单元" in unmarked
+    assert "不得把所有输出单元直接称为错题" in unmarked
+    assert "本次是有红标作业识别" not in unmarked
 
 
 def test_recognition_correction_adds_only_the_selected_constraint():

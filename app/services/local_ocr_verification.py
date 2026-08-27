@@ -1,15 +1,17 @@
-"""Contradiction-only local OCR verification for proposed question crops."""
+"""Bounded local OCR evidence for full pages and question crops."""
 
 from __future__ import annotations
 
 import unicodedata
+import logging
+import time
 from difflib import SequenceMatcher
 from importlib.metadata import version
 from typing import Callable, List, Literal, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.services.question_image import load_cropped_rgb_image
+from app.services.question_image import load_cropped_rgb_image, load_resized_rgb_image
 from app.services.vision_recognition import VisionItem
 
 
@@ -18,15 +20,38 @@ class OCRLine(BaseModel):
 
     text: str
     confidence: float = Field(ge=0, le=1)
+    bbox: Optional[List[float]] = None
 
 
 class OCRVerification(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    status: Literal["support", "contradict", "inconclusive", "unavailable"]
+    status: Literal[
+        "support",
+        "wrong_candidate",
+        "text_mismatch",
+        "inconclusive",
+        "unavailable",
+        "disabled",
+    ]
     matched_index: Optional[int] = None
     text_summary: str = ""
     confidence: Optional[float] = None
+    error_code: Optional[str] = None
+    duration_ms: float = Field(default=0.0, ge=0)
+
+
+class OCRPageEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    status: Literal["available", "unavailable", "disabled"]
+    lines: List[OCRLine] = Field(default_factory=list)
+    duration_ms: float = Field(default=0.0, ge=0)
+    error_code: Optional[str] = None
+    prepared_size: Optional[List[int]] = None
+
+
+logger = logging.getLogger(__name__)
 
 
 def _normalized_text(value: str, remove_tones: bool = False) -> str:
@@ -122,7 +147,7 @@ def classify_ocr_lines(
             and scores[best_other_index] > target_score
         ):
             return OCRVerification(
-                status="contradict",
+                status="wrong_candidate",
                 matched_index=best_other_index,
                 text_summary=text_summary,
                 confidence=confidence,
@@ -135,8 +160,50 @@ def classify_ocr_lines(
     )
 
 
-def _unavailable() -> OCRVerification:
-    return OCRVerification(status="unavailable")
+def _unavailable(error_code: str) -> OCRVerification:
+    return OCRVerification(status="unavailable", error_code=error_code)
+
+
+def _disabled() -> OCRVerification:
+    return OCRVerification(status="disabled")
+
+
+def _boxes_intersect(first: List[float], second: List[float]) -> bool:
+    return not (
+        first[2] <= second[0]
+        or first[0] >= second[2]
+        or first[3] <= second[1]
+        or first[1] >= second[3]
+    )
+
+
+def classify_page_evidence(
+    page: OCRPageEvidence,
+    bbox: List[float],
+    target_index: int,
+    items: Sequence[VisionItem],
+    line_confidence_threshold: float,
+    min_effective_characters: int,
+    support_similarity_threshold: float,
+    contradiction_similarity_threshold: float,
+) -> OCRVerification:
+    if page.status == "disabled":
+        return _disabled()
+    if page.status == "unavailable":
+        return _unavailable(page.error_code or "page_ocr_unavailable")
+    return classify_ocr_lines(
+        lines=[
+            line
+            for line in page.lines
+            if line.bbox is not None and _boxes_intersect(line.bbox, bbox)
+        ],
+        target_index=target_index,
+        items=items,
+        line_confidence_threshold=line_confidence_threshold,
+        min_effective_characters=min_effective_characters,
+        support_similarity_threshold=support_similarity_threshold,
+        contradiction_similarity_threshold=contradiction_similarity_threshold,
+    )
 
 
 class RapidOCRVerifier:
@@ -212,38 +279,117 @@ class RapidOCRVerifier:
         return self._engine_cache[cache_key]
 
     @staticmethod
-    def _lines_from_result(result) -> List[OCRLine]:
+    def _lines_from_result(result, image_size=None) -> List[OCRLine]:
         texts = getattr(result, "txts", None) or ()
         scores = getattr(result, "scores", None) or ()
-        return [
-            OCRLine(text=str(text), confidence=float(score))
-            for text, score in zip(texts, scores)
-            if text
-        ]
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            boxes = [None] * len(texts)
+        width, height = image_size or (None, None)
+        lines = []
+        for text, score, box in zip(texts, scores, boxes):
+            if not text:
+                continue
+            normalized_bbox = None
+            if box is not None and width and height:
+                points = list(box)
+                xs = [float(point[0]) for point in points]
+                ys = [float(point[1]) for point in points]
+                normalized_bbox = [
+                    max(0.0, min(xs) / width),
+                    max(0.0, min(ys) / height),
+                    min(1.0, max(xs) / width),
+                    min(1.0, max(ys) / height),
+                ]
+            lines.append(
+                OCRLine(
+                    text=str(text),
+                    confidence=float(score),
+                    bbox=normalized_bbox,
+                )
+            )
+        return lines
 
-    def verify(
+    def _run_engine(self, image):
+        try:
+            engine = self._engine()
+        except Exception as exc:
+            logger.warning(
+                "local_ocr_unavailable error_code=engine_initialization_failed error_type=%s",
+                type(exc).__name__,
+            )
+            return None, "engine_initialization_failed"
+        try:
+            import numpy
+
+            return engine(numpy.asarray(image), use_cls=False), None
+        except Exception as exc:
+            logger.warning(
+                "local_ocr_unavailable error_code=inference_failed error_type=%s",
+                type(exc).__name__,
+            )
+            return None, "inference_failed"
+
+    def recognize_page(self, image_path: str, max_edge: int) -> OCRPageEvidence:
+        if not self.enabled:
+            return OCRPageEvidence(status="disabled")
+        started = time.perf_counter()
+        try:
+            image = load_resized_rgb_image(
+                image_path,
+                max_edge=max_edge,
+                max_pixels=self.max_pixels,
+            )
+        except Exception:
+            return OCRPageEvidence(
+                status="unavailable",
+                duration_ms=(time.perf_counter() - started) * 1000,
+                error_code="image_preparation_failed",
+            )
+        result, error_code = self._run_engine(image)
+        duration_ms = (time.perf_counter() - started) * 1000
+        if error_code:
+            return OCRPageEvidence(
+                status="unavailable",
+                duration_ms=duration_ms,
+                error_code=error_code,
+                prepared_size=list(image.size),
+            )
+        return OCRPageEvidence(
+            status="available",
+            lines=self._lines_from_result(result, image.size),
+            duration_ms=duration_ms,
+            prepared_size=list(image.size),
+        )
+
+    def verify_crop(
         self,
         image_path: str,
         bbox: List[float],
         target_index: int,
         items: Sequence[VisionItem],
     ) -> OCRVerification:
+        started = time.perf_counter()
         if not self.enabled:
-            return _unavailable()
+            return _disabled()
         try:
-            import numpy
-
             crop = load_cropped_rgb_image(
                 image_path,
                 bbox,
                 max_pixels=self.max_pixels,
             )
-            result = self._engine()(numpy.asarray(crop), use_cls=False)
-            lines = self._lines_from_result(result)
         except Exception:
-            return _unavailable()
+            return _unavailable("image_preparation_failed").model_copy(
+                update={"duration_ms": (time.perf_counter() - started) * 1000}
+            )
+        result, error_code = self._run_engine(crop)
+        if error_code:
+            return _unavailable(error_code).model_copy(
+                update={"duration_ms": (time.perf_counter() - started) * 1000}
+            )
+        lines = self._lines_from_result(result)
 
-        return classify_ocr_lines(
+        verification = classify_ocr_lines(
             lines=lines,
             target_index=target_index,
             items=items,
@@ -252,3 +398,16 @@ class RapidOCRVerifier:
             support_similarity_threshold=self.support_similarity_threshold,
             contradiction_similarity_threshold=self.contradiction_similarity_threshold,
         )
+        return verification.model_copy(
+            update={"duration_ms": (time.perf_counter() - started) * 1000}
+        )
+
+    def verify(
+        self,
+        image_path: str,
+        bbox: List[float],
+        target_index: int,
+        items: Sequence[VisionItem],
+    ) -> OCRVerification:
+        """Backward-compatible alias for crop verification."""
+        return self.verify_crop(image_path, bbox, target_index, items)

@@ -75,15 +75,16 @@ def test_ignored_item_does_not_keep_image_in_review_state():
     ]) == "confirmed"
 
 
-def test_recognized_item_not_auto_collected_is_retained_for_review():
-    from app.tasks.process_image import collection_status_to_persist
+def test_ignored_item_is_not_unconditionally_converted_to_review():
+    from app.services.question_collection import collection_status_for_decision
+    from app.services.recognition_policy import CandidateDecision
 
-    assert collection_status_to_persist("collected") == "collected"
-    assert collection_status_to_persist("pending_review") == "pending_review"
-    assert collection_status_to_persist("ignored") == "pending_review"
+    assert collection_status_for_decision(
+        CandidateDecision(action="discard", reason="答案一致")
+    ) is None
 
 
-def test_strict_reprocessing_drops_automatically_ignored_candidates():
+def test_evidence_policy_always_drops_ignored_candidates():
     from app.tasks.process_image import should_persist_candidate
 
     ignored = {"collection_status": "ignored"}
@@ -91,7 +92,7 @@ def test_strict_reprocessing_drops_automatically_ignored_candidates():
 
     assert not should_persist_candidate(ignored, "false_positives")
     assert not should_persist_candidate(ignored, "both")
-    assert should_persist_candidate(ignored, "missed_errors")
+    assert not should_persist_candidate(ignored, "missed_errors")
     assert should_persist_candidate(pending, "false_positives")
 
 

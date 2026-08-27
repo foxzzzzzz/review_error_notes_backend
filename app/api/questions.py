@@ -126,17 +126,52 @@ async def list_review_images(
         group = groups.setdefault(
             image_id,
             {
+                "group_type": "questions",
                 "image_id": image_id,
                 "question_count": 0,
                 "auto_collected_count": collected_count,
+                "issue_code": None,
+                "issue_message": None,
                 "questions": [],
+                "_created_at": image.created_at,
             },
         )
         item = QuestionOut.model_validate(question).model_dump(mode="json")
         item["crop_region"] = question.crop_region
         group["questions"].append(item)
         group["question_count"] += 1
-    return list(groups.values())
+
+    issue_result = await db.execute(
+        select(WrongImage, auto_collected_count.label("auto_collected_count"))
+        .where(
+            WrongImage.student_id == student.id,
+            WrongImage.status == "needs_review",
+            WrongImage.question_count == 0,
+            WrongImage.error_code.is_not(None),
+        )
+        .order_by(WrongImage.created_at.desc())
+    )
+    for image, collected_count in issue_result.all():
+        image_id = str(image.id)
+        groups.setdefault(
+            image_id,
+            {
+                "group_type": "image_issue",
+                "image_id": image_id,
+                "question_count": 0,
+                "auto_collected_count": collected_count,
+                "issue_code": image.error_code,
+                "issue_message": image.error_message,
+                "questions": [],
+                "_created_at": image.created_at,
+            },
+        )
+    ordered_groups = sorted(
+        groups.values(), key=lambda group: group["_created_at"], reverse=True
+    )
+    for group in ordered_groups:
+        group.pop("_created_at", None)
+    return ordered_groups
 
 
 @router.post("/review/images/{image_id}/decisions")
@@ -227,7 +262,12 @@ async def reprocess_review_image(
         .with_for_update()
     )
     questions = result.scalars().all()
-    if not questions:
+    actionable_image_issue = bool(
+        image.status == "needs_review"
+        and image.question_count == 0
+        and image.error_code
+    )
+    if not questions and not actionable_image_issue:
         raise HTTPException(status_code=409, detail="No pending review questions")
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     for question in questions:

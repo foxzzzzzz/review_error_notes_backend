@@ -177,3 +177,62 @@ def test_invalid_image_raises_safe_error(tmp_path):
             red_pixel_min_ratio=0.01,
             expansion_ratio=0.05,
         )
+
+
+def test_full_page_scan_keeps_red_marks_and_filters_grid_line_and_noise(tmp_path):
+    from app.services.error_mark_validation import scan_red_mark_regions
+
+    image_path = tmp_path / "page.png"
+    image = Image.new("RGB", (400, 300), "white")
+    draw = ImageDraw.Draw(image)
+    for y in range(30, 280, 40):
+        draw.line((10, y, 390, y), fill=(225, 180, 180), width=1)
+    draw.ellipse((40, 50, 100, 110), outline=(210, 25, 25), width=5)
+    draw.line((180, 60, 230, 110), fill=(220, 20, 20), width=5)
+    draw.line((230, 60, 180, 110), fill=(220, 20, 20), width=5)
+    draw.line((20, 10, 380, 10), fill=(210, 25, 25), width=1)
+    draw.point((350, 250), fill=(220, 20, 20))
+    image.save(image_path)
+
+    result = scan_red_mark_regions(
+        str(image_path),
+        max_edge=1600,
+        min_component_pixels=12,
+        max_component_area_ratio=0.08,
+        max_thinness_ratio=18,
+    )
+
+    assert result.status == "detected"
+    assert len(result.regions) == 2
+    assert result.red_pixel_count > 0
+    assert result.scanned_width == 400
+    assert result.scanned_height == 300
+    assert result.duration_ms >= 0
+
+
+def test_full_page_scan_reports_no_reliable_red_marks(tmp_path):
+    from app.services.error_mark_validation import scan_red_mark_regions
+
+    image_path = tmp_path / "clean.png"
+    Image.new("RGB", (120, 80), "white").save(image_path)
+
+    result = scan_red_mark_regions(
+        str(image_path), 1600, 12, 0.08, 18
+    )
+
+    assert result.status == "none"
+    assert result.regions == []
+    assert result.red_pixel_count == 0
+
+
+def test_full_page_scan_rejects_invalid_image(tmp_path):
+    from app.services.error_mark_validation import (
+        ErrorMarkImageInvalid,
+        scan_red_mark_regions,
+    )
+
+    image_path = tmp_path / "broken-scan.jpg"
+    image_path.write_bytes(b"not-an-image")
+
+    with pytest.raises(ErrorMarkImageInvalid):
+        scan_red_mark_regions(str(image_path), 1600, 12, 0.08, 18)

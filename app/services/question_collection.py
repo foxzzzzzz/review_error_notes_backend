@@ -3,6 +3,8 @@
 import unicodedata
 from typing import Optional, Tuple
 
+from app.services.recognition_policy import CandidateDecision
+
 
 COLLECTION_PENDING_REVIEW = "pending_review"
 COLLECTION_COLLECTED = "collected"
@@ -55,3 +57,12 @@ def collection_status_for(question) -> str:
 def collection_reason_for(question) -> str:
     """Return the reason shown to users for a collection decision."""
     return _collection_decision_for(question)[1]
+
+
+def collection_status_for_decision(decision: CandidateDecision) -> str | None:
+    """Map an explicit policy action to its persisted collection status."""
+    return {
+        "collect": COLLECTION_COLLECTED,
+        "review": COLLECTION_PENDING_REVIEW,
+        "discard": None,
+    }[decision.action]
