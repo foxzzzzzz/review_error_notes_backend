@@ -414,6 +414,58 @@ def test_pipeline_rejects_model_marks_without_local_red_pixels(tmp_path):
     assert all(value["review_status"] == "needs_review" for value in values)
 
 
+def test_unmarked_mode_localizes_when_model_marks_are_rejected(tmp_path):
+    from app.services.error_mark_validation import RedMarkScanResult
+
+    class InvalidMarkUnmarkedClient(FakeClient):
+        def recognize(self, image_path, subject_hint=None, **_kwargs):
+            result = _vision_result()
+            result.error_marks = [
+                result.error_marks[0].model_copy(
+                    update={"bbox": [0.8, 0.05, 0.9, 0.15]}
+                )
+            ]
+            return result
+
+        def localize(self, image_path, items, error_marks):
+            self.localize_calls += 1
+            assert error_marks == []
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=index,
+                        matched=True,
+                        mark_ids=[],
+                        bbox=[0.1 + index * 0.4, 0.15, 0.35 + index * 0.4, 0.45],
+                        observed_prompt_text=item.prompt_text,
+                        observed_raw_text=item.raw_text,
+                        confidence=0.95,
+                    )
+                    for index, item in enumerate(items)
+                ]
+            )
+
+    no_red = RedMarkScanResult(
+        status="none",
+        regions=[],
+        red_pixel_count=0,
+        scanned_width=400,
+        scanned_height=300,
+        duration_ms=1.0,
+    )
+    client = InvalidMarkUnmarkedClient()
+
+    _result, values = _run_batch(
+        tmp_path,
+        client=client,
+        local_red_scan=no_red,
+        force_mode="unmarked",
+    )
+
+    assert client.localize_calls == 1
+    assert all("bbox" in value["crop_region"] for value in values)
+
+
 def test_rejected_mark_does_not_invalidate_question_matched_to_valid_mark(tmp_path):
     class PartiallyValidMarkClient(FakeClient):
         def recognize(self, image_path, subject_hint=None):

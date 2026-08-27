@@ -671,7 +671,11 @@ def recognize_question_batch(
         "rejection_counts": {},
     }
     try:
-        if not result.error_marks or valid_marks:
+        if (
+            (mode == "unmarked" and not legacy_mode)
+            or not result.error_marks
+            or valid_marks
+        ):
             localization_result = client.localize(
                 image_path,
                 result.items,

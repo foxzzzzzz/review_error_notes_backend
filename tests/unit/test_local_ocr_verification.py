@@ -1,3 +1,7 @@
+import tracemalloc
+
+from PIL import Image
+
 from app.services.vision_recognition import VisionItem
 
 
@@ -208,3 +212,26 @@ def test_page_evidence_uses_only_lines_intersecting_candidate_bbox():
 
     assert result.status == "wrong_candidate"
     assert result.matched_index == 1
+
+
+def test_dense_red_page_scan_does_not_allocate_one_python_object_per_pixel(tmp_path):
+    from app.services.error_mark_validation import scan_red_mark_regions
+
+    image_path = tmp_path / "dense-red.png"
+    Image.new("RGB", (800, 800), (220, 30, 30)).save(image_path)
+
+    tracemalloc.start()
+    try:
+        result = scan_red_mark_regions(
+            str(image_path),
+            max_edge=1600,
+            min_component_pixels=12,
+            max_component_area_ratio=0.08,
+            max_thinness_ratio=18,
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert result.status == "none"
+    assert peak < 20_000_000

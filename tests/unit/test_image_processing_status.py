@@ -65,6 +65,24 @@ class RetryDB:
         self.committed = True
 
 
+class ReviewReprocessDB:
+    def __init__(self, image, questions):
+        self.image = image
+        self.questions = questions
+        self.commit_count = 0
+
+    async def scalar(self, _query):
+        return self.image
+
+    async def execute(self, _query):
+        return SimpleNamespace(
+            scalars=lambda: SimpleNamespace(all=lambda: self.questions)
+        )
+
+    async def commit(self):
+        self.commit_count += 1
+
+
 class IncompleteImagesDB:
     def __init__(self, images):
         self.images = images
@@ -213,3 +231,41 @@ def test_retry_rejects_an_image_that_is_not_failed():
         )
 
     assert exc_info.value.status_code == 409
+
+
+def test_reprocess_issue_restores_its_metadata_when_task_dispatch_fails(monkeypatch):
+    from app.api import questions as question_api
+
+    image = SimpleNamespace(
+        id="image-1",
+        student_id="student-1",
+        status="needs_review",
+        question_count=0,
+        error_code="red_marks_unresolved",
+        error_message="系统检测到批改痕迹，但没有找到可确认的错题区域。",
+        recognition_correction=None,
+        original_url="/uploads/source.jpg",
+    )
+    db = ReviewReprocessDB(image, [])
+    monkeypatch.setattr(question_api.settings, "UPLOAD_DIR", "/uploads")
+    monkeypatch.setattr(
+        question_api.process_image,
+        "delay",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("broker unavailable")),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            question_api.reprocess_review_image(
+                image_id="image-1",
+                data=SimpleNamespace(correction="missed_errors"),
+                student=SimpleNamespace(id="student-1"),
+                db=db,
+            )
+        )
+
+    assert exc_info.value.status_code == 503
+    assert image.status == "needs_review"
+    assert image.question_count == 0
+    assert image.error_code == "red_marks_unresolved"
+    assert image.error_message == "系统检测到批改痕迹，但没有找到可确认的错题区域。"

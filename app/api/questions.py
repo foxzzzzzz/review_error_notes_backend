@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,7 +42,7 @@ async def list_questions(
     status: str = None,
     mastery_status: Literal["learning", "mastered"] | None = Query(None),
     tag: str = None,
-    keyword: str | None = Query(None, max_length=100),
+    keyword: Annotated[str | None, Query(max_length=100)] = None,
     limit: int = Query(20, le=100),
     offset: int = 0,
     created_from: datetime = None,
@@ -269,6 +269,11 @@ async def reprocess_review_image(
     )
     if not questions and not actionable_image_issue:
         raise HTTPException(status_code=409, detail="No pending review questions")
+    previous_status = image.status
+    previous_question_count = image.question_count
+    previous_error_code = image.error_code
+    previous_error_message = image.error_message
+    previous_correction = image.recognition_correction
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     for question in questions:
         question.collection_status = "superseded"
@@ -286,8 +291,11 @@ async def reprocess_review_image(
         for question in questions:
             question.collection_status = "pending_review"
             question.deleted_at = None
-        image.status = "needs_review"
-        image.recognition_correction = None
+        image.status = previous_status
+        image.question_count = previous_question_count
+        image.error_code = previous_error_code
+        image.error_message = previous_error_message
+        image.recognition_correction = previous_correction
         await db.commit()
         raise HTTPException(status_code=503, detail="处理任务投递失败，请重试")
     return {"image_id": str(image.id), "status": "pending"}

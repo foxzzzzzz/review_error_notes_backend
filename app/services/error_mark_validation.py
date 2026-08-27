@@ -95,12 +95,16 @@ def scan_red_mark_regions(
         & (red >= green * 1.35)
         & (red >= blue * 1.35)
     )
-    remaining = set(np.flatnonzero(mask).tolist())
-    red_pixel_count = len(remaining)
+    visited = np.zeros(mask.shape, dtype=bool)
+    red_pixel_count = int(mask.sum())
     regions = []
-    while remaining:
-        start_index = remaining.pop()
+    while True:
+        unvisited = mask & ~visited
+        if not unvisited.any():
+            break
+        start_index = int(unvisited.argmax())
         stack = [start_index]
+        visited[start_index // width, start_index % width] = True
         component_pixels = 0
         min_x = max_x = start_index % width
         min_y = max_y = start_index // width
@@ -122,8 +126,8 @@ def scan_red_mark_regions(
                 if not (0 <= neighbor_x < width and 0 <= neighbor_y < height):
                     continue
                 neighbor = neighbor_y * width + neighbor_x
-                if neighbor in remaining:
-                    remaining.remove(neighbor)
+                if mask[neighbor_y, neighbor_x] and not visited[neighbor_y, neighbor_x]:
+                    visited[neighbor_y, neighbor_x] = True
                     stack.append(neighbor)
 
         component_width = max_x - min_x + 1
