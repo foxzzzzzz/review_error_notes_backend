@@ -123,6 +123,67 @@ def test_localize_sends_all_recognized_indexes_in_one_request(tmp_path):
     assert [item.index for item in result.items] == [0, 1]
 
 
+def test_localize_retries_invalid_json_with_format_correction(tmp_path, caplog):
+    from app.services.vision_recognition import MiniMaxVisionClient
+
+    source = tmp_path / "question.jpg"
+    _write_image(source)
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        content = "private-invalid-localization-json"
+        if len(requests) == 2:
+            content = json.dumps(
+                {
+                    "items": [
+                        {
+                            "index": 0,
+                            "matched": True,
+                            "mark_ids": [0],
+                            "bbox": [0.1, 0.2, 0.4, 0.5],
+                            "observed_prompt_text": "课文",
+                            "observed_raw_text": "kè wén",
+                            "confidence": 0.94,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        return httpx.Response(
+            200,
+            json={"content": content, "base_resp": {"status_code": 0}},
+        )
+
+    caplog.set_level("INFO")
+    client = MiniMaxVisionClient(
+        api_key="secret-token",
+        api_host="https://api.minimaxi.com",
+        timeout_seconds=5,
+        max_retries=1,
+        max_edge=1200,
+        jpeg_quality=90,
+        retry_delay_seconds=0,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+    )
+
+    result = client.localize(
+        str(source),
+        [_vision_item("kè wén", "课文", "write_pinyin")],
+        [_error_mark()],
+    )
+
+    assert result.items[0].index == 0
+    assert len(requests) == 2
+    assert "格式纠偏" in requests[1]["prompt"]
+    assert (
+        "vision_response_retry operation=localization "
+        "error_code=vision_response_json_invalid attempt=1 max_retries=1"
+    ) in caplog.text
+    assert "private-invalid-localization-json" not in caplog.text
+
+
 def test_localization_allows_an_explicit_unmatched_result_without_bbox():
     from app.services.vision_recognition import LocalizationItem
 
@@ -260,6 +321,95 @@ def test_localization_rejects_oversized_bbox():
         marks={0: _error_mark()},
         max_area_ratio=0.35,
     )
+
+
+def test_geometry_diagnostic_distinguishes_area_and_mark_center_failures():
+    from app.services.vision_recognition import (
+        LocalizationItem,
+        localization_geometry_diagnostic,
+    )
+
+    oversized = LocalizationItem(
+        index=0,
+        matched=True,
+        mark_ids=[0],
+        bbox=[0.0, 0.0, 1.0, 0.8],
+        observed_prompt_text="课文",
+        observed_raw_text="kè wén",
+        confidence=0.96,
+    )
+    outside_mark = LocalizationItem(
+        index=1,
+        matched=True,
+        mark_ids=[0],
+        bbox=[0.6, 0.6, 0.8, 0.8],
+        observed_prompt_text="课文",
+        observed_raw_text="kè wén",
+        confidence=0.96,
+    )
+
+    oversized_diagnostic = localization_geometry_diagnostic(
+        oversized,
+        marks={0: _error_mark()},
+        max_area_ratio=0.35,
+    )
+    outside_diagnostic = localization_geometry_diagnostic(
+        outside_mark,
+        marks={0: _error_mark()},
+        max_area_ratio=0.35,
+    )
+
+    assert oversized_diagnostic == {
+        "passed": False,
+        "bbox_area_ratio": 0.8,
+        "max_area_ratio": 0.35,
+        "mark_ids": [0],
+        "missing_mark_ids": [],
+        "outside_mark_ids": [],
+        "failure_reasons": ["bbox_area_exceeded"],
+    }
+    assert outside_diagnostic == {
+        "passed": False,
+        "bbox_area_ratio": 0.04,
+        "max_area_ratio": 0.35,
+        "mark_ids": [0],
+        "missing_mark_ids": [],
+        "outside_mark_ids": [0],
+        "failure_reasons": ["mark_center_outside_bbox"],
+    }
+
+
+def test_geometry_diagnostic_reports_missing_and_unknown_mark_ids():
+    from app.services.vision_recognition import (
+        LocalizationItem,
+        localization_geometry_diagnostic,
+    )
+
+    missing_assignment = LocalizationItem(
+        index=0,
+        matched=True,
+        mark_ids=[],
+        bbox=[0.1, 0.1, 0.4, 0.4],
+        observed_prompt_text="课文",
+        observed_raw_text="kè wén",
+        confidence=0.96,
+    )
+    unknown_assignment = missing_assignment.model_copy(
+        update={"index": 1, "mark_ids": [7]}
+    )
+
+    assert localization_geometry_diagnostic(
+        missing_assignment,
+        marks={0: _error_mark()},
+        max_area_ratio=0.35,
+    )["failure_reasons"] == ["missing_mark_ids"]
+    unknown_diagnostic = localization_geometry_diagnostic(
+        unknown_assignment,
+        marks={0: _error_mark()},
+        max_area_ratio=0.35,
+    )
+    assert unknown_diagnostic["missing_mark_ids"] == [7]
+    assert unknown_diagnostic["failure_reasons"] == ["unknown_mark_ids"]
 
 
 def test_rejects_duplicate_mark_assignment_across_items():

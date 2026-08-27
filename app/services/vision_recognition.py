@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import inspect
+import json
+import logging
 import re
 import time
 import unicodedata
@@ -39,6 +40,16 @@ from app.services.tag_normalization import normalize_tags
 VISION_PATH = "/v1/coding_plan/vlm"
 OUTPUT_RE = re.compile(r"<output>\s*(.*?)\s*</output>", re.DOTALL)
 FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+FORMAT_RETRYABLE_ERROR_CODES = {
+    "vision_response_empty",
+    "vision_response_json_invalid",
+    "vision_response_schema_invalid",
+}
+FORMAT_RETRY_INSTRUCTION = (
+    "\n\n格式纠偏：上次返回无法通过结构化解析。只返回严格 JSON，"
+    "不要解释，不要 Markdown，不要在 JSON 前后添加任何文字。"
+)
+logger = logging.getLogger(__name__)
 
 
 def recognition_correction_instruction(correction: Optional[str]) -> str:
@@ -190,11 +201,26 @@ SAFE_RECOGNITION_DIAGNOSTIC_KEYS = {
     "localization_status",
     "localization_error_code",
     "localization_error_reason",
+    "localization_error_diagnostic",
     "localization_returned_count",
     "localization_validated_count",
     "localization_verified_count",
     "localization_reliable_mark_count",
     "localization_rejection_counts",
+    "localization_geometry_failure_counts",
+    "localization_geometry_diagnostics",
+    "response_content_length",
+    "json_error_position",
+    "json_error_line",
+    "json_error_column",
+    "has_markdown_fence",
+    "has_output_wrapper",
+    "first_non_whitespace_char_type",
+    "last_non_whitespace_char_type",
+    "likely_truncated",
+    "parsed_json_type",
+    "response_attempt",
+    "response_max_attempts",
 }
 
 
@@ -415,17 +441,56 @@ def localization_passes_geometry(
     max_area_ratio: float,
     allow_unassigned_marks: bool = False,
 ) -> bool:
-    if not localization.matched or localization.bbox is None:
-        return False
-    if bbox_area(localization.bbox) > max_area_ratio:
-        return False
-    if marks and not localization.mark_ids and not allow_unassigned_marks:
-        return False
-    return all(
-        mark_id in marks
-        and bbox_contains_center(localization.bbox, marks[mark_id].bbox)
-        for mark_id in localization.mark_ids
+    return localization_geometry_diagnostic(
+        localization,
+        marks=marks,
+        max_area_ratio=max_area_ratio,
+        allow_unassigned_marks=allow_unassigned_marks,
+    )["passed"]
+
+
+def localization_geometry_diagnostic(
+    localization: LocalizationItem,
+    marks: dict[int, ErrorMark],
+    max_area_ratio: float,
+    allow_unassigned_marks: bool = False,
+) -> dict:
+    """Explain geometry rejection without exposing recognized worksheet text."""
+    failure_reasons = []
+    area_ratio = (
+        bbox_area(localization.bbox) if localization.bbox is not None else None
     )
+    if not localization.matched or localization.bbox is None:
+        failure_reasons.append("not_matched_or_missing_bbox")
+    if area_ratio is not None and area_ratio > max_area_ratio:
+        failure_reasons.append("bbox_area_exceeded")
+    if marks and not localization.mark_ids and not allow_unassigned_marks:
+        failure_reasons.append("missing_mark_ids")
+
+    missing_mark_ids = [
+        mark_id for mark_id in localization.mark_ids if mark_id not in marks
+    ]
+    if missing_mark_ids:
+        failure_reasons.append("unknown_mark_ids")
+    outside_mark_ids = [
+        mark_id
+        for mark_id in localization.mark_ids
+        if localization.bbox is not None
+        and mark_id in marks
+        and not bbox_contains_center(localization.bbox, marks[mark_id].bbox)
+    ]
+    if outside_mark_ids:
+        failure_reasons.append("mark_center_outside_bbox")
+
+    return {
+        "passed": not failure_reasons,
+        "bbox_area_ratio": round(area_ratio, 6) if area_ratio is not None else None,
+        "max_area_ratio": max_area_ratio,
+        "mark_ids": list(localization.mark_ids),
+        "missing_mark_ids": missing_mark_ids,
+        "outside_mark_ids": outside_mark_ids,
+        "failure_reasons": failure_reasons,
+    }
 
 
 def _normalized_evidence_text(value: Optional[str]) -> str:
@@ -469,14 +534,18 @@ def build_question_values(
     localization_confidence_passed = bool(
         localization and localization.confidence >= localization_threshold
     )
-    localization_geometry_passed = bool(
-        localization
-        and localization_passes_geometry(
+    geometry_diagnostic = (
+        localization_geometry_diagnostic(
             localization,
             marks=marks,
             max_area_ratio=localization_max_area_ratio,
             allow_unassigned_marks=localization_red_verified,
         )
+        if localization is not None
+        else None
+    )
+    localization_geometry_passed = bool(
+        geometry_diagnostic and geometry_diagnostic["passed"]
     )
     localization_text_evidence_passed = bool(
         localization and localization_matches_evidence(localization, item)
@@ -564,6 +633,7 @@ def build_question_values(
         "text_evidence_passed": localization_text_evidence_passed,
         "local_red_verified": localization_red_verified,
         "verified": localization_verified,
+        "geometry": geometry_diagnostic,
     }
     return values
 
@@ -664,11 +734,14 @@ def recognize_question_batch(
         "status": "skipped",
         "error_code": None,
         "error_reason": None,
+        "error_diagnostic": {},
         "returned_count": 0,
         "validated_count": 0,
         "verified_count": 0,
         "reliable_mark_count": 0,
         "rejection_counts": {},
+        "geometry_failure_counts": {},
+        "geometry_diagnostics": [],
     }
     try:
         if (
@@ -695,6 +768,9 @@ def recognize_question_batch(
         localization_batch_validation["status"] = "rejected"
         localization_batch_validation["error_code"] = exc.code
         localization_batch_validation["error_reason"] = exc.diagnostic.get("reason")
+        localization_batch_validation["error_diagnostic"] = (
+            safe_recognition_diagnostic(exc)
+        )
         localizations = {}
 
     values = []
@@ -902,6 +978,28 @@ def recognize_question_batch(
         )
         for key in validation_keys
     }
+    geometry_diagnostics = [
+        {
+            "index": index,
+            **candidate["ocr_raw_json"]["localization_validation"]["geometry"],
+        }
+        for index, candidate in enumerate(values)
+        if candidate["ocr_raw_json"]["localization_validation"]["geometry"]
+        is not None
+        and not candidate["ocr_raw_json"]["localization_validation"]["geometry"][
+            "passed"
+        ]
+    ]
+    geometry_failure_counts = {}
+    for diagnostic in geometry_diagnostics:
+        for failure_reason in diagnostic["failure_reasons"]:
+            geometry_failure_counts[failure_reason] = (
+                geometry_failure_counts.get(failure_reason, 0) + 1
+            )
+    localization_batch_validation["geometry_failure_counts"] = (
+        geometry_failure_counts
+    )
+    localization_batch_validation["geometry_diagnostics"] = geometry_diagnostics
     for question_values in values:
         question_values["ocr_raw_json"]["localization_batch_validation"] = dict(
             localization_batch_validation
@@ -916,6 +1014,16 @@ def recognize_question_batch(
             for candidate in values
         )
     ):
+        geometry_diagnostic = {}
+        if localization_batch_validation["geometry_diagnostics"]:
+            geometry_diagnostic = {
+                "localization_geometry_failure_counts": (
+                    localization_batch_validation["geometry_failure_counts"]
+                ),
+                "localization_geometry_diagnostics": (
+                    localization_batch_validation["geometry_diagnostics"]
+                ),
+            }
         raise ImageReviewRequired(
             "red_marks_unresolved",
             "系统检测到批改痕迹，但没有找到可确认的错题区域。",
@@ -930,6 +1038,9 @@ def recognize_question_batch(
                 ],
                 "localization_error_reason": localization_batch_validation[
                     "error_reason"
+                ],
+                "localization_error_diagnostic": localization_batch_validation[
+                    "error_diagnostic"
                 ],
                 "localization_returned_count": localization_batch_validation[
                     "returned_count"
@@ -946,6 +1057,7 @@ def recognize_question_batch(
                 "localization_rejection_counts": localization_batch_validation[
                     "rejection_counts"
                 ],
+                **geometry_diagnostic,
             },
         )
     return result, values
@@ -1009,14 +1121,62 @@ def prepare_image_data_url(
     return "data:image/jpeg;base64," + encoded
 
 
+def _json_boundary_character_type(character: str | None) -> str:
+    if character is None:
+        return "none"
+    return {
+        "{": "object_start",
+        "}": "object_end",
+        "[": "array_start",
+        "]": "array_end",
+        '"': "string_quote",
+        ":": "colon",
+        ",": "comma",
+    }.get(character, "digit" if character.isdigit() else "other")
+
+
+def _response_shape_diagnostic(content: str) -> dict:
+    stripped = content.strip()
+    output_match = OUTPUT_RE.fullmatch(stripped)
+    candidate = output_match.group(1).strip() if output_match else stripped
+    fence_match = FENCE_RE.fullmatch(candidate)
+    candidate = fence_match.group(1).strip() if fence_match else candidate
+    first_character = candidate[0] if candidate else None
+    last_character = candidate[-1] if candidate else None
+    return {
+        "response_content_length": len(content),
+        "has_markdown_fence": bool(fence_match),
+        "has_output_wrapper": bool(output_match),
+        "first_non_whitespace_char_type": _json_boundary_character_type(
+            first_character
+        ),
+        "last_non_whitespace_char_type": _json_boundary_character_type(
+            last_character
+        ),
+        "likely_truncated": bool(candidate and last_character not in {"}", "]"}),
+    }
+
+
 def _extract_json(content: str, diagnostic: dict | None = None) -> dict:
     if not isinstance(content, str) or not content.strip():
         raise VisionRecognitionError(
             "vision_response_empty",
             "识别结果为空，请稍后重试",
-            diagnostic,
+            {
+                **(diagnostic or {}),
+                "response_content_length": (
+                    len(content) if isinstance(content, str) else 0
+                ),
+            },
         )
 
+    shape_diagnostic = _response_shape_diagnostic(content)
+    response_diagnostic = {
+        **(diagnostic or {}),
+        **shape_diagnostic,
+    }
+    if diagnostic is not None:
+        diagnostic.update(shape_diagnostic)
     candidate = content.strip()
     output_match = OUTPUT_RE.fullmatch(candidate)
     if output_match:
@@ -1031,13 +1191,21 @@ def _extract_json(content: str, diagnostic: dict | None = None) -> dict:
         raise VisionRecognitionError(
             "vision_response_json_invalid",
             "识别结果格式异常，请稍后重试",
-            diagnostic,
+            {
+                **response_diagnostic,
+                "json_error_position": exc.pos,
+                "json_error_line": exc.lineno,
+                "json_error_column": exc.colno,
+            },
         ) from exc
     if not isinstance(data, dict):
         raise VisionRecognitionError(
             "vision_response_json_invalid",
             "识别结果格式异常，请稍后重试",
-            diagnostic,
+            {
+                **response_diagnostic,
+                "parsed_json_type": type(data).__name__,
+            },
         )
     return data
 
@@ -1158,9 +1326,10 @@ class MiniMaxVisionClient:
         )
 
     def _request(self, payload, result_model, diagnostic: dict):
+        request_payload = dict(payload)
         for attempt in range(self.max_retries + 1):
             try:
-                response = self._post(payload)
+                response = self._post(request_payload)
                 is_transient = response.status_code == 429 or 500 <= response.status_code < 600
                 if is_transient and attempt < self.max_retries:
                     self.sleep(self.retry_delay_seconds)
@@ -1194,6 +1363,41 @@ class MiniMaxVisionClient:
                             ],
                         },
                     ) from exc
+            except VisionRecognitionError as exc:
+                exc.diagnostic = {
+                    **exc.diagnostic,
+                    "response_attempt": attempt + 1,
+                    "response_max_attempts": self.max_retries + 1,
+                }
+                if (
+                    exc.code in FORMAT_RETRYABLE_ERROR_CODES
+                    and attempt < self.max_retries
+                ):
+                    logger.info(
+                        "vision_response_retry operation=%s error_code=%s "
+                        "attempt=%s max_retries=%s diagnostic=%s",
+                        diagnostic.get("operation", "unknown"),
+                        exc.code,
+                        attempt + 1,
+                        self.max_retries,
+                        json.dumps(
+                            safe_recognition_diagnostic(exc),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    )
+                    prompt = request_payload.get("prompt")
+                    if (
+                        isinstance(prompt, str)
+                        and FORMAT_RETRY_INSTRUCTION not in prompt
+                    ):
+                        request_payload = {
+                            **request_payload,
+                            "prompt": prompt + FORMAT_RETRY_INSTRUCTION,
+                        }
+                    self.sleep(self.retry_delay_seconds)
+                    continue
+                raise
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 if attempt < self.max_retries:
                     self.sleep(self.retry_delay_seconds)

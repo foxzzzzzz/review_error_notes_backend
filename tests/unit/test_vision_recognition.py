@@ -279,6 +279,154 @@ def test_client_retries_transient_status(tmp_path, transient_status):
 
 
 @pytest.mark.parametrize(
+    ("first_content", "expected_error_code"),
+    [
+        ("", "vision_response_empty"),
+        ("not-json-private-content", "vision_response_json_invalid"),
+        (
+            json.dumps(
+                {
+                    **_valid_payload(),
+                    "items": [
+                        {
+                            key: value
+                            for key, value in _valid_payload()["items"][0].items()
+                            if key != "raw_text"
+                        }
+                    ],
+                }
+            ),
+            "vision_response_schema_invalid",
+        ),
+    ],
+)
+def test_client_retries_invalid_model_format_with_correction_prompt(
+    tmp_path,
+    caplog,
+    first_content,
+    expected_error_code,
+):
+    from app.services.vision_recognition import MiniMaxVisionClient
+
+    source = tmp_path / "question.jpg"
+    _write_image(source, (400, 300))
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        content = (
+            first_content
+            if len(requests) == 1
+            else json.dumps(_valid_payload(), ensure_ascii=False)
+        )
+        return httpx.Response(
+            200,
+            json={"content": content, "base_resp": {"status_code": 0}},
+        )
+
+    caplog.set_level("INFO")
+    client = MiniMaxVisionClient(
+        api_key="secret-token",
+        api_host="https://api.minimaxi.com",
+        timeout_seconds=5,
+        max_retries=1,
+        max_edge=1200,
+        jpeg_quality=90,
+        retry_delay_seconds=0,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+    )
+
+    result = client.recognize(str(source))
+
+    assert result.items[0].subject == "chinese"
+    assert len(requests) == 2
+    assert "格式纠偏" not in requests[0]["prompt"]
+    assert "格式纠偏" in requests[1]["prompt"]
+    assert (
+        f"vision_response_retry operation=recognition "
+        f"error_code={expected_error_code} attempt=1 max_retries=1"
+    ) in caplog.text
+    if first_content:
+        assert first_content not in caplog.text
+
+
+def test_invalid_json_diagnostic_describes_shape_without_response_content(tmp_path):
+    from app.services.vision_recognition import MiniMaxVisionClient, VisionRecognitionError
+
+    source = tmp_path / "question.jpg"
+    _write_image(source, (400, 300))
+    private_content = '{"items":'
+    client = MiniMaxVisionClient(
+        api_key="secret-token",
+        api_host="https://api.minimaxi.com",
+        timeout_seconds=5,
+        max_retries=0,
+        max_edge=1200,
+        jpeg_quality=90,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "content": private_content,
+                    "base_resp": {"status_code": 0},
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(VisionRecognitionError) as raised:
+        client.recognize(str(source))
+
+    diagnostic = raised.value.diagnostic
+    assert raised.value.code == "vision_response_json_invalid"
+    assert diagnostic["response_content_length"] == 9
+    assert diagnostic["json_error_position"] == 9
+    assert diagnostic["json_error_line"] == 1
+    assert diagnostic["json_error_column"] == 10
+    assert diagnostic["has_markdown_fence"] is False
+    assert diagnostic["has_output_wrapper"] is False
+    assert diagnostic["first_non_whitespace_char_type"] == "object_start"
+    assert diagnostic["last_non_whitespace_char_type"] == "colon"
+    assert diagnostic["likely_truncated"] is True
+    assert diagnostic["response_attempt"] == 1
+    assert diagnostic["response_max_attempts"] == 1
+    assert private_content not in str(diagnostic)
+
+
+def test_invalid_json_diagnostic_inspects_content_inside_markdown_fence(tmp_path):
+    from app.services.vision_recognition import MiniMaxVisionClient, VisionRecognitionError
+
+    source = tmp_path / "question.jpg"
+    _write_image(source, (400, 300))
+    private_content = '```json\n{"items":\n```'
+    client = MiniMaxVisionClient(
+        api_key="secret-token",
+        api_host="https://api.minimaxi.com",
+        timeout_seconds=5,
+        max_retries=0,
+        max_edge=1200,
+        jpeg_quality=90,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={"content": private_content, "base_resp": {"status_code": 0}},
+            )
+        ),
+    )
+
+    with pytest.raises(VisionRecognitionError) as raised:
+        client.recognize(str(source))
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic["has_markdown_fence"] is True
+    assert diagnostic["first_non_whitespace_char_type"] == "object_start"
+    assert diagnostic["last_non_whitespace_char_type"] == "colon"
+    assert diagnostic["likely_truncated"] is True
+    assert private_content not in str(diagnostic)
+
+
+@pytest.mark.parametrize(
     "content",
     [
         lambda payload: "explanation\n" + json.dumps(payload),

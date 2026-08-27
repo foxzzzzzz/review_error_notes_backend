@@ -274,6 +274,12 @@ def test_marked_mode_returns_image_issue_when_localization_discards_every_candid
         "localization_status": "rejected",
         "localization_error_code": "vision_localization_invalid",
         "localization_error_reason": "unassigned_mark",
+        "localization_error_diagnostic": {
+            "operation": "localization",
+            "reason": "unassigned_mark",
+            "candidate_count": 2,
+            "mark_count": 2,
+        },
         "localization_returned_count": 0,
         "localization_validated_count": 0,
         "localization_verified_count": 0,
@@ -291,6 +297,69 @@ def test_marked_mode_returns_image_issue_when_localization_discards_every_candid
     from app.services.vision_recognition import safe_recognition_diagnostic
 
     assert safe_recognition_diagnostic(raised.value) == raised.value.diagnostic
+
+
+def test_marked_mode_reports_specific_geometry_rejection_reasons(tmp_path):
+    from app.services.vision_recognition import ImageReviewRequired
+
+    class GeometryRejectedClient(FakeClient):
+        def localize(self, image_path, items, error_marks):
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=0,
+                        matched=True,
+                        mark_ids=[0],
+                        bbox=[0.0, 0.0, 1.0, 0.8],
+                        observed_prompt_text=items[0].prompt_text,
+                        observed_raw_text=items[0].raw_text,
+                        confidence=0.95,
+                    ),
+                    LocalizationItem(
+                        index=1,
+                        matched=True,
+                        mark_ids=[1],
+                        bbox=[0.8, 0.8, 0.95, 0.95],
+                        observed_prompt_text=items[1].prompt_text,
+                        observed_raw_text=items[1].raw_text,
+                        confidence=0.95,
+                    ),
+                ]
+            )
+
+    with pytest.raises(ImageReviewRequired) as raised:
+        _run_batch(
+            tmp_path,
+            client=GeometryRejectedClient(),
+            local_red_scan=_detected_red_scan(),
+        )
+
+    assert raised.value.diagnostic["localization_geometry_failure_counts"] == {
+        "bbox_area_exceeded": 1,
+        "mark_center_outside_bbox": 1,
+    }
+    assert raised.value.diagnostic["localization_geometry_diagnostics"] == [
+        {
+            "index": 0,
+            "passed": False,
+            "bbox_area_ratio": 0.8,
+            "max_area_ratio": 0.35,
+            "mark_ids": [0],
+            "missing_mark_ids": [],
+            "outside_mark_ids": [],
+            "failure_reasons": ["bbox_area_exceeded"],
+        },
+        {
+            "index": 1,
+            "passed": False,
+            "bbox_area_ratio": 0.0225,
+            "max_area_ratio": 0.35,
+            "mark_ids": [1],
+            "missing_mark_ids": [],
+            "outside_mark_ids": [1],
+            "failure_reasons": ["mark_center_outside_bbox"],
+        },
+    ]
 
 
 def test_unmarked_mode_uses_one_page_ocr_and_at_most_three_crop_rechecks(tmp_path):
