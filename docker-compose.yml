@@ -53,6 +53,9 @@ services:
       - ./tests:/app/tests
       - ./docker-compose.yml:/app/docker-compose.yml:ro
       - ./.env.example:/app/.env.example:ro
+      - ./README.md:/app/README.md:ro
+      - ./Dockerfile:/app/Dockerfile:ro
+      - ./scripts:/app/scripts:ro
       - uploads:/app/uploads
       - pdfs:/app/pdfs
       - avatars:/app/avatars

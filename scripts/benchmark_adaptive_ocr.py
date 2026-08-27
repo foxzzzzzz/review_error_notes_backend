@@ -7,7 +7,13 @@ import json
 import platform
 import resource
 import statistics
+import sys
 from importlib.metadata import version
+from pathlib import Path
+
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.config import settings
 from app.services.error_mark_validation import scan_red_mark_regions

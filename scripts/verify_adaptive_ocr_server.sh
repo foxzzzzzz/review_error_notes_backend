@@ -10,6 +10,7 @@ cd "$(dirname "$0")/.."
 
 docker compose build api worker
 docker compose run --rm --no-deps api pytest \
+  tests/unit/test_benchmark_adaptive_ocr_script.py \
   tests/unit/test_minimax_deployment_config.py \
   tests/unit/test_error_mark_validation.py \
   tests/unit/test_recognition_policy.py \
