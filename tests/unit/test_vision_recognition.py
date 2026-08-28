@@ -42,6 +42,45 @@ def _valid_payload():
     }
 
 
+def _error_mark():
+    from app.services.vision_recognition import ErrorMark
+
+    return ErrorMark(
+        mark_id=0,
+        mark_type="circle",
+        bbox=[0.1, 0.2, 0.3, 0.4],
+        confidence=0.95,
+    )
+
+
+def _mock_stage_client(tmp_path, responses, max_retries=0):
+    from app.services.vision_recognition import MiniMaxVisionClient
+
+    source = tmp_path / "question.jpg"
+    _write_image(source, (400, 300))
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"content": json.dumps(responses[len(requests) - 1])},
+        )
+
+    client = MiniMaxVisionClient(
+        api_key="secret-token",
+        api_host="https://api.minimaxi.com",
+        timeout_seconds=5,
+        max_retries=max_retries,
+        max_edge=1200,
+        jpeg_quality=90,
+        retry_delay_seconds=0,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+    )
+    return client, source, requests
+
+
 def test_prompt_prioritizes_red_error_marks_without_full_page_fallback():
     from app.services.vision_recognition import RECOGNITION_PROMPT
 
@@ -351,6 +390,85 @@ def test_client_exposes_three_isolated_stage_operations(tmp_path):
     assert "不得识别学生答案" in payloads[1]["prompt"]
     assert "不得修改题目坐标" in payloads[2]["prompt"]
     assert all(payload["image_url"].startswith("data:image/jpeg;base64,") for payload in payloads)
+
+
+@pytest.mark.parametrize(
+    "response_payload",
+    [
+        {
+            "results": [
+                {
+                    "mark_id": 0,
+                    "matched": True,
+                    "bbox": [0.05, 0.1, 0.4, 0.5],
+                    "confidence": 0.92,
+                }
+            ]
+        },
+        {
+            "mark_id": 0,
+            "matched": True,
+            "bbox": [0.05, 0.1, 0.4, 0.5],
+            "confidence": 0.92,
+        },
+    ],
+)
+def test_mark_localization_normalizes_known_minimax_response_shapes(
+    tmp_path,
+    response_payload,
+):
+    client, source, _requests = _mock_stage_client(tmp_path, [response_payload])
+
+    result = client.locate_marked_questions(
+        str(source),
+        [_error_mark()],
+    )
+
+    assert len(result.items) == 1
+    assert result.items[0].mark_id == 0
+    assert result.items[0].matched is True
+
+
+def test_mark_localization_requires_items_root(tmp_path):
+    from app.services.vision_recognition import VisionRecognitionError
+
+    client, source, _requests = _mock_stage_client(tmp_path, [{}])
+
+    with pytest.raises(VisionRecognitionError) as exc_info:
+        client.locate_marked_questions(str(source), [_error_mark()])
+
+    assert exc_info.value.code == "vision_response_schema_invalid"
+    assert exc_info.value.diagnostic["expected_root_key"] == "items"
+    assert "items" in exc_info.value.diagnostic["validation_fields"]
+
+
+def test_stage_prompts_and_schema_retry_name_the_exact_items_contract(tmp_path):
+    responses = [
+        {"answers": []},
+        {
+            "items": [
+                {
+                    "mark_id": 0,
+                    "matched": True,
+                    "bbox": [0.05, 0.1, 0.4, 0.5],
+                    "confidence": 0.92,
+                }
+            ]
+        },
+        {"items": [{"mark_id": 0, **_valid_payload()["items"][0]}]},
+    ]
+    client, source, requests = _mock_stage_client(
+        tmp_path, responses, max_retries=1
+    )
+
+    localized = client.locate_marked_questions(str(source), [_error_mark()])
+    content = client.recognize_localized_content(str(source), [0], "chinese")
+
+    assert localized.items[0].mark_id == 0
+    assert content.items[0].mark_id == 0
+    assert '严格 JSON：{"items"' in requests[0]["prompt"]
+    assert '根字段必须是 "items"' in requests[1]["prompt"]
+    assert '严格 JSON：{"items"' in requests[2]["prompt"]
 
 
 @pytest.mark.parametrize("transient_status", [429, 500, 501, 503, 599])

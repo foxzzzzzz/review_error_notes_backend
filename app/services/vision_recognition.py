@@ -83,7 +83,9 @@ MARK_QUESTION_LOCALIZATION_PROMPT = """你是小学作业错题范围定位器�
 2. 只输出题目范围 bbox 和定位置信度；不得识别学生答案、正确答案、题型或标签。
 3. cross_circle 和 circle 优先以红圈为答案锚点；仅 cross 时结合附近版面结构定位。
 4. 无法可靠定位时返回 matched=false、bbox=null，不得猜测。
-5. bbox 使用归一化角点格式 [left, top, right, bottom]，只返回严格 JSON。
+5. bbox 使用归一化角点格式 [left, top, right, bottom]。
+6. 只返回严格 JSON：{"items":[{"mark_id":0,"matched":true,"bbox":[0.1,0.2,0.4,0.3],"confidence":0.95}]}；示例值只说明结构，必须按原图替换。
+7. 最外层必须是对象，根字段必须是 "items"；即使只有一个 mark_id，也必须放入 items 数组。
 
 输入：__INPUT__
 """
@@ -96,7 +98,8 @@ CONTENT_RECOGNITION_PROMPT = """你是小学错题内容识别器。图片由若
 2. 识别题目要求、印刷提示、学生实际作答、建议正确答案、科目、题型、标签、难度和置信度。
 3. 未作答时 raw_text 必须是空字符串；证据不足的片段写入 uncertain_segments。
 4. 不得修改题目坐标，不得识别或重新分配红色标记。
-5. 只返回严格 JSON。
+5. 只返回严格 JSON：{"items":[{"mark_id":0,"raw_text":"图片中的学生作答","instruction":"图片中的题目要求","prompt_text":"图片中的印刷提示","normalized_text":null,"answer":"建议正确答案","subject":"chinese","question_type":"other","tags":[],"difficulty":3,"confidence":0.95,"uncertain_segments":[]}]}；示例值只说明结构，必须按裁图替换。
+6. 最外层必须是对象，根字段必须是 "items"；即使只有一道题，也必须放入 items 数组。
 
 输入 mark_ids：__MARK_IDS__
 """
@@ -271,6 +274,10 @@ SAFE_RECOGNITION_DIAGNOSTIC_KEYS = {
     "last_non_whitespace_char_type",
     "likely_truncated",
     "parsed_json_type",
+    "expected_root_key",
+    "response_top_level_keys",
+    "response_array_field_names",
+    "response_first_item_keys",
     "response_attempt",
     "response_max_attempts",
 }
@@ -371,7 +378,7 @@ class ContentRecognitionItem(VisionItem):
 class ContentRecognitionResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    items: List[ContentRecognitionItem] = Field(default_factory=list)
+    items: List[ContentRecognitionItem]
 
     @model_validator(mode="after")
     def mark_ids_must_be_unique(self):
@@ -456,7 +463,7 @@ class MarkQuestionLocalizationItem(BaseModel):
 class MarkQuestionLocalizationResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    items: List[MarkQuestionLocalizationItem] = Field(default_factory=list)
+    items: List[MarkQuestionLocalizationItem]
 
     @model_validator(mode="after")
     def mark_ids_must_be_unique(self):
@@ -464,6 +471,66 @@ class MarkQuestionLocalizationResult(BaseModel):
         if len(mark_ids) != len(set(mark_ids)):
             raise ValueError("localized mark ids must be unique")
         return self
+
+
+def _stage_item_model(result_model):
+    if result_model is MarkQuestionLocalizationResult:
+        return MarkQuestionLocalizationItem
+    if result_model is ContentRecognitionResult:
+        return ContentRecognitionItem
+    return None
+
+
+def _normalize_stage_response_shape(raw, result_model):
+    """Normalize only the two observed, unambiguous MiniMax wrapper variants."""
+    if (
+        result_model is not MarkQuestionLocalizationResult
+        or not isinstance(raw, dict)
+        or "items" in raw
+    ):
+        return raw
+    item_model = MarkQuestionLocalizationItem
+    if set(raw) == {"results"} and isinstance(raw["results"], list):
+        return {"items": raw["results"]}
+
+    raw_keys = set(raw)
+    allowed_keys = set(item_model.model_fields)
+    required_keys = {
+        name for name, field in item_model.model_fields.items() if field.is_required()
+    }
+    if required_keys <= raw_keys <= allowed_keys:
+        return {"items": [raw]}
+    return raw
+
+
+def _stage_response_shape_diagnostic(raw, result_model) -> dict:
+    if _stage_item_model(result_model) is None:
+        return {}
+    diagnostic = {"expected_root_key": "items"}
+    if not isinstance(raw, dict):
+        return diagnostic
+    diagnostic["response_top_level_keys"] = sorted(str(key) for key in raw)[:20]
+    diagnostic["response_array_field_names"] = sorted(
+        str(key) for key, value in raw.items() if isinstance(value, list)
+    )[:20]
+    for field_name in ("items", "results"):
+        values = raw.get(field_name)
+        if isinstance(values, list) and values and isinstance(values[0], dict):
+            diagnostic["response_first_item_keys"] = sorted(
+                str(key) for key in values[0]
+            )[:30]
+            break
+    return diagnostic
+
+
+def _format_retry_instruction_for(result_model) -> str:
+    if _stage_item_model(result_model) is None:
+        return FORMAT_RETRY_INSTRUCTION
+    return (
+        FORMAT_RETRY_INSTRUCTION
+        + '\n本阶段最外层必须是 JSON 对象，根字段必须是 "items"，'
+        '格式为 {"items":[...]}；即使只有一项也不得省略 items 数组。'
+    )
 
 
 def validated_localizations(
@@ -2727,6 +2794,10 @@ class MiniMaxVisionClient:
                         {**diagnostic, "status_code": response.status_code},
                     )
                 raw = self._parse_response_content(response, diagnostic)
+                response_shape_diagnostic = _stage_response_shape_diagnostic(
+                    raw, result_model
+                )
+                raw = _normalize_stage_response_shape(raw, result_model)
                 try:
                     return result_model.model_validate(raw)
                 except ValidationError as exc:
@@ -2735,6 +2806,7 @@ class MiniMaxVisionClient:
                         "识别结果格式不完整，请稍后重试",
                         {
                             **diagnostic,
+                            **response_shape_diagnostic,
                             "validation_fields": [
                                 ".".join(str(part) for part in error["loc"])
                                 for error in exc.errors()[:5]
@@ -2765,13 +2837,14 @@ class MiniMaxVisionClient:
                         ),
                     )
                     prompt = request_payload.get("prompt")
+                    retry_instruction = _format_retry_instruction_for(result_model)
                     if (
                         isinstance(prompt, str)
-                        and FORMAT_RETRY_INSTRUCTION not in prompt
+                        and retry_instruction not in prompt
                     ):
                         request_payload = {
                             **request_payload,
-                            "prompt": prompt + FORMAT_RETRY_INSTRUCTION,
+                            "prompt": prompt + retry_instruction,
                         }
                     self.sleep(self.retry_delay_seconds)
                     continue
