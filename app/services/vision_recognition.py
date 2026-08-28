@@ -7,6 +7,7 @@ import io
 import inspect
 import json
 import logging
+import math
 import re
 import time
 import unicodedata
@@ -209,6 +210,10 @@ SAFE_RECOGNITION_DIAGNOSTIC_KEYS = {
     "localization_rejection_counts",
     "localization_geometry_failure_counts",
     "localization_geometry_diagnostics",
+    "localization_assigned_mark_ids",
+    "localization_unassigned_mark_ids",
+    "localization_unassigned_mark_count",
+    "localization_missing_mark_diagnostics",
     "response_content_length",
     "json_error_position",
     "json_error_line",
@@ -375,8 +380,8 @@ def validated_localizations(
     ]
     if len(assigned_mark_ids) != len(set(assigned_mark_ids)):
         raise localization_error("duplicate_mark_assignment")
-    if set(assigned_mark_ids) != set(marks):
-        raise localization_error("unassigned_mark")
+    if set(assigned_mark_ids) - set(marks):
+        raise localization_error("unknown_mark_assignment")
     return {item.index: item for item in result.items}
 
 
@@ -391,6 +396,103 @@ def bbox_contains_center(container: List[float], candidate: List[float]) -> bool
         container[0] <= center_x <= container[2]
         and container[1] <= center_y <= container[3]
     )
+
+
+def bboxes_intersect(first: List[float], second: List[float]) -> bool:
+    return not (
+        first[2] < second[0]
+        or second[2] < first[0]
+        or first[3] < second[1]
+        or second[3] < first[1]
+    )
+
+
+def mark_distance_diagnostic(
+    localization_bbox: List[float],
+    mark_id: int,
+    mark_bbox: List[float],
+) -> dict:
+    center_x = (mark_bbox[0] + mark_bbox[2]) / 2
+    center_y = (mark_bbox[1] + mark_bbox[3]) / 2
+    horizontal_gap = max(
+        localization_bbox[0] - center_x,
+        0.0,
+        center_x - localization_bbox[2],
+    )
+    vertical_gap = max(
+        localization_bbox[1] - center_y,
+        0.0,
+        center_y - localization_bbox[3],
+    )
+    return {
+        "mark_id": mark_id,
+        "horizontal_gap_ratio": round(horizontal_gap, 6),
+        "vertical_gap_ratio": round(vertical_gap, 6),
+        "nearest_distance_ratio": round(
+            math.hypot(horizontal_gap, vertical_gap),
+            6,
+        ),
+        "mark_bbox_intersects_question_bbox": bboxes_intersect(
+            localization_bbox,
+            mark_bbox,
+        ),
+    }
+
+
+def nearest_red_region_diagnostic(
+    localization_bbox: List[float],
+    red_regions,
+) -> dict | None:
+    candidates = []
+    for region_index, region in enumerate(red_regions):
+        region_bbox = region.bbox
+        horizontal_gap = max(
+            localization_bbox[0] - region_bbox[2],
+            0.0,
+            region_bbox[0] - localization_bbox[2],
+        )
+        vertical_gap = max(
+            localization_bbox[1] - region_bbox[3],
+            0.0,
+            region_bbox[1] - localization_bbox[3],
+        )
+        distance = math.hypot(horizontal_gap, vertical_gap)
+        candidates.append(
+            (
+                distance,
+                region_index,
+                {
+                    "region_index": region_index,
+                    "horizontal_gap_ratio": round(horizontal_gap, 6),
+                    "vertical_gap_ratio": round(vertical_gap, 6),
+                    "nearest_distance_ratio": round(distance, 6),
+                    "intersects_question_bbox": bboxes_intersect(
+                        localization_bbox,
+                        region_bbox,
+                    ),
+                    "region_area_ratio": region.area_ratio,
+                    "region_pixel_count": region.pixel_count,
+                },
+            )
+        )
+    if not candidates:
+        return None
+    return min(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
+
+
+def safe_local_red_validation(diagnostic: dict | None) -> dict | None:
+    if diagnostic is None:
+        return None
+    safe_keys = (
+        "accepted",
+        "reason",
+        "red_pixel_count",
+        "pixel_count",
+        "red_pixel_ratio",
+        "red_pixel_min_ratio",
+        "expansion_ratio",
+    )
+    return {key: diagnostic.get(key) for key in safe_keys if key in diagnostic}
 
 
 def marker_focused_display_bbox(
@@ -481,6 +583,15 @@ def localization_geometry_diagnostic(
     ]
     if outside_mark_ids:
         failure_reasons.append("mark_center_outside_bbox")
+    outside_mark_diagnostics = [
+        mark_distance_diagnostic(
+            localization.bbox,
+            mark_id,
+            marks[mark_id].bbox,
+        )
+        for mark_id in outside_mark_ids
+        if localization.bbox is not None
+    ]
 
     return {
         "passed": not failure_reasons,
@@ -489,6 +600,7 @@ def localization_geometry_diagnostic(
         "mark_ids": list(localization.mark_ids),
         "missing_mark_ids": missing_mark_ids,
         "outside_mark_ids": outside_mark_ids,
+        "outside_mark_diagnostics": outside_mark_diagnostics,
         "failure_reasons": failure_reasons,
     }
 
@@ -742,6 +854,10 @@ def recognize_question_batch(
         "rejection_counts": {},
         "geometry_failure_counts": {},
         "geometry_diagnostics": [],
+        "assigned_mark_ids": [],
+        "unassigned_mark_ids": [],
+        "unassigned_mark_count": 0,
+        "missing_mark_diagnostics": [],
     }
     try:
         if (
@@ -764,6 +880,21 @@ def recognize_question_batch(
             )
             localization_batch_validation["status"] = "validated"
             localization_batch_validation["validated_count"] = len(localizations)
+            assigned_mark_ids = sorted(
+                {
+                    mark_id
+                    for localization in localizations.values()
+                    for mark_id in localization.mark_ids
+                }
+            )
+            unassigned_mark_ids = sorted(set(marks_by_id) - set(assigned_mark_ids))
+            localization_batch_validation["assigned_mark_ids"] = assigned_mark_ids
+            localization_batch_validation["unassigned_mark_ids"] = (
+                unassigned_mark_ids
+            )
+            localization_batch_validation["unassigned_mark_count"] = len(
+                unassigned_mark_ids
+            )
     except VisionRecognitionError as exc:
         localization_batch_validation["status"] = "rejected"
         localization_batch_validation["error_code"] = exc.code
@@ -1000,6 +1131,31 @@ def recognize_question_batch(
         geometry_failure_counts
     )
     localization_batch_validation["geometry_diagnostics"] = geometry_diagnostics
+    missing_mark_diagnostics = []
+    red_regions = local_red_scan.regions if local_red_scan is not None else []
+    for index, candidate in enumerate(values):
+        localization = localizations.get(index)
+        if (
+            localization is None
+            or localization.bbox is None
+            or localization.mark_ids
+        ):
+            continue
+        missing_mark_diagnostics.append(
+            {
+                "index": index,
+                "local_red_validation": safe_local_red_validation(
+                    candidate["ocr_raw_json"].get("localization_red_validation")
+                ),
+                "nearest_local_red_region": nearest_red_region_diagnostic(
+                    localization.bbox,
+                    red_regions,
+                ),
+            }
+        )
+    localization_batch_validation["missing_mark_diagnostics"] = (
+        missing_mark_diagnostics
+    )
     for question_values in values:
         question_values["ocr_raw_json"]["localization_batch_validation"] = dict(
             localization_batch_validation
@@ -1014,16 +1170,36 @@ def recognize_question_batch(
             for candidate in values
         )
     ):
-        geometry_diagnostic = {}
+        localization_detail_diagnostic = {}
         if localization_batch_validation["geometry_diagnostics"]:
-            geometry_diagnostic = {
-                "localization_geometry_failure_counts": (
-                    localization_batch_validation["geometry_failure_counts"]
-                ),
-                "localization_geometry_diagnostics": (
-                    localization_batch_validation["geometry_diagnostics"]
-                ),
-            }
+            localization_detail_diagnostic.update(
+                {
+                    "localization_geometry_failure_counts": (
+                        localization_batch_validation["geometry_failure_counts"]
+                    ),
+                    "localization_geometry_diagnostics": (
+                        localization_batch_validation["geometry_diagnostics"]
+                    ),
+                }
+            )
+        if localization_batch_validation["unassigned_mark_ids"]:
+            localization_detail_diagnostic.update(
+                {
+                    "localization_assigned_mark_ids": (
+                        localization_batch_validation["assigned_mark_ids"]
+                    ),
+                    "localization_unassigned_mark_ids": (
+                        localization_batch_validation["unassigned_mark_ids"]
+                    ),
+                    "localization_unassigned_mark_count": (
+                        localization_batch_validation["unassigned_mark_count"]
+                    ),
+                }
+            )
+        if localization_batch_validation["missing_mark_diagnostics"]:
+            localization_detail_diagnostic["localization_missing_mark_diagnostics"] = (
+                localization_batch_validation["missing_mark_diagnostics"]
+            )
         raise ImageReviewRequired(
             "red_marks_unresolved",
             "系统检测到批改痕迹，但没有找到可确认的错题区域。",
@@ -1057,7 +1233,7 @@ def recognize_question_batch(
                 "localization_rejection_counts": localization_batch_validation[
                     "rejection_counts"
                 ],
-                **geometry_diagnostic,
+                **localization_detail_diagnostic,
             },
         )
     return result, values

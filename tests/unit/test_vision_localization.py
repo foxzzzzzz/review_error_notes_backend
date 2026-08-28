@@ -366,6 +366,7 @@ def test_geometry_diagnostic_distinguishes_area_and_mark_center_failures():
         "mark_ids": [0],
         "missing_mark_ids": [],
         "outside_mark_ids": [],
+        "outside_mark_diagnostics": [],
         "failure_reasons": ["bbox_area_exceeded"],
     }
     assert outside_diagnostic == {
@@ -375,6 +376,15 @@ def test_geometry_diagnostic_distinguishes_area_and_mark_center_failures():
         "mark_ids": [0],
         "missing_mark_ids": [],
         "outside_mark_ids": [0],
+        "outside_mark_diagnostics": [
+            {
+                "mark_id": 0,
+                "horizontal_gap_ratio": 0.35,
+                "vertical_gap_ratio": 0.3,
+                "nearest_distance_ratio": 0.460977,
+                "mark_bbox_intersects_question_bbox": False,
+            }
+        ],
         "failure_reasons": ["mark_center_outside_bbox"],
     }
 
@@ -441,10 +451,9 @@ def test_rejects_duplicate_mark_assignment_across_items():
     assert exc_info.value.diagnostic["reason"] == "duplicate_mark_assignment"
 
 
-def test_rejects_valid_mark_that_was_not_assigned_to_any_item():
+def test_allows_valid_mark_that_was_not_assigned_to_any_item():
     from app.services.vision_recognition import (
         LocalizationResult,
-        VisionRecognitionError,
         validated_localizations,
     )
 
@@ -462,15 +471,41 @@ def test_rejects_valid_mark_that_was_not_assigned_to_any_item():
         ]
     )
 
+    localizations = validated_localizations(
+        result,
+        item_count=1,
+        marks={
+            0: _error_mark(),
+            1: _error_mark(1, [0.6, 0.25, 0.7, 0.35]),
+        },
+    )
+
+    assert list(localizations) == [0]
+
+
+def test_rejects_mark_assignment_that_is_not_in_valid_marks():
+    from app.services.vision_recognition import (
+        LocalizationResult,
+        VisionRecognitionError,
+        validated_localizations,
+    )
+
+    result = LocalizationResult(
+        items=[
+            {
+                "index": 0,
+                "matched": True,
+                "mark_ids": [7],
+                "bbox": [0.1, 0.2, 0.4, 0.5],
+                "observed_prompt_text": "课文",
+                "observed_raw_text": "kè wén",
+                "confidence": 0.9,
+            }
+        ]
+    )
+
     with pytest.raises(VisionRecognitionError) as exc_info:
-        validated_localizations(
-            result,
-            item_count=1,
-            marks={
-                0: _error_mark(),
-                1: _error_mark(1, [0.6, 0.25, 0.7, 0.35]),
-            },
-        )
+        validated_localizations(result, item_count=1, marks={0: _error_mark()})
 
     assert exc_info.value.code == "vision_localization_invalid"
-    assert exc_info.value.diagnostic["reason"] == "unassigned_mark"
+    assert exc_info.value.diagnostic["reason"] == "unknown_mark_assignment"

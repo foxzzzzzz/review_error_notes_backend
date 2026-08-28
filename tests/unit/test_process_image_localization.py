@@ -347,6 +347,7 @@ def test_marked_mode_reports_specific_geometry_rejection_reasons(tmp_path):
             "mark_ids": [0],
             "missing_mark_ids": [],
             "outside_mark_ids": [],
+            "outside_mark_diagnostics": [],
             "failure_reasons": ["bbox_area_exceeded"],
         },
         {
@@ -357,9 +358,75 @@ def test_marked_mode_reports_specific_geometry_rejection_reasons(tmp_path):
             "mark_ids": [1],
             "missing_mark_ids": [],
             "outside_mark_ids": [1],
+            "outside_mark_diagnostics": [
+                {
+                    "mark_id": 1,
+                    "horizontal_gap_ratio": 0.125,
+                    "vertical_gap_ratio": 0.14,
+                    "nearest_distance_ratio": 0.187683,
+                    "mark_bbox_intersects_question_bbox": False,
+                }
+            ],
             "failure_reasons": ["mark_center_outside_bbox"],
         },
     ]
+
+
+def test_marked_mode_keeps_reliable_candidates_when_a_mark_is_unassigned(tmp_path):
+    class PartiallyAssignedClient(FakeClient):
+        def localize(self, image_path, items, error_marks):
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=0,
+                        matched=True,
+                        mark_ids=[0],
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        observed_prompt_text=items[0].prompt_text,
+                        observed_raw_text=items[0].raw_text,
+                        confidence=0.95,
+                    ),
+                    LocalizationItem(
+                        index=1,
+                        matched=True,
+                        mark_ids=[],
+                        bbox=[0.55, 0.5, 0.8, 0.8],
+                        observed_prompt_text=items[1].prompt_text,
+                        observed_raw_text=items[1].raw_text,
+                        confidence=0.95,
+                    ),
+                ]
+            )
+
+    _result, values = _run_batch(
+        tmp_path,
+        client=PartiallyAssignedClient(),
+        local_red_scan=_detected_red_scan(),
+    )
+
+    batch_diagnostic = values[0]["ocr_raw_json"][
+        "localization_batch_validation"
+    ]
+    assert batch_diagnostic["status"] == "validated"
+    assert batch_diagnostic["assigned_mark_ids"] == [0]
+    assert batch_diagnostic["unassigned_mark_ids"] == [1]
+    assert batch_diagnostic["unassigned_mark_count"] == 1
+    assert len(batch_diagnostic["missing_mark_diagnostics"]) == 1
+    missing_mark_diagnostic = batch_diagnostic["missing_mark_diagnostics"][0]
+    assert missing_mark_diagnostic["index"] == 1
+    assert missing_mark_diagnostic["local_red_validation"]["accepted"] is True
+    assert missing_mark_diagnostic["local_red_validation"]["reason"] == "accepted"
+    assert missing_mark_diagnostic["nearest_local_red_region"] == {
+        "region_index": 0,
+        "horizontal_gap_ratio": 0.25,
+        "vertical_gap_ratio": 0.16,
+        "nearest_distance_ratio": 0.296816,
+        "intersects_question_bbox": False,
+        "region_area_ratio": 0.011,
+        "region_pixel_count": 100,
+    }
+    assert values[0]["collection_status"] == "pending_review"
+    assert values[1]["collection_status"] == "pending_review"
 
 
 def test_unmarked_mode_uses_one_page_ocr_and_at_most_three_crop_rechecks(tmp_path):
