@@ -98,63 +98,63 @@ def scan_red_mark_regions(
     visited = np.zeros(mask.shape, dtype=bool)
     red_pixel_count = int(mask.sum())
     regions = []
-    while True:
-        unvisited = mask & ~visited
-        if not unvisited.any():
-            break
-        start_index = int(unvisited.argmax())
-        stack = [start_index]
-        visited[start_index // width, start_index % width] = True
-        component_pixels = 0
-        min_x = max_x = start_index % width
-        min_y = max_y = start_index // width
-        while stack:
-            index = stack.pop()
-            x = index % width
-            y = index // width
-            component_pixels += 1
-            min_x = min(min_x, x)
-            max_x = max(max_x, x)
-            min_y = min(min_y, y)
-            max_y = max(max_y, y)
-            for neighbor_x, neighbor_y in (
-                (x - 1, y),
-                (x + 1, y),
-                (x, y - 1),
-                (x, y + 1),
-            ):
-                if not (0 <= neighbor_x < width and 0 <= neighbor_y < height):
-                    continue
-                neighbor = neighbor_y * width + neighbor_x
-                if mask[neighbor_y, neighbor_x] and not visited[neighbor_y, neighbor_x]:
-                    visited[neighbor_y, neighbor_x] = True
-                    stack.append(neighbor)
+    for start_y in range(height):
+        for x in np.flatnonzero(mask[start_y]):
+            x = int(x)
+            if visited[start_y, x]:
+                continue
+            stack = [start_y * width + x]
+            visited[start_y, x] = True
+            component_pixels = 0
+            min_x = max_x = x
+            min_y = max_y = start_y
+            while stack:
+                index = stack.pop()
+                x = index % width
+                current_y = index // width
+                component_pixels += 1
+                min_x = min(min_x, x)
+                max_x = max(max_x, x)
+                min_y = min(min_y, current_y)
+                max_y = max(max_y, current_y)
+                for neighbor_x, neighbor_y in (
+                    (x - 1, current_y),
+                    (x + 1, current_y),
+                    (x, current_y - 1),
+                    (x, current_y + 1),
+                ):
+                    if not (0 <= neighbor_x < width and 0 <= neighbor_y < height):
+                        continue
+                    neighbor = neighbor_y * width + neighbor_x
+                    if mask[neighbor_y, neighbor_x] and not visited[neighbor_y, neighbor_x]:
+                        visited[neighbor_y, neighbor_x] = True
+                        stack.append(neighbor)
 
-        component_width = max_x - min_x + 1
-        component_height = max_y - min_y + 1
-        area_ratio = component_width * component_height / (width * height)
-        thinness_ratio = max(component_width, component_height) / max(
-            1, min(component_width, component_height)
-        )
-        if (
-            component_pixels < min_component_pixels
-            or area_ratio > max_component_area_ratio
-            or thinness_ratio > max_thinness_ratio
-        ):
-            continue
-        regions.append(
-            RedMarkRegion(
-                bbox=[
-                    min_x / width,
-                    min_y / height,
-                    (max_x + 1) / width,
-                    (max_y + 1) / height,
-                ],
-                pixel_count=component_pixels,
-                area_ratio=area_ratio,
-                thinness_ratio=thinness_ratio,
+            component_width = max_x - min_x + 1
+            component_height = max_y - min_y + 1
+            area_ratio = component_width * component_height / (width * height)
+            thinness_ratio = max(component_width, component_height) / max(
+                1, min(component_width, component_height)
             )
-        )
+            if (
+                component_pixels < min_component_pixels
+                or area_ratio > max_component_area_ratio
+                or thinness_ratio > max_thinness_ratio
+            ):
+                continue
+            regions.append(
+                RedMarkRegion(
+                    bbox=[
+                        min_x / width,
+                        min_y / height,
+                        (max_x + 1) / width,
+                        (max_y + 1) / height,
+                    ],
+                    pixel_count=component_pixels,
+                    area_ratio=area_ratio,
+                    thinness_ratio=thinness_ratio,
+                )
+            )
 
     return RedMarkScanResult(
         status="detected" if regions else "none",

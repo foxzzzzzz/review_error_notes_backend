@@ -283,6 +283,15 @@ curl -X POST http://localhost:8000/api/auth/dev-login \
 
 ### pytest 自动化测试
 
+后端代码语法最低要求 Python 3.10；标准开发、服务器和 CI 测试环境统一
+使用 Docker 镜像中的 Python 3.11。不要使用低版本本机 Python 直接执行
+`pytest`。
+
+```bash
+# 推荐：无需启动数据库的单元测试
+bash scripts/test_unit.sh
+```
+
 ```bash
 # 在容器内运行
 docker-compose exec api pytest tests/ -v

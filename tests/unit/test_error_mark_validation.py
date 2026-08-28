@@ -352,6 +352,33 @@ def test_full_page_scan_reports_no_reliable_red_marks(tmp_path):
     assert result.red_pixel_count == 0
 
 
+def test_full_page_scan_handles_many_sparse_red_components_with_bounded_latency(
+    tmp_path,
+):
+    """Regression for rescanning the whole mask once per red component."""
+    from app.services.error_mark_validation import scan_red_mark_regions
+
+    image_path = tmp_path / "sparse-red-components.png"
+    image = Image.new("RGB", (1600, 1600), "white")
+    draw = ImageDraw.Draw(image)
+    for index in range(1600):
+        x = 10 + (index % 40) * 39
+        y = 10 + (index // 40) * 39
+        draw.rectangle((x, y, x + 3, y + 3), fill=(220, 20, 20))
+    image.save(image_path)
+
+    result = scan_red_mark_regions(
+        str(image_path),
+        max_edge=1600,
+        min_component_pixels=12,
+        max_component_area_ratio=0.08,
+        max_thinness_ratio=18,
+    )
+
+    assert len(result.regions) == 1600
+    assert result.duration_ms < 2_000
+
+
 def test_full_page_scan_rejects_invalid_image(tmp_path):
     from app.services.error_mark_validation import (
         ErrorMarkImageInvalid,

@@ -1,5 +1,17 @@
 """pytest fixtures — tests run against a live backend (docker-compose up first)."""
+import sys
+
 import pytest
+
+
+def pytest_sessionstart(session):
+    if sys.version_info < (3, 10):
+        pytest.exit(
+            "Backend tests require Python 3.10+. "
+            "Please use the Docker Python 3.11 test environment.",
+            returncode=2,
+        )
+
 import httpx
 import uuid
 import time
