@@ -160,6 +160,7 @@ def _run_batch(
     cross_only_max_gap_ratio=0.08,
     semantic_retry_count=0,
     marked_ocr_recheck_limit=0,
+    local_red_rescue_min_pixels=80,
 ):
     from app.services.vision_recognition import recognize_question_batch
 
@@ -186,6 +187,7 @@ def _run_batch(
         cross_only_max_gap_ratio=cross_only_max_gap_ratio,
         semantic_retry_count=semantic_retry_count,
         marked_ocr_recheck_limit=marked_ocr_recheck_limit,
+        local_red_rescue_min_pixels=local_red_rescue_min_pixels,
     )
 
 
@@ -379,6 +381,124 @@ def test_marked_ocr_rescue_is_bounded_for_deterministic_assignments(tmp_path):
     assert values[0]["ocr_raw_json"]["localization_batch_validation"][
         "marked_ocr_recheck_count"
     ] == 1
+
+
+def test_marked_text_mismatch_is_sent_to_ocr_and_retained_for_review(tmp_path):
+    class TextMismatchClient(FakeClient):
+        def localize(self, image_path, items, error_marks):
+            self.localize_calls += 1
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=0,
+                        matched=True,
+                        mark_ids=[0],
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        observed_prompt_text="错误文本",
+                        observed_raw_text="错误文本",
+                        confidence=0.94,
+                    ),
+                    LocalizationItem(
+                        index=1,
+                        matched=True,
+                        mark_ids=[1],
+                        bbox=[0.55, 0.5, 0.8, 0.8],
+                        observed_prompt_text=items[1].prompt_text,
+                        observed_raw_text=items[1].raw_text,
+                        confidence=0.91,
+                    ),
+                ]
+            )
+
+    verifier = FakeOCRVerifier({0: OCRVerification(status="support")})
+    _result, values = _run_batch(
+        tmp_path,
+        client=TextMismatchClient(),
+        ocr_verifier=verifier,
+        local_red_scan=_detected_red_scan(),
+        correction_group_enabled=True,
+        marked_ocr_recheck_limit=1,
+    )
+
+    assert verifier.calls[0][1] == 0
+    assert values[0]["collection_status"] == "pending_review"
+    assert values[0]["crop_region"]["localization_status"] == "verified"
+    validation = values[0]["ocr_raw_json"]["localization_validation"]
+    assert validation["text_evidence_passed"] is False
+    assert validation["ocr_text_rescued"] is True
+    assert values[0]["ocr_raw_json"]["reliable_error_mark"] is True
+
+
+def test_uncovered_local_red_region_uniquely_rescues_missing_mark_assignment(tmp_path):
+    from app.services.error_mark_validation import RedMarkRegion, RedMarkScanResult
+
+    class OneMarkClient(FakeClient):
+        def recognize(self, image_path, subject_hint=None, **_kwargs):
+            result = _vision_result()
+            result.error_marks = result.error_marks[:1]
+            return result
+
+        def localize(self, image_path, items, error_marks):
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=0,
+                        matched=True,
+                        mark_ids=[0],
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        observed_prompt_text=items[0].prompt_text,
+                        observed_raw_text=items[0].raw_text,
+                        confidence=0.94,
+                    ),
+                    LocalizationItem(
+                        index=1,
+                        matched=True,
+                        mark_ids=[],
+                        bbox=[0.55, 0.5, 0.8, 0.8],
+                        observed_prompt_text=items[1].prompt_text,
+                        observed_raw_text=items[1].raw_text,
+                        confidence=0.91,
+                    ),
+                ]
+            )
+
+    scan = RedMarkScanResult(
+        status="detected",
+        regions=[
+            RedMarkRegion(
+                bbox=[0.2, 0.23, 0.3, 0.34],
+                pixel_count=100,
+                area_ratio=0.011,
+                thinness_ratio=1.1,
+            ),
+            RedMarkRegion(
+                bbox=[0.62, 0.6, 0.73, 0.72],
+                pixel_count=700,
+                area_ratio=0.013,
+                thinness_ratio=1.1,
+            ),
+        ],
+        red_pixel_count=800,
+        scanned_width=400,
+        scanned_height=300,
+        duration_ms=1.0,
+    )
+
+    _result, values = _run_batch(
+        tmp_path,
+        client=OneMarkClient(),
+        local_red_scan=scan,
+        correction_group_enabled=True,
+        local_red_rescue_min_pixels=80,
+        marked_ocr_recheck_limit=1,
+    )
+
+    assert values[1]["collection_status"] == "pending_review"
+    assert values[1]["ocr_raw_json"]["assignment_source"] == "local_red"
+    assert values[1]["ocr_raw_json"]["localization_red_validation"]["accepted"]
+    batch = values[0]["ocr_raw_json"]["localization_batch_validation"]
+    assert batch["local_red_rescue_indexes"] == [1]
+    assert batch["local_red_rescue_diagnostics"][0]["region_pixel_count"] == 700
 
 
 def test_marked_mode_retries_once_when_model_misses_local_red_mark(tmp_path):

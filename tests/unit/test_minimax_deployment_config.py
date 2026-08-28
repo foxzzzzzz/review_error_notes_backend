@@ -10,7 +10,7 @@ BACKEND_ROOT = Path(__file__).parents[2]
 
 EXPECTED_ADAPTIVE_EVIDENCE_SETTINGS = {
     "MARK_CORRECTION_GROUP_ENABLED": "true",
-    "MARK_PAIR_MAX_DISTANCE_RATIO": "0.12",
+    "MARK_PAIR_MAX_DISTANCE_RATIO": "0.04",
     "MARK_ANCHOR_MAX_GAP_RATIO": "0.08",
     "MARK_CROSS_ONLY_MAX_GAP_RATIO": "0.08",
     "MARK_DEDUP_IOU_THRESHOLD": "0.8",
@@ -23,6 +23,7 @@ EXPECTED_ADAPTIVE_EVIDENCE_SETTINGS = {
     "LOCAL_RED_COMPONENT_MIN_PIXELS": "12",
     "LOCAL_RED_COMPONENT_MAX_AREA_RATIO": "0.08",
     "LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO": "18",
+    "LOCAL_RED_RESCUE_MIN_PIXELS": "80",
     "MINIMAX_MARK_MISMATCH_RETRY_COUNT": "1",
     "CELERY_WORKER_CONCURRENCY": "2",
 }
@@ -90,7 +91,7 @@ def test_adaptive_local_evidence_settings_are_bounded():
     settings = Settings(_env_file=None)
 
     assert settings.MARK_CORRECTION_GROUP_ENABLED is True
-    assert settings.MARK_PAIR_MAX_DISTANCE_RATIO == 0.12
+    assert settings.MARK_PAIR_MAX_DISTANCE_RATIO == 0.04
     assert settings.MARK_ANCHOR_MAX_GAP_RATIO == 0.08
     assert settings.MARK_CROSS_ONLY_MAX_GAP_RATIO == 0.08
     assert settings.MARK_DEDUP_IOU_THRESHOLD == 0.8
@@ -99,6 +100,7 @@ def test_adaptive_local_evidence_settings_are_bounded():
     assert settings.LOCAL_OCR_ENABLED is True
     assert settings.LOCAL_OCR_FULL_PAGE_MAX_EDGE == 1600
     assert settings.LOCAL_OCR_CROP_RECHECK_LIMIT == 3
+    assert settings.LOCAL_RED_RESCUE_MIN_PIXELS == 80
     assert settings.CELERY_WORKER_CONCURRENCY == 2
 
     with pytest.raises(ValidationError):
@@ -107,6 +109,8 @@ def test_adaptive_local_evidence_settings_are_bounded():
         Settings(_env_file=None, LOCAL_OCR_CROP_RECHECK_LIMIT=21)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, LOCAL_RED_COMPONENT_MAX_AREA_RATIO=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, LOCAL_RED_RESCUE_MIN_PIXELS=0)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, MARK_PAIR_MAX_DISTANCE_RATIO=1.01)
     with pytest.raises(ValidationError):
@@ -130,6 +134,7 @@ def test_worker_passes_correction_group_settings_to_recognition_batch():
         "cross_only_max_gap_ratio": "MARK_CROSS_ONLY_MAX_GAP_RATIO",
         "semantic_retry_count": "MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT",
         "marked_ocr_recheck_limit": "LOCAL_OCR_MARKED_RECHECK_LIMIT",
+        "local_red_rescue_min_pixels": "LOCAL_RED_RESCUE_MIN_PIXELS",
     }
     compact_task = "".join(task.split())
     for argument, setting_name in expected_arguments.items():

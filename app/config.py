@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     MARK_RED_PIXEL_MIN_RATIO: float = Field(default=0.005, ge=0, le=1)
     MARK_RED_PIXEL_EXPANSION_RATIO: float = Field(default=0.08, ge=0, le=1)
     MARK_CORRECTION_GROUP_ENABLED: bool = True
-    MARK_PAIR_MAX_DISTANCE_RATIO: float = Field(default=0.12, ge=0, le=1)
+    MARK_PAIR_MAX_DISTANCE_RATIO: float = Field(default=0.04, ge=0, le=1)
     MARK_ANCHOR_MAX_GAP_RATIO: float = Field(default=0.08, ge=0, le=1)
     MARK_CROSS_ONLY_MAX_GAP_RATIO: float = Field(default=0.08, ge=0, le=1)
     MARK_DEDUP_IOU_THRESHOLD: float = Field(default=0.8, gt=0, le=1)
@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     LOCAL_RED_COMPONENT_MIN_PIXELS: int = Field(default=12, ge=1)
     LOCAL_RED_COMPONENT_MAX_AREA_RATIO: float = Field(default=0.08, gt=0, le=1)
     LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO: float = Field(default=18, ge=1)
+    LOCAL_RED_RESCUE_MIN_PIXELS: int = Field(default=80, ge=1)
     CELERY_WORKER_CONCURRENCY: int = Field(default=2, ge=1, le=16)
     TAG_ALIAS_CONFIG_PATH: str = "./config/tag-aliases.json"
     DEBUG_DATA_RESET_CONFIRMATION_PHRASE: str = "CLEAR_DEBUG_BUSINESS_DATA"

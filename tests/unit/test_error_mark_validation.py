@@ -69,6 +69,7 @@ def test_reports_pixel_evidence_and_rejection_reason_for_each_mark(tmp_path):
         "red_pixel_min_ratio": 0.01,
         "accepted": True,
         "reason": "accepted",
+        "mark_type": "circle",
     }
     assert diagnostics[1]["red_pixel_ratio"] == 0.0
     assert diagnostics[1]["reason"] == "insufficient_red_pixels"
@@ -158,6 +159,112 @@ def test_cross_circle_is_rejected_when_circle_component_has_no_red_pixels(tmp_pa
     assert diagnostics[0]["reason"] == "invalid_component_pixels"
     assert diagnostics[0]["component_validation"]["cross"]["accepted"] is True
     assert diagnostics[0]["component_validation"]["circle"]["accepted"] is False
+
+
+def test_cross_circle_degrades_to_valid_cross_when_circle_has_no_red_pixels(tmp_path):
+    from app.services.error_mark_validation import filter_valid_error_marks
+    from app.services.vision_recognition import ErrorMark
+
+    image_path = tmp_path / "partial-cross-circle.png"
+    image = Image.new("RGB", (200, 120), "white")
+    draw = ImageDraw.Draw(image)
+    draw.line((30, 20, 70, 60), fill=(220, 20, 20), width=6)
+    draw.line((70, 20, 30, 60), fill=(220, 20, 20), width=6)
+    image.save(image_path)
+    mark = ErrorMark(
+        mark_id=0,
+        mark_type="cross_circle",
+        bbox=[0.1, 0.1, 0.9, 0.8],
+        cross_bbox=[0.1, 0.1, 0.4, 0.6],
+        circle_bbox=[0.6, 0.1, 0.9, 0.6],
+        confidence=0.95,
+    )
+
+    valid, rejected, diagnostics = filter_valid_error_marks(
+        str(image_path),
+        [mark],
+        confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        expansion_ratio=0.0,
+        component_fallback_enabled=True,
+    )
+
+    assert rejected == []
+    assert [candidate.mark_type for candidate in valid] == ["cross"]
+    assert valid[0].bbox == mark.cross_bbox
+    assert diagnostics[0]["fallback_type"] == "cross"
+
+
+def test_cross_circle_splits_components_when_union_does_not_contain_them(tmp_path):
+    from app.services.error_mark_validation import filter_valid_error_marks
+    from app.services.vision_recognition import ErrorMark
+
+    image_path = tmp_path / "misgrouped-cross-circle.png"
+    image = Image.new("RGB", (200, 120), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((20, 20, 50, 50), fill=(220, 20, 20))
+    draw.rectangle((140, 20, 170, 50), fill=(220, 20, 20))
+    image.save(image_path)
+    mark = ErrorMark(
+        mark_id=0,
+        mark_type="cross_circle",
+        bbox=[0.05, 0.1, 0.35, 0.5],
+        cross_bbox=[0.1, 0.15, 0.25, 0.45],
+        circle_bbox=[0.7, 0.15, 0.85, 0.45],
+        confidence=0.95,
+    )
+
+    valid, rejected, diagnostics = filter_valid_error_marks(
+        str(image_path),
+        [mark],
+        confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        expansion_ratio=0.0,
+        component_fallback_enabled=True,
+    )
+
+    assert rejected == []
+    assert [candidate.mark_type for candidate in valid] == ["cross", "circle"]
+    assert diagnostics[0]["components_within_union"] is False
+    assert diagnostics[0]["fallback_type"] == "split_components"
+    assert diagnostics[0]["component_validation"]["cross"]["accepted"] is True
+    assert diagnostics[0]["component_validation"]["circle"]["accepted"] is True
+
+
+def test_cross_circle_splits_far_components_even_when_union_contains_both(tmp_path):
+    from app.services.error_mark_validation import filter_valid_error_marks
+    from app.services.vision_recognition import ErrorMark
+
+    image_path = tmp_path / "far-cross-circle.png"
+    image = Image.new("RGB", (200, 120), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((20, 20, 50, 50), fill=(220, 20, 20))
+    draw.rectangle((140, 20, 170, 50), fill=(220, 20, 20))
+    image.save(image_path)
+    mark = ErrorMark(
+        mark_id=0,
+        mark_type="cross_circle",
+        bbox=[0.05, 0.1, 0.9, 0.5],
+        cross_bbox=[0.1, 0.15, 0.25, 0.45],
+        circle_bbox=[0.7, 0.15, 0.85, 0.45],
+        confidence=0.95,
+    )
+
+    valid, rejected, diagnostics = filter_valid_error_marks(
+        str(image_path),
+        [mark],
+        confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        expansion_ratio=0.0,
+        component_fallback_enabled=True,
+        component_pair_max_distance_ratio=0.04,
+    )
+
+    assert rejected == []
+    assert [candidate.mark_type for candidate in valid] == ["cross", "circle"]
+    assert diagnostics[0]["components_within_union"] is True
+    assert diagnostics[0]["components_pairable"] is False
+    assert diagnostics[0]["fallback_type"] == "split_components"
 
 
 def test_normalize_error_mark_groups_deduplicates_overlapping_marks():

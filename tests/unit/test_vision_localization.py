@@ -765,3 +765,42 @@ def test_rejects_mark_assignment_that_is_not_in_valid_marks():
 
     assert exc_info.value.code == "vision_localization_invalid"
     assert exc_info.value.diagnostic["reason"] == "unknown_mark_assignment"
+
+
+def test_local_red_rescue_rejects_small_noise_component():
+    from app.services.error_mark_validation import RedMarkRegion
+    from app.services.vision_recognition import (
+        LocalizationItem,
+        repair_unique_local_red_assignments,
+    )
+
+    localizations = {
+        0: LocalizationItem(
+            index=0,
+            matched=True,
+            mark_ids=[],
+            bbox=[0.2, 0.2, 0.5, 0.5],
+            observed_prompt_text="课文",
+            observed_raw_text="kè wén",
+            confidence=0.95,
+        )
+    }
+    region = RedMarkRegion(
+        bbox=[0.25, 0.25, 0.3, 0.3],
+        pixel_count=20,
+        area_ratio=0.0025,
+        thinness_ratio=1.0,
+    )
+
+    rescued, diagnostics = repair_unique_local_red_assignments(
+        localizations,
+        {},
+        [region],
+        localization_threshold=0.85,
+        max_area_ratio=0.35,
+        max_gap_ratio=0.08,
+        min_pixels=80,
+    )
+
+    assert rescued == set()
+    assert diagnostics == []

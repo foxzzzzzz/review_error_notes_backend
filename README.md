@@ -457,7 +457,7 @@ student (学生)
 | `MARK_RED_PIXEL_MIN_RATIO` | 标记框内最低红色像素比例 | `0.005` |
 | `MARK_RED_PIXEL_EXPANSION_RATIO` | 红色像素检查框向外扩展比例 | `0.08` |
 | `MARK_CORRECTION_GROUP_ENABLED` | 将邻近红×与红圈合并为一次判错事件 | `true` |
-| `MARK_PAIR_MAX_DISTANCE_RATIO` | 红×与红圈组合的最大归一化距离 | `0.12` |
+| `MARK_PAIR_MAX_DISTANCE_RATIO` | 红×与红圈组合的最大归一化距离 | `0.04` |
 | `MARK_ANCHOR_MAX_GAP_RATIO` | 判错事件锚点与题目候选的最大间距 | `0.08` |
 | `MARK_CROSS_ONLY_MAX_GAP_RATIO` | 仅红×与题目候选的最大间距 | `0.08` |
 | `MARK_DEDUP_IOU_THRESHOLD` | 重复红标合并的 IoU 阈值 | `0.8` |
@@ -482,6 +482,7 @@ student (学生)
 | `LOCAL_RED_COMPONENT_MIN_PIXELS` | 红色连通区域最少像素数 | `12` |
 | `LOCAL_RED_COMPONENT_MAX_AREA_RATIO` | 红色连通区域最大整图面积比例 | `0.08` |
 | `LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO` | 红色连通区域最大长宽比 | `18` |
+| `LOCAL_RED_RESCUE_MIN_PIXELS` | 未被模型红标覆盖的本地红区用于兜底关联时的最少像素数 | `80` |
 | `CELERY_WORKER_CONCURRENCY` | CPU OCR Worker 并发数 | `2` |
 | `QUESTION_SOFT_DELETE_RETENTION_DAYS` | 软删除错题和无引用图片在物理清理前的保留天数 | `30` |
 | `QUESTION_CLEANUP_INTERVAL_SECONDS` | Beat 投递周期清理任务的间隔秒数 | `86400` |

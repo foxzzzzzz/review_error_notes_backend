@@ -192,6 +192,7 @@ def process_image(self, image_id: str, filepath: str):
             cross_only_max_gap_ratio=settings.MARK_CROSS_ONLY_MAX_GAP_RATIO,
             semantic_retry_count=settings.MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT,
             marked_ocr_recheck_limit=settings.LOCAL_OCR_MARKED_RECHECK_LIMIT,
+            local_red_rescue_min_pixels=settings.LOCAL_RED_RESCUE_MIN_PIXELS,
         )
         log_mark_validation_diagnostics(image_id, question_values)
         question_values = discard_pending_duplicates_of_collected(question_values)

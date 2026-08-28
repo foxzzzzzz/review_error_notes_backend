@@ -836,6 +836,103 @@ def repair_unique_mark_assignments(
     return repaired, repair_diagnostics
 
 
+def repair_unique_local_red_assignments(
+    localizations: dict[int, LocalizationItem],
+    marks: dict[int, ErrorMark],
+    red_regions,
+    *,
+    localization_threshold: float,
+    max_area_ratio: float,
+    max_gap_ratio: float,
+    min_pixels: int,
+) -> tuple[set[int], List[dict]]:
+    """Match uncovered strong red components to one unassigned localization."""
+    eligible_localizations = {
+        index: localization
+        for index, localization in localizations.items()
+        if localization.matched
+        and localization.bbox is not None
+        and not localization.mark_ids
+        and localization.confidence >= localization_threshold
+        and bbox_area(localization.bbox) <= max_area_ratio
+    }
+    available_regions = {
+        region_index: region
+        for region_index, region in enumerate(red_regions)
+        if region.pixel_count >= min_pixels
+        and not any(bboxes_intersect(region.bbox, mark.bbox) for mark in marks.values())
+    }
+    edges = []
+    for index, localization in eligible_localizations.items():
+        for region_index, region in available_regions.items():
+            diagnostic = nearest_red_region_diagnostic(
+                localization.bbox,
+                [region],
+            )
+            if diagnostic is None:
+                continue
+            distance = diagnostic["nearest_distance_ratio"]
+            if not diagnostic["intersects_question_bbox"] and distance > max_gap_ratio:
+                continue
+            edges.append((distance, index, region_index, diagnostic))
+
+    def unique_best(candidates, identity_position):
+        ordered = sorted(
+            candidates,
+            key=lambda candidate: (candidate[0], candidate[identity_position]),
+        )
+        if not ordered:
+            return None
+        if len(ordered) > 1 and math.isclose(
+            ordered[0][0],
+            ordered[1][0],
+            abs_tol=1e-9,
+        ):
+            return None
+        return ordered[0]
+
+    best_by_index = {
+        index: unique_best([edge for edge in edges if edge[1] == index], 2)
+        for index in eligible_localizations
+    }
+    best_by_region = {
+        region_index: unique_best(
+            [edge for edge in edges if edge[2] == region_index],
+            1,
+        )
+        for region_index in available_regions
+    }
+    rescued_indexes = set()
+    diagnostics = []
+    for index, edge in sorted(best_by_index.items()):
+        if edge is None:
+            continue
+        _, _, region_index, region_diagnostic = edge
+        reverse = best_by_region.get(region_index)
+        if reverse is None or reverse[1] != index:
+            continue
+        region = available_regions[region_index]
+        rescued_indexes.add(index)
+        diagnostics.append(
+            {
+                "index": index,
+                "region_index": region_index,
+                "assignment_source": "local_red",
+                "nearest_distance_ratio": region_diagnostic[
+                    "nearest_distance_ratio"
+                ],
+                "intersects_question_bbox": region_diagnostic[
+                    "intersects_question_bbox"
+                ],
+                "region_pixel_count": region.pixel_count,
+                "region_area_ratio": region.area_ratio,
+                "min_pixels": min_pixels,
+                "max_gap_ratio": max_gap_ratio,
+            }
+        )
+    return rescued_indexes, diagnostics
+
+
 def build_question_values(
     item: VisionItem,
     index: int,
@@ -1085,6 +1182,7 @@ def recognize_question_batch(
     cross_only_max_gap_ratio: float = 0.0,
     semantic_retry_count: int = 0,
     marked_ocr_recheck_limit: int = 0,
+    local_red_rescue_min_pixels: int = 80,
 ) -> tuple[VisionResult, List[dict]]:
     """Recognize, localize, and apply adaptive local evidence policy."""
     legacy_mode = local_red_scan is None
@@ -1117,6 +1215,8 @@ def recognize_question_batch(
                 confidence_threshold=mark_confidence_threshold,
                 red_pixel_min_ratio=red_pixel_min_ratio,
                 expansion_ratio=red_pixel_expansion_ratio,
+                component_fallback_enabled=correction_group_enabled,
+                component_pair_max_distance_ratio=pair_max_distance_ratio,
             )
         except ErrorMarkImageInvalid:
             valid_marks = []
@@ -1181,6 +1281,9 @@ def recognize_question_batch(
         "semantic_retry_attempts": 0,
         "semantic_retry_reason_counts": {},
         "marked_ocr_recheck_count": 0,
+        "text_ocr_rescue_indexes": [],
+        "local_red_rescue_indexes": [],
+        "local_red_rescue_diagnostics": [],
     }
     try:
         if (
@@ -1340,11 +1443,60 @@ def recognize_question_batch(
         )
         localizations = {}
 
+    local_red_rescue_indexes: set[int] = set()
+    if mode == "marked" and correction_group_enabled and local_red_scan is not None:
+        (
+            local_red_rescue_indexes,
+            local_red_rescue_diagnostics,
+        ) = repair_unique_local_red_assignments(
+            localizations,
+            marks_by_id,
+            local_red_scan.regions,
+            localization_threshold=localization_threshold,
+            max_area_ratio=localization_max_area_ratio,
+            max_gap_ratio=anchor_max_gap_ratio,
+            min_pixels=local_red_rescue_min_pixels,
+        )
+        ordered_local_red_rescues = sorted(
+            local_red_rescue_diagnostics,
+            key=lambda diagnostic: (
+                diagnostic["nearest_distance_ratio"],
+                -diagnostic["region_pixel_count"],
+                diagnostic["index"],
+            ),
+        )[:marked_ocr_recheck_limit]
+        local_red_rescue_indexes = {
+            diagnostic["index"] for diagnostic in ordered_local_red_rescues
+        }
+        local_red_rescue_diagnostics = ordered_local_red_rescues
+        localization_batch_validation["local_red_rescue_indexes"] = sorted(
+            local_red_rescue_indexes
+        )
+        localization_batch_validation["local_red_rescue_diagnostics"] = (
+            local_red_rescue_diagnostics
+        )
+        assignment_sources.update(
+            {index: "local_red" for index in local_red_rescue_indexes}
+        )
+
     values = []
     for index, item in enumerate(result.items):
         localization = localizations.get(index)
         localization_red_validation = None
-        localization_red_verified = False
+        localization_red_verified = index in local_red_rescue_indexes
+        if localization_red_verified:
+            rescue_diagnostic = next(
+                diagnostic
+                for diagnostic in localization_batch_validation[
+                    "local_red_rescue_diagnostics"
+                ]
+                if diagnostic["index"] == index
+            )
+            localization_red_validation = {
+                "accepted": True,
+                "reason": "unique_uncovered_local_red_region",
+                **rescue_diagnostic,
+            }
         should_validate_local_red_evidence = (
             localization is not None
             and localization.matched
@@ -1354,6 +1506,7 @@ def recognize_question_batch(
             and localization_matches_evidence(localization, item)
             and bool(marks_by_id)
             and not localization.mark_ids
+            and not localization_red_verified
         )
         if should_validate_local_red_evidence:
             try:
@@ -1466,38 +1619,95 @@ def recognize_question_batch(
                 items=result.items,
             )
 
+    deterministic_ocr_candidates = sorted(
+        (
+            diagnostic
+            for diagnostic in localization_batch_validation[
+                "assignment_diagnostics"
+            ]
+            if diagnostic.get("assignment_source") == "deterministic"
+        ),
+        key=lambda diagnostic: (
+            diagnostic.get("nearest_distance_ratio", 1.0),
+            diagnostic["index"],
+        ),
+    )
+    text_ocr_rescue_candidates = [
+        index
+        for index, question_values in enumerate(values)
+        if mode == "marked"
+        and question_values["ocr_raw_json"]["localization_validation"][
+            "geometry_passed"
+        ]
+        and not question_values["ocr_raw_json"]["localization_validation"][
+            "text_evidence_passed"
+        ]
+        and (
+            localizations.get(index) is not None
+            and (
+                localizations[index].mark_ids
+                or index in local_red_rescue_indexes
+            )
+        )
+    ]
+    supplemental_ocr_candidates = [
+        (0, diagnostic["nearest_distance_ratio"], diagnostic["index"])
+        for diagnostic in localization_batch_validation[
+            "local_red_rescue_diagnostics"
+        ]
+    ]
+    supplemental_ocr_candidates.extend(
+        (1, -result.items[index].confidence, index)
+        for index in text_ocr_rescue_candidates
+        if index not in local_red_rescue_indexes
+    )
+    supplemental_ocr_candidates.extend(
+        (2, diagnostic.get("nearest_distance_ratio", 1.0), diagnostic["index"])
+        for diagnostic in deterministic_ocr_candidates
+        if diagnostic["index"] not in local_red_rescue_indexes
+        and diagnostic["index"] not in text_ocr_rescue_candidates
+    )
+    supplemental_ocr_indexes = {
+        candidate[2]
+        for candidate in sorted(supplemental_ocr_candidates)[
+            :marked_ocr_recheck_limit
+        ]
+    }
     deterministic_rescue_indexes = {
         diagnostic["index"]
-        for diagnostic in sorted(
-            (
-                diagnostic
-                for diagnostic in localization_batch_validation[
-                    "assignment_diagnostics"
-                ]
-                if diagnostic.get("assignment_source") == "deterministic"
-            ),
-            key=lambda diagnostic: (
-                diagnostic.get("nearest_distance_ratio", 1.0),
-                diagnostic["index"],
-            ),
-        )[:marked_ocr_recheck_limit]
+        for diagnostic in deterministic_ocr_candidates
+        if diagnostic["index"] in supplemental_ocr_indexes
     }
+    text_ocr_rescue_indexes = set(text_ocr_rescue_candidates).intersection(
+        supplemental_ocr_indexes
+    )
+    localization_batch_validation["text_ocr_rescue_indexes"] = sorted(
+        text_ocr_rescue_indexes
+    )
     for index, question_values in enumerate(values):
         reliable_mark = question_values["ocr_raw_json"]["reliable_error_mark"]
         localization = localizations.get(index)
+        localization_validation = question_values["ocr_raw_json"][
+            "localization_validation"
+        ]
         proposed_bbox = (
             localization.bbox
             if localization is not None
-            and question_values["crop_region"].get("bbox") is not None
+            and localization_validation["geometry_passed"]
             else None
         )
         assignment_source = question_values["ocr_raw_json"]["assignment_source"]
-        should_run_marked_ocr = assignment_source != "deterministic" or (
-            index in deterministic_rescue_indexes
+        supplemental_assignment = assignment_source in {
+            "deterministic",
+            "local_red",
+        } or index in text_ocr_rescue_candidates
+        should_run_marked_ocr = not supplemental_assignment or (
+            index in supplemental_ocr_indexes
         )
+        text_ocr_rescue = index in text_ocr_rescue_indexes
         if (
             mode == "marked"
-            and reliable_mark
+            and (reliable_mark or text_ocr_rescue)
             and proposed_bbox is not None
             and should_run_marked_ocr
         ):
@@ -1508,9 +1718,13 @@ def recognize_question_batch(
                 target_index=index,
                 items=result.items,
             )
-            if assignment_source == "deterministic":
+            if supplemental_assignment:
                 localization_batch_validation["marked_ocr_recheck_count"] += 1
-        elif mode == "unmarked" and not hasattr(ocr_verifier, "recognize_page") and proposed_bbox:
+        elif (
+            mode == "unmarked"
+            and not hasattr(ocr_verifier, "recognize_page")
+            and proposed_bbox
+        ):
             verifications[index] = ocr_verifier.verify(
                 image_path,
                 proposed_bbox,
@@ -1531,12 +1745,40 @@ def recognize_question_batch(
                 "duration_ms": 0.0,
             }
         )
+        localization_validation["ocr_text_rescued"] = False
         if local_ocr["status"] in {"wrong_candidate", "text_mismatch"}:
             question_values["crop_region"] = {
                 "bbox_source": "unverified",
                 "localization_status": "needs_review",
                 "index": index,
             }
+            question_values["review_status"] = "needs_review"
+        elif text_ocr_rescue and local_ocr["status"] in {
+            "support",
+            "inconclusive",
+            "unavailable",
+            "disabled",
+        }:
+            question_values["crop_region"] = {
+                "bbox": marker_focused_display_bbox(
+                    localization_bbox=localization.bbox,
+                    mark_ids=localization.mark_ids,
+                    marks=marks_by_id,
+                    padding_ratio=crop_context_padding_ratio,
+                ),
+                "bbox_format": "normalized_ltrb",
+                "bbox_source": "ocr_text_rescued",
+                "bbox_confidence": localization.confidence,
+                "localization_status": "verified",
+                "mark_ids": localization.mark_ids,
+                "index": index,
+            }
+            question_values["review_status"] = "needs_review"
+            reliable_mark = True
+            question_values["ocr_raw_json"]["reliable_error_mark"] = True
+            localization_validation["ocr_text_rescued"] = True
+            localization_validation["verified"] = True
+        if assignment_source == "local_red":
             question_values["review_status"] = "needs_review"
         question_values["ocr_raw_json"]["local_ocr"] = local_ocr
         question_values["ocr_raw_json"]["local_ocr_page"] = page_diagnostic
@@ -1623,6 +1865,7 @@ def recognize_question_batch(
                     localization.bbox,
                     red_regions,
                 ),
+                "local_red_rescued": index in local_red_rescue_indexes,
             }
         )
     localization_batch_validation["missing_mark_diagnostics"] = (

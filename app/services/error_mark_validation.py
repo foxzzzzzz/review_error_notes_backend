@@ -257,6 +257,19 @@ def _union_bbox(first: Sequence[float], second: Sequence[float]) -> List[float]:
     ]
 
 
+def _bbox_contains(
+    container: Sequence[float],
+    candidate: Sequence[float],
+    tolerance: float = 0.0,
+) -> bool:
+    return (
+        container[0] - tolerance <= candidate[0]
+        and container[1] - tolerance <= candidate[1]
+        and container[2] + tolerance >= candidate[2]
+        and container[3] + tolerance >= candidate[3]
+    )
+
+
 def normalize_error_mark_groups(
     marks: Sequence[ErrorMark],
     *,
@@ -374,6 +387,8 @@ def filter_valid_error_marks(
     confidence_threshold: float,
     red_pixel_min_ratio: float,
     expansion_ratio: float,
+    component_fallback_enabled: bool = False,
+    component_pair_max_distance_ratio: float = 1.0,
 ) -> tuple[List[ErrorMark], List[int], List[dict]]:
     """Keep valid marks and report the pixel evidence used for each decision."""
     valid = []
@@ -382,6 +397,10 @@ def filter_valid_error_marks(
     try:
         with Image.open(image_path) as source:
             image = ImageOps.exif_transpose(source).convert("RGB")
+            next_fallback_mark_id = max(
+                (mark.mark_id for mark in marks),
+                default=-1,
+            ) + 1
             for mark in marks:
                 diagnostic = _red_pixel_evidence(
                     image,
@@ -391,33 +410,128 @@ def filter_valid_error_marks(
                 )
                 component_validation = None
                 component_accepted = True
+                components_within_union = None
+                component_pair_distance_ratio = None
+                components_pairable = None
+                fallback_marks = []
+                fallback_type = None
                 if mark.mark_type == "cross_circle":
-                    if mark.cross_bbox is None or mark.circle_bbox is None:
-                        component_accepted = False
-                        component_validation = {}
-                    else:
-                        component_validation = {
-                            "cross": _red_pixel_evidence(
-                                image,
-                                mark.cross_bbox,
-                                red_pixel_min_ratio=red_pixel_min_ratio,
-                                expansion_ratio=expansion_ratio,
-                            ),
-                            "circle": _red_pixel_evidence(
-                                image,
-                                mark.circle_bbox,
-                                red_pixel_min_ratio=red_pixel_min_ratio,
-                                expansion_ratio=expansion_ratio,
-                            ),
-                        }
-                        component_accepted = all(
+                    component_validation = {}
+                    if mark.cross_bbox is not None:
+                        component_validation["cross"] = _red_pixel_evidence(
+                            image,
+                            mark.cross_bbox,
+                            red_pixel_min_ratio=red_pixel_min_ratio,
+                            expansion_ratio=expansion_ratio,
+                        )
+                    if mark.circle_bbox is not None:
+                        component_validation["circle"] = _red_pixel_evidence(
+                            image,
+                            mark.circle_bbox,
+                            red_pixel_min_ratio=red_pixel_min_ratio,
+                            expansion_ratio=expansion_ratio,
+                        )
+                    component_accepted = (
+                        set(component_validation) == {"cross", "circle"}
+                        and all(
                             evidence["accepted"]
                             for evidence in component_validation.values()
                         )
+                    )
+                    if (
+                        mark.cross_bbox is not None
+                        and mark.circle_bbox is not None
+                    ):
+                        components_within_union = _bbox_contains(
+                            mark.bbox,
+                            mark.cross_bbox,
+                            expansion_ratio,
+                        ) and _bbox_contains(
+                            mark.bbox,
+                            mark.circle_bbox,
+                            expansion_ratio,
+                        )
+                        component_pair_distance_ratio = _bbox_distance(
+                            mark.cross_bbox,
+                            mark.circle_bbox,
+                        )
+                        components_pairable = (
+                            component_pair_distance_ratio
+                            <= component_pair_max_distance_ratio
+                        )
+                    if (
+                        component_fallback_enabled
+                        and mark.confidence >= confidence_threshold
+                    ):
+                        valid_components = []
+                        if (
+                            mark.cross_bbox is not None
+                            and component_validation
+                            and component_validation["cross"]["accepted"]
+                        ):
+                            valid_components.append(
+                                mark.model_copy(
+                                    update={
+                                        "mark_type": "cross",
+                                        "bbox": mark.cross_bbox,
+                                        "cross_bbox": mark.cross_bbox,
+                                        "circle_bbox": None,
+                                    }
+                                )
+                            )
+                        if (
+                            mark.circle_bbox is not None
+                            and component_validation
+                            and component_validation["circle"]["accepted"]
+                        ):
+                            circle_id = (
+                                mark.mark_id
+                                if not valid_components
+                                else next_fallback_mark_id
+                            )
+                            if valid_components:
+                                next_fallback_mark_id += 1
+                            valid_components.append(
+                                mark.model_copy(
+                                    update={
+                                        "mark_id": circle_id,
+                                        "mark_type": "circle",
+                                        "bbox": mark.circle_bbox,
+                                        "cross_bbox": None,
+                                        "circle_bbox": mark.circle_bbox,
+                                    }
+                                )
+                            )
+                        if len(valid_components) == 2 and (
+                            not components_within_union or not components_pairable
+                        ):
+                            fallback_marks = valid_components
+                            fallback_type = "split_components"
+                        elif len(valid_components) == 1:
+                            fallback_marks = valid_components
+                            fallback_type = valid_components[0].mark_type
+                        elif not valid_components and diagnostic["accepted"]:
+                            fallback_marks = [
+                                mark.model_copy(
+                                    update={
+                                        "mark_type": "mixed",
+                                        "cross_bbox": None,
+                                        "circle_bbox": None,
+                                    }
+                                )
+                            ]
+                            fallback_type = "mixed"
                 if mark.confidence < confidence_threshold:
                     accepted = False
                     reason = "low_confidence"
-                elif not component_accepted:
+                elif fallback_marks:
+                    accepted = True
+                    reason = "accepted_with_component_fallback"
+                elif (
+                    not component_accepted
+                    or components_within_union is False
+                    or components_pairable is False
+                ):
                     accepted = False
                     reason = "invalid_component_pixels"
                 elif mark.mark_type == "cross_circle":
@@ -427,24 +541,38 @@ def filter_valid_error_marks(
                     accepted = diagnostic["accepted"]
                     reason = diagnostic["reason"]
                 mark_diagnostic = {
-                        "mark_id": mark.mark_id,
-                        "confidence": mark.confidence,
-                        "confidence_threshold": confidence_threshold,
-                        "pixel_box": diagnostic["pixel_box"],
-                        "red_pixel_count": diagnostic["red_pixel_count"],
-                        "pixel_count": diagnostic["pixel_count"],
-                        "red_pixel_ratio": diagnostic["red_pixel_ratio"],
-                        "red_pixel_min_ratio": diagnostic[
-                            "red_pixel_min_ratio"
-                        ],
-                        "accepted": accepted,
-                        "reason": reason,
-                    }
+                    "mark_id": mark.mark_id,
+                    "confidence": mark.confidence,
+                    "confidence_threshold": confidence_threshold,
+                    "pixel_box": diagnostic["pixel_box"],
+                    "red_pixel_count": diagnostic["red_pixel_count"],
+                    "pixel_count": diagnostic["pixel_count"],
+                    "red_pixel_ratio": diagnostic["red_pixel_ratio"],
+                    "red_pixel_min_ratio": diagnostic["red_pixel_min_ratio"],
+                    "accepted": accepted,
+                    "reason": reason,
+                    "mark_type": mark.mark_type,
+                }
                 if component_validation is not None:
                     mark_diagnostic["component_validation"] = component_validation
+                if components_within_union is not None:
+                    mark_diagnostic["components_within_union"] = (
+                        components_within_union
+                    )
+                if component_pair_distance_ratio is not None:
+                    mark_diagnostic["component_pair_distance_ratio"] = round(
+                        component_pair_distance_ratio,
+                        6,
+                    )
+                    mark_diagnostic["component_pair_max_distance_ratio"] = (
+                        component_pair_max_distance_ratio
+                    )
+                    mark_diagnostic["components_pairable"] = components_pairable
+                if fallback_type is not None:
+                    mark_diagnostic["fallback_type"] = fallback_type
                 diagnostics.append(mark_diagnostic)
                 if accepted:
-                    valid.append(mark)
+                    valid.extend(fallback_marks or [mark])
                 else:
                     rejected.append(mark.mark_id)
     except (Image.DecompressionBombError, OSError, ValueError) as exc:
