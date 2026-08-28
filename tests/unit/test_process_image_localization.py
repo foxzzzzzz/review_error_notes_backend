@@ -461,7 +461,19 @@ def test_three_stage_retries_only_missing_localization_and_content_ids(tmp_path)
                         **_vision_result().items[mark_id].model_dump(),
                     )
                     for mark_id in returned_ids
-                ]
+                ],
+                invalid_item_diagnostics=(
+                    [
+                        {
+                            "mark_id": 1,
+                            "validation_errors": [
+                                {"field": "instruction", "type": "value_error"}
+                            ],
+                        }
+                    ]
+                    if self.content_calls == 1
+                    else []
+                ),
             )
 
     client = RetryClient()
@@ -489,6 +501,8 @@ def test_three_stage_retries_only_missing_localization_and_content_ids(tmp_path)
     assert client.content_calls == 2
     assert diagnostic["unlocalized_mark_ids"] == []
     assert diagnostic["missing_content_mark_ids"] == []
+    assert diagnostic["content_invalid_item_count"] == 1
+    assert diagnostic["content_invalid_mark_ids"] == [1]
 
 
 def test_three_stage_retries_mark_detection_for_uncovered_local_red_regions(tmp_path):

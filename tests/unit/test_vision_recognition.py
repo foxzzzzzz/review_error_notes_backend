@@ -469,6 +469,44 @@ def test_stage_prompts_and_schema_retry_name_the_exact_items_contract(tmp_path):
     assert '严格 JSON：{"items"' in requests[0]["prompt"]
     assert '根字段必须是 "items"' in requests[1]["prompt"]
     assert '严格 JSON：{"items"' in requests[2]["prompt"]
+    assert 'subject 只能是 "math"、"chinese"、"english"' in requests[2]["prompt"]
+    assert 'question_type 只能是 "write_pinyin"' in requests[2]["prompt"]
+    assert "instruction 和 prompt_text 都不得为空" in requests[2]["prompt"]
+
+
+def test_content_recognition_keeps_valid_items_and_reports_invalid_items(
+    tmp_path,
+    caplog,
+):
+    valid_item = {"mark_id": 0, **_valid_payload()["items"][0]}
+    invalid_item = {
+        "mark_id": 1,
+        **_valid_payload()["items"][0],
+        "raw_text": "private-student-answer",
+        "instruction": "",
+        "question_type": "pinyin",
+    }
+    client, source, _requests = _mock_stage_client(
+        tmp_path,
+        [{"items": [valid_item, invalid_item]}],
+    )
+    caplog.set_level("INFO")
+
+    result = client.recognize_localized_content(str(source), [0, 1], "chinese")
+
+    assert [item.mark_id for item in result.items] == [0]
+    assert len(result.invalid_item_diagnostics) == 1
+    rejected = result.invalid_item_diagnostics[0]
+    assert rejected["mark_id"] == 1
+    assert {
+        (error["field"], error["type"])
+        for error in rejected["validation_errors"]
+    } == {
+        ("instruction", "value_error"),
+        ("question_type", "literal_error"),
+    }
+    assert "vision_content_items_rejected" in caplog.text
+    assert "private-student-answer" not in caplog.text
 
 
 @pytest.mark.parametrize("transient_status", [429, 500, 501, 503, 599])

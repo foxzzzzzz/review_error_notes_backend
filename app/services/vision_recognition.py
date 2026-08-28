@@ -98,8 +98,11 @@ CONTENT_RECOGNITION_PROMPT = """你是小学错题内容识别器。图片由若
 2. 识别题目要求、印刷提示、学生实际作答、建议正确答案、科目、题型、标签、难度和置信度。
 3. 未作答时 raw_text 必须是空字符串；证据不足的片段写入 uncertain_segments。
 4. 不得修改题目坐标，不得识别或重新分配红色标记。
-5. 只返回严格 JSON：{"items":[{"mark_id":0,"raw_text":"图片中的学生作答","instruction":"图片中的题目要求","prompt_text":"图片中的印刷提示","normalized_text":null,"answer":"建议正确答案","subject":"chinese","question_type":"other","tags":[],"difficulty":3,"confidence":0.95,"uncertain_segments":[]}]}；示例值只说明结构，必须按裁图替换。
-6. 最外层必须是对象，根字段必须是 "items"；即使只有一道题，也必须放入 items 数组。
+5. subject 只能是 "math"、"chinese"、"english" 之一。
+6. question_type 只能是 "write_pinyin"、"write_word"、"fill_blank"、"calculation"、"other" 之一；无法确定时使用 "other"。
+7. instruction 和 prompt_text 都不得为空或 null。看不到完整章节标题时，根据裁图内可见题型生成简洁 instruction；确实没有独立印刷提示时，将 prompt_text 写为“题目提示未完整显示”，并把 prompt_text 加入 uncertain_segments。
+8. 只返回严格 JSON：{"items":[{"mark_id":0,"raw_text":"图片中的学生作答","instruction":"图片中的题目要求","prompt_text":"图片中的印刷提示","normalized_text":null,"answer":"建议正确答案","subject":"chinese","question_type":"other","tags":[],"difficulty":3,"confidence":0.95,"uncertain_segments":[]}]}；示例值只说明结构，必须按裁图替换。
+9. 最外层必须是对象，根字段必须是 "items"；即使只有一道题，也必须放入 items 数组。
 
 输入 mark_ids：__MARK_IDS__
 """
@@ -278,6 +281,9 @@ SAFE_RECOGNITION_DIAGNOSTIC_KEYS = {
     "response_top_level_keys",
     "response_array_field_names",
     "response_first_item_keys",
+    "content_invalid_item_count",
+    "content_invalid_mark_ids",
+    "content_invalid_item_diagnostics",
     "response_attempt",
     "response_max_attempts",
 }
@@ -379,6 +385,7 @@ class ContentRecognitionResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     items: List[ContentRecognitionItem]
+    invalid_item_diagnostics: List[dict] = Field(default_factory=list, exclude=True)
 
     @model_validator(mode="after")
     def mark_ids_must_be_unique(self):
@@ -386,6 +393,12 @@ class ContentRecognitionResult(BaseModel):
         if len(mark_ids) != len(set(mark_ids)):
             raise ValueError("content mark ids must be unique")
         return self
+
+
+class ContentRecognitionEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    items: List[dict]
 
 
 class VisionResult(BaseModel):
@@ -531,6 +544,57 @@ def _format_retry_instruction_for(result_model) -> str:
         + '\n本阶段最外层必须是 JSON 对象，根字段必须是 "items"，'
         '格式为 {"items":[...]}；即使只有一项也不得省略 items 数组。'
     )
+
+
+def _validate_response_result(raw, result_model, diagnostic: dict):
+    if result_model is not ContentRecognitionResult:
+        return result_model.model_validate(raw)
+
+    envelope = ContentRecognitionEnvelope.model_validate(raw)
+    valid_items = []
+    invalid_item_diagnostics = []
+    for item_index, raw_item in enumerate(envelope.items):
+        try:
+            valid_items.append(ContentRecognitionItem.model_validate(raw_item))
+        except ValidationError as exc:
+            raw_mark_id = raw_item.get("mark_id")
+            mark_id = (
+                raw_mark_id
+                if isinstance(raw_mark_id, int) and not isinstance(raw_mark_id, bool)
+                else None
+            )
+            invalid_item_diagnostics.append(
+                {
+                    "item_index": item_index,
+                    "mark_id": mark_id,
+                    "validation_errors": [
+                        {
+                            "field": ".".join(str(part) for part in error["loc"]),
+                            "type": error["type"],
+                        }
+                        for error in exc.errors()[:5]
+                    ],
+                }
+            )
+
+    result = ContentRecognitionResult(
+        items=valid_items,
+        invalid_item_diagnostics=invalid_item_diagnostics,
+    )
+    if invalid_item_diagnostics:
+        logger.info(
+            "vision_content_items_rejected operation=%s candidate_count=%s "
+            "invalid_count=%s diagnostic=%s",
+            diagnostic.get("operation", "content_recognition"),
+            diagnostic.get("candidate_count", 0),
+            len(invalid_item_diagnostics),
+            json.dumps(
+                invalid_item_diagnostics,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+    return result
 
 
 def validated_localizations(
@@ -1361,6 +1425,9 @@ def recognize_marked_three_stage(
         "content_llm_ms": 0.0,
         "content_item_count": 0,
         "content_llm_attempts": 0,
+        "content_invalid_item_count": 0,
+        "content_invalid_mark_ids": [],
+        "content_invalid_item_diagnostics": [],
         "unlocalized_mark_ids": [],
         "missing_content_mark_ids": [],
     }
@@ -1493,6 +1560,24 @@ def recognize_marked_three_stage(
             finally:
                 if temporary_path is not None:
                     Path(temporary_path).unlink(missing_ok=True)
+            invalid_item_diagnostics = content_result.invalid_item_diagnostics
+            diagnostic["content_invalid_item_count"] += len(
+                invalid_item_diagnostics
+            )
+            diagnostic["content_invalid_item_diagnostics"].extend(
+                {
+                    **item_diagnostic,
+                    "content_attempt": _content_attempt + 1,
+                }
+                for item_diagnostic in invalid_item_diagnostics
+            )
+            invalid_mark_ids = set(diagnostic["content_invalid_mark_ids"])
+            invalid_mark_ids.update(
+                item_diagnostic["mark_id"]
+                for item_diagnostic in invalid_item_diagnostics
+                if item_diagnostic.get("mark_id") in pending_ids
+            )
+            diagnostic["content_invalid_mark_ids"] = sorted(invalid_mark_ids)
             content_by_mark.update(
                 {
                     item.mark_id: item
@@ -2799,7 +2884,7 @@ class MiniMaxVisionClient:
                 )
                 raw = _normalize_stage_response_shape(raw, result_model)
                 try:
-                    return result_model.model_validate(raw)
+                    return _validate_response_result(raw, result_model, diagnostic)
                 except ValidationError as exc:
                     raise VisionRecognitionError(
                         "vision_response_schema_invalid",
