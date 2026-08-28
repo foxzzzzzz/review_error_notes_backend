@@ -161,6 +161,7 @@ def _run_batch(
     semantic_retry_count=0,
     marked_ocr_recheck_limit=0,
     local_red_rescue_min_pixels=80,
+    three_stage_enabled=False,
 ):
     from app.services.vision_recognition import recognize_question_batch
 
@@ -188,6 +189,7 @@ def _run_batch(
         semantic_retry_count=semantic_retry_count,
         marked_ocr_recheck_limit=marked_ocr_recheck_limit,
         local_red_rescue_min_pixels=local_red_rescue_min_pixels,
+        three_stage_enabled=three_stage_enabled,
     )
 
 
@@ -209,6 +211,356 @@ def _detected_red_scan():
         scanned_height=300,
         duration_ms=1.0,
     )
+
+
+def test_three_stage_marked_recognition_keeps_stable_mark_ids(tmp_path):
+    from app.services.vision_recognition import (
+        ContentRecognitionItem,
+        ContentRecognitionResult,
+        MarkDetectionResult,
+        MarkQuestionLocalizationItem,
+        MarkQuestionLocalizationResult,
+        recognize_marked_three_stage,
+    )
+
+    class ThreeStageClient:
+        def __init__(self):
+            self.calls = []
+
+        def detect_marks(self, image_path, local_red_regions, correction=None):
+            self.calls.append("marks")
+            return MarkDetectionResult(error_marks=_vision_result().error_marks)
+
+        def locate_marked_questions(self, image_path, error_marks, correction=None):
+            self.calls.append("localization")
+            return MarkQuestionLocalizationResult(
+                items=[
+                    MarkQuestionLocalizationItem(
+                        mark_id=mark.mark_id,
+                        matched=True,
+                        bbox=(
+                            [0.15, 0.15, 0.4, 0.45]
+                            if mark.mark_id == 0
+                            else [0.55, 0.5, 0.8, 0.8]
+                        ),
+                        confidence=0.94,
+                    )
+                    for mark in error_marks
+                ]
+            )
+
+        def recognize_localized_content(self, crop_sheet_path, mark_ids, subject_hint):
+            self.calls.append("content")
+            assert mark_ids == [0, 1]
+            return ContentRecognitionResult(
+                items=[
+                    ContentRecognitionItem(
+                        mark_id=mark_id,
+                        **_vision_result().items[mark_id].model_dump(),
+                    )
+                    for mark_id in mark_ids
+                ]
+            )
+
+    client = ThreeStageClient()
+    result, localizations, marks, diagnostic = recognize_marked_three_stage(
+        client=client,
+        image_path=_write_source_image(tmp_path),
+        subject_hint="chinese",
+        local_red_regions=[],
+        mark_confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        red_pixel_expansion_ratio=0.05,
+        pair_max_distance_ratio=0.04,
+        dedup_iou_threshold=0.8,
+        crop_context_padding_ratio=0.1,
+        image_max_edge=1200,
+        image_jpeg_quality=90,
+        image_max_pixels=40_000_000,
+    )
+
+    assert client.calls == ["marks", "localization", "content"]
+    assert len(result.items) == 2
+    assert [mark.mark_id for mark in marks] == [0, 1]
+    assert localizations[0].mark_ids == [0]
+    assert localizations[1].mark_ids == [1]
+    assert diagnostic["content_item_count"] == 2
+
+
+def test_three_stage_keeps_successful_items_when_one_mark_is_unmatched(tmp_path):
+    from app.services.vision_recognition import (
+        ContentRecognitionItem,
+        ContentRecognitionResult,
+        MarkDetectionResult,
+        MarkQuestionLocalizationItem,
+        MarkQuestionLocalizationResult,
+        recognize_marked_three_stage,
+    )
+
+    class PartialClient:
+        def detect_marks(self, image_path, local_red_regions, correction=None):
+            return MarkDetectionResult(error_marks=_vision_result().error_marks)
+
+        def locate_marked_questions(self, image_path, error_marks, correction=None):
+            return MarkQuestionLocalizationResult(
+                items=[
+                    MarkQuestionLocalizationItem(
+                        mark_id=0,
+                        matched=True,
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        confidence=0.94,
+                    ),
+                    MarkQuestionLocalizationItem(
+                        mark_id=1,
+                        matched=False,
+                        bbox=None,
+                        confidence=0.4,
+                    ),
+                ]
+            )
+
+        def recognize_localized_content(self, crop_sheet_path, mark_ids, subject_hint):
+            return ContentRecognitionResult(
+                items=[
+                    ContentRecognitionItem(
+                        mark_id=0,
+                        **_vision_result().items[0].model_dump(),
+                    )
+                ]
+            )
+
+    result, localizations, _marks, diagnostic = recognize_marked_three_stage(
+        client=PartialClient(),
+        image_path=_write_source_image(tmp_path),
+        subject_hint="chinese",
+        local_red_regions=[],
+        mark_confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        red_pixel_expansion_ratio=0.05,
+        pair_max_distance_ratio=0.04,
+        dedup_iou_threshold=0.8,
+        crop_context_padding_ratio=0.1,
+        image_max_edge=1200,
+        image_jpeg_quality=90,
+        image_max_pixels=40_000_000,
+    )
+
+    assert len(result.items) == 1
+    assert set(localizations) == {0}
+    assert diagnostic["unlocalized_mark_ids"] == [1]
+
+
+def test_recognition_batch_uses_three_stage_path_without_legacy_calls(tmp_path):
+    from app.services.vision_recognition import (
+        ContentRecognitionItem,
+        ContentRecognitionResult,
+        MarkDetectionResult,
+        MarkQuestionLocalizationItem,
+        MarkQuestionLocalizationResult,
+    )
+
+    class ThreeStageOnlyClient:
+        def __init__(self):
+            self.calls = []
+
+        def detect_marks(self, image_path, local_red_regions, correction=None):
+            self.calls.append("marks")
+            return MarkDetectionResult(error_marks=_vision_result().error_marks)
+
+        def locate_marked_questions(self, image_path, error_marks, correction=None):
+            self.calls.append("localization")
+            return MarkQuestionLocalizationResult(
+                items=[
+                    MarkQuestionLocalizationItem(
+                        mark_id=0,
+                        matched=True,
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        confidence=0.94,
+                    ),
+                    MarkQuestionLocalizationItem(
+                        mark_id=1,
+                        matched=True,
+                        bbox=[0.55, 0.5, 0.8, 0.8],
+                        confidence=0.94,
+                    ),
+                ]
+            )
+
+        def recognize_localized_content(self, crop_sheet_path, mark_ids, subject_hint):
+            self.calls.append("content")
+            return ContentRecognitionResult(
+                items=[
+                    ContentRecognitionItem(
+                        mark_id=mark_id,
+                        **_vision_result().items[mark_id].model_dump(),
+                    )
+                    for mark_id in mark_ids
+                ]
+            )
+
+    client = ThreeStageOnlyClient()
+    result, values = _run_batch(
+        tmp_path,
+        client=client,
+        local_red_scan=_detected_red_scan(),
+        correction_group_enabled=True,
+        three_stage_enabled=True,
+    )
+
+    assert client.calls == ["marks", "localization", "content"]
+    assert len(result.items) == 2
+    assert len(values) == 2
+    assert all(value["ocr_raw_json"]["three_stage"]["content_item_count"] == 2 for value in values)
+
+
+def test_three_stage_retries_only_missing_localization_and_content_ids(tmp_path):
+    from app.services.vision_recognition import (
+        ContentRecognitionItem,
+        ContentRecognitionResult,
+        MarkDetectionResult,
+        MarkQuestionLocalizationItem,
+        MarkQuestionLocalizationResult,
+        recognize_marked_three_stage,
+    )
+
+    class RetryClient:
+        def __init__(self):
+            self.localization_calls = 0
+            self.content_calls = 0
+
+        def detect_marks(self, image_path, local_red_regions, correction=None):
+            return MarkDetectionResult(error_marks=_vision_result().error_marks)
+
+        def locate_marked_questions(self, image_path, error_marks, correction=None):
+            self.localization_calls += 1
+            second_matched = self.localization_calls > 1
+            return MarkQuestionLocalizationResult(
+                items=[
+                    MarkQuestionLocalizationItem(
+                        mark_id=0,
+                        matched=True,
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        confidence=0.94,
+                    ),
+                    MarkQuestionLocalizationItem(
+                        mark_id=1,
+                        matched=second_matched,
+                        bbox=[0.55, 0.5, 0.8, 0.8] if second_matched else None,
+                        confidence=0.94 if second_matched else 0.4,
+                    ),
+                ]
+            )
+
+        def recognize_localized_content(self, crop_sheet_path, mark_ids, subject_hint):
+            self.content_calls += 1
+            returned_ids = [0] if self.content_calls == 1 else mark_ids
+            return ContentRecognitionResult(
+                items=[
+                    ContentRecognitionItem(
+                        mark_id=mark_id,
+                        **_vision_result().items[mark_id].model_dump(),
+                    )
+                    for mark_id in returned_ids
+                ]
+            )
+
+    client = RetryClient()
+    result, _localizations, _marks, diagnostic = recognize_marked_three_stage(
+        client=client,
+        image_path=_write_source_image(tmp_path),
+        subject_hint="chinese",
+        local_red_regions=[],
+        mark_confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        red_pixel_expansion_ratio=0.05,
+        pair_max_distance_ratio=0.04,
+        dedup_iou_threshold=0.8,
+        crop_context_padding_ratio=0.1,
+        image_max_edge=1200,
+        image_jpeg_quality=90,
+        image_max_pixels=40_000_000,
+        localization_stage_retry_count=1,
+        content_stage_retry_count=1,
+        content_batch_size=6,
+    )
+
+    assert len(result.items) == 2
+    assert client.localization_calls == 2
+    assert client.content_calls == 2
+    assert diagnostic["unlocalized_mark_ids"] == []
+    assert diagnostic["missing_content_mark_ids"] == []
+
+
+def test_three_stage_retries_mark_detection_for_uncovered_local_red_regions(tmp_path):
+    from app.services.vision_recognition import (
+        ContentRecognitionItem,
+        ContentRecognitionResult,
+        MarkDetectionResult,
+        MarkQuestionLocalizationItem,
+        MarkQuestionLocalizationResult,
+        recognize_marked_three_stage,
+    )
+
+    class MarkRetryClient:
+        def __init__(self):
+            self.mark_calls = 0
+
+        def detect_marks(self, image_path, local_red_regions, correction=None):
+            self.mark_calls += 1
+            marks = _vision_result().error_marks
+            return MarkDetectionResult(
+                error_marks=marks[:1] if self.mark_calls == 1 else marks
+            )
+
+        def locate_marked_questions(self, image_path, error_marks, correction=None):
+            return MarkQuestionLocalizationResult(
+                items=[
+                    MarkQuestionLocalizationItem(
+                        mark_id=mark.mark_id,
+                        matched=True,
+                        bbox=(
+                            [0.15, 0.15, 0.4, 0.45]
+                            if mark.mark_id == 0
+                            else [0.55, 0.5, 0.8, 0.8]
+                        ),
+                        confidence=0.94,
+                    )
+                    for mark in error_marks
+                ]
+            )
+
+        def recognize_localized_content(self, crop_sheet_path, mark_ids, subject_hint):
+            return ContentRecognitionResult(
+                items=[
+                    ContentRecognitionItem(
+                        mark_id=mark_id,
+                        **_vision_result().items[mark_id].model_dump(),
+                    )
+                    for mark_id in mark_ids
+                ]
+            )
+
+    client = MarkRetryClient()
+    result, _localizations, _marks, diagnostic = recognize_marked_three_stage(
+        client=client,
+        image_path=_write_source_image(tmp_path),
+        subject_hint="chinese",
+        local_red_regions=[[0.2, 0.23, 0.3, 0.34], [0.62, 0.6, 0.73, 0.72]],
+        mark_confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        red_pixel_expansion_ratio=0.05,
+        pair_max_distance_ratio=0.04,
+        dedup_iou_threshold=0.8,
+        crop_context_padding_ratio=0.1,
+        image_max_edge=1200,
+        image_jpeg_quality=90,
+        image_max_pixels=40_000_000,
+        mark_stage_retry_count=1,
+    )
+
+    assert client.mark_calls == 2
+    assert len(result.items) == 2
+    assert diagnostic["uncovered_local_red_region_count"] == 0
 
 
 def test_marked_mode_localizes_normalized_error_mark_groups(tmp_path):

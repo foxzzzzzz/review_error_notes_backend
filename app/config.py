@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     MINIMAX_VISION_TIMEOUT_SECONDS: float = 60
     MINIMAX_VISION_MAX_RETRIES: int = 2
     MINIMAX_VISION_RETRY_DELAY_SECONDS: float = 1
+    MINIMAX_THREE_STAGE_RECOGNITION_ENABLED: bool = True
+    MINIMAX_MARK_STAGE_RETRY_COUNT: int = Field(default=1, ge=0, le=2)
+    MINIMAX_LOCALIZATION_STAGE_RETRY_COUNT: int = Field(default=1, ge=0, le=2)
+    MINIMAX_CONTENT_STAGE_RETRY_COUNT: int = Field(default=1, ge=0, le=2)
+    MINIMAX_CONTENT_BATCH_SIZE: int = Field(default=6, ge=1, le=20)
     MINIMAX_CONFIDENCE_THRESHOLD: float = 0.85
     MINIMAX_MARK_CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0, le=1)
     MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0, le=1)

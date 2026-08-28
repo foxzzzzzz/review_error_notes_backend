@@ -116,6 +116,17 @@ def log_mark_validation_diagnostics(
                 separators=(",", ":"),
             ),
         )
+    three_stage = (
+        question_values[0]["ocr_raw_json"].get("three_stage")
+        if question_values
+        else None
+    )
+    if three_stage is not None:
+        logger.info(
+            "three_stage_recognition image_id=%s diagnostic=%s",
+            image_id,
+            json.dumps(three_stage, ensure_ascii=False, separators=(",", ":")),
+        )
 
 
 @celery_app.task(bind=True)
@@ -193,6 +204,14 @@ def process_image(self, image_id: str, filepath: str):
             semantic_retry_count=settings.MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT,
             marked_ocr_recheck_limit=settings.LOCAL_OCR_MARKED_RECHECK_LIMIT,
             local_red_rescue_min_pixels=settings.LOCAL_RED_RESCUE_MIN_PIXELS,
+            three_stage_enabled=settings.MINIMAX_THREE_STAGE_RECOGNITION_ENABLED,
+            mark_stage_retry_count=settings.MINIMAX_MARK_STAGE_RETRY_COUNT,
+            localization_stage_retry_count=settings.MINIMAX_LOCALIZATION_STAGE_RETRY_COUNT,
+            content_stage_retry_count=settings.MINIMAX_CONTENT_STAGE_RETRY_COUNT,
+            content_batch_size=settings.MINIMAX_CONTENT_BATCH_SIZE,
+            image_max_edge=settings.MINIMAX_IMAGE_MAX_EDGE,
+            image_jpeg_quality=settings.MINIMAX_IMAGE_JPEG_QUALITY,
+            image_max_pixels=settings.QUESTION_IMAGE_MAX_PIXELS,
         )
         log_mark_validation_diagnostics(image_id, question_values)
         question_values = discard_pending_duplicates_of_collected(question_values)
@@ -251,6 +270,15 @@ def process_image(self, image_id: str, filepath: str):
             ]
             ocr_calls = sum(duration > 0 for duration in crop_ocr_durations)
             ocr_ms = sum(crop_ocr_durations)
+            three_stage_diagnostic = (
+                question_values[0]["ocr_raw_json"].get("three_stage", {})
+                if question_values
+                else {}
+            )
+            vision_llm_ms = sum(
+                float(three_stage_diagnostic.get(key, 0) or 0)
+                for key in ("mark_llm_ms", "localization_llm_ms", "content_llm_ms")
+            )
             if page_diagnostic and page_diagnostic.get("status") == "available":
                 ocr_calls += 1
                 ocr_ms += page_diagnostic.get("duration_ms", 0)
@@ -263,10 +291,12 @@ def process_image(self, image_id: str, filepath: str):
             db.commit()
             claimed = False
         logger.info(
-            "image_recognition_summary image_id=%s mode=%s red_scan_ms=%.2f ocr_ms=%.2f ocr_calls=%s candidate_count=%s persisted_count=%s status=%s",
+            "image_recognition_summary image_id=%s mode=%s pipeline=%s red_scan_ms=%.2f vision_llm_ms=%.2f ocr_ms=%.2f ocr_calls=%s candidate_count=%s persisted_count=%s status=%s",
             image_id,
             recognition_mode,
+            three_stage_diagnostic.get("recognition_pipeline", "legacy"),
             local_red_scan.duration_ms,
+            vision_llm_ms,
             ocr_ms,
             ocr_calls,
             len(question_values),

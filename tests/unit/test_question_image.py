@@ -8,6 +8,7 @@ from app.services.question_image import (
     QuestionImageNotFound,
     load_cropped_rgb_image,
     load_resized_rgb_image,
+    render_numbered_question_sheet,
     render_question_image,
 )
 
@@ -57,6 +58,43 @@ def test_in_memory_page_resize_preserves_aspect_ratio(tmp_path):
     image = load_resized_rgb_image(source, max_edge=1600, max_pixels=40_000_000)
 
     assert image.size == (1600, 800)
+
+
+def test_numbered_question_sheet_contains_one_panel_per_mark(tmp_path):
+    source = tmp_path / "source.jpg"
+    image = Image.new("RGB", (400, 300), "white")
+    image.paste((255, 0, 0), (40, 30, 160, 120))
+    image.paste((0, 0, 255), (200, 150, 360, 270))
+    image.save(source, format="JPEG")
+
+    content = render_numbered_question_sheet(
+        source,
+        [(3, [0.1, 0.1, 0.4, 0.4]), (7, [0.5, 0.5, 0.9, 0.9])],
+        padding_ratio=0.05,
+        max_edge=800,
+        jpeg_quality=90,
+        max_pixels=40_000_000,
+    )
+
+    with Image.open(BytesIO(content)) as sheet:
+        assert sheet.mode == "RGB"
+        assert max(sheet.size) <= 800
+        assert sheet.height > 120
+
+
+def test_numbered_question_sheet_rejects_empty_localizations(tmp_path):
+    source = tmp_path / "source.jpg"
+    _save_image(source)
+
+    with pytest.raises(QuestionImageInvalid, match="localizations"):
+        render_numbered_question_sheet(
+            source,
+            [],
+            padding_ratio=0.05,
+            max_edge=800,
+            jpeg_quality=90,
+            max_pixels=40_000_000,
+        )
 
 
 def test_original_view_returns_the_complete_image(tmp_path):

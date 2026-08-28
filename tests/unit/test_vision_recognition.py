@@ -161,6 +161,53 @@ def test_recognition_prompt_separates_question_content_from_error_mark_coordinat
     assert "不得预先绑定" in RECOGNITION_PROMPT
 
 
+def test_three_stage_prompts_keep_responsibilities_isolated():
+    from app.services.vision_recognition import (
+        CONTENT_RECOGNITION_PROMPT,
+        MARK_DETECTION_PROMPT,
+        MARK_QUESTION_LOCALIZATION_PROMPT,
+    )
+
+    assert "不得识别题目内容" in MARK_DETECTION_PROMPT
+    assert "学生作答或正确答案" in MARK_DETECTION_PROMPT
+    assert "不得合并红圈和红叉" in MARK_DETECTION_PROMPT
+    assert "不得识别学生答案" in MARK_QUESTION_LOCALIZATION_PROMPT
+    assert "不得修改 mark_id" in MARK_QUESTION_LOCALIZATION_PROMPT
+    assert "不得修改题目坐标" in CONTENT_RECOGNITION_PROMPT
+
+
+def test_mark_detection_rejects_precombined_cross_circle():
+    from app.services.vision_recognition import MarkDetectionResult
+
+    payload = {
+        "error_marks": [
+            {
+                "mark_id": 0,
+                "mark_type": "cross_circle",
+                "bbox": [0.1, 0.1, 0.4, 0.4],
+                "cross_bbox": [0.3, 0.1, 0.4, 0.2],
+                "circle_bbox": [0.1, 0.2, 0.35, 0.4],
+                "confidence": 0.95,
+            }
+        ]
+    }
+
+    with pytest.raises(ValidationError):
+        MarkDetectionResult.model_validate(payload)
+
+
+def test_stage_three_content_has_stable_mark_id_but_no_bbox():
+    from app.services.vision_recognition import ContentRecognitionItem
+
+    item = ContentRecognitionItem(
+        mark_id=2,
+        **_valid_payload()["items"][0],
+    )
+
+    assert item.mark_id == 2
+    assert "bbox" not in item.model_dump()
+
+
 @pytest.mark.parametrize(
     ("model_difficulty", "expected_difficulty"),
     [
@@ -241,6 +288,69 @@ def test_client_calls_minimax_vlm_and_parses_structured_content(tmp_path):
     assert result.items[0].raw_text == "qin tin\n蜻蜓"
     assert result.items[0].normalized_text == "qīng tíng\n蜻蜓"
     assert result.ignored_text == ["Date:"]
+
+
+def test_client_exposes_three_isolated_stage_operations(tmp_path):
+    from app.services.vision_recognition import ErrorMark, MiniMaxVisionClient
+
+    source = tmp_path / "question.jpg"
+    _write_image(source, (400, 300))
+    payloads = []
+    responses = [
+        {
+            "error_marks": [
+                {
+                    "mark_id": 0,
+                    "mark_type": "circle",
+                    "bbox": [0.1, 0.2, 0.3, 0.4],
+                    "cross_bbox": None,
+                    "circle_bbox": None,
+                    "confidence": 0.95,
+                }
+            ]
+        },
+        {
+            "items": [
+                {
+                    "mark_id": 0,
+                    "matched": True,
+                    "bbox": [0.05, 0.1, 0.4, 0.5],
+                    "confidence": 0.92,
+                }
+            ]
+        },
+        {"items": [{"mark_id": 0, **_valid_payload()["items"][0]}]},
+    ]
+
+    def handler(request):
+        payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"content": json.dumps(responses[len(payloads) - 1])},
+        )
+
+    client = MiniMaxVisionClient(
+        api_key="secret-token",
+        api_host="https://api.minimaxi.com",
+        timeout_seconds=5,
+        max_retries=0,
+        max_edge=1200,
+        jpeg_quality=90,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+    )
+
+    marks = client.detect_marks(str(source), [[0.1, 0.2, 0.3, 0.4]])
+    localized = client.locate_marked_questions(str(source), marks.error_marks)
+    content = client.recognize_localized_content(str(source), [0], "chinese")
+
+    assert marks.error_marks[0].mark_type == "circle"
+    assert localized.items[0].mark_id == 0
+    assert content.items[0].mark_id == 0
+    assert "学生作答或正确答案" in payloads[0]["prompt"]
+    assert "不得识别学生答案" in payloads[1]["prompt"]
+    assert "不得修改题目坐标" in payloads[2]["prompt"]
+    assert all(payload["image_url"].startswith("data:image/jpeg;base64,") for payload in payloads)
 
 
 @pytest.mark.parametrize("transient_status", [429, 500, 501, 503, 599])

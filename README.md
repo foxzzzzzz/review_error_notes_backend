@@ -513,3 +513,6 @@ RUN_LIVE_API_TESTS=true bash scripts/verify_adaptive_ocr_server.sh /path/to/imag
 ```
 
 生产环境会拒绝执行实时 API 测试，避免测试账号和迁移操作进入生产数据库。实时套件暂时排除两项已记录的历史直调单测：它们把 FastAPI 的 `Query(None)` 默认对象直接传给接口函数，与本次 OCR 改造无关。
+### 三阶段红标错题识别
+
+Worker 默认通过 `MINIMAX_THREE_STAGE_RECOGNITION_ENABLED` 启用准确率优先的三阶段视觉链路。`MINIMAX_MARK_STAGE_RETRY_COUNT`、`MINIMAX_LOCALIZATION_STAGE_RETRY_COUNT`、`MINIMAX_CONTENT_STAGE_RETRY_COUNT` 分别限制红标、定位和内容阶段的额外重试，`MINIMAX_CONTENT_BATCH_SIZE` 限制单次内容识别题数。紧急回滚时可设置 `MINIMAX_THREE_STAGE_RECOGNITION_ENABLED=false`，同一图片不会混用两种流程。

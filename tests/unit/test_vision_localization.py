@@ -91,6 +91,42 @@ def test_error_mark_accepts_cross_circle_components():
     assert mark.circle_bbox == [0.1, 0.2, 0.35, 0.4]
 
 
+def test_mark_question_localization_requires_bbox_only_when_matched():
+    from app.services.vision_recognition import MarkQuestionLocalizationItem
+
+    matched = MarkQuestionLocalizationItem(
+        mark_id=2,
+        matched=True,
+        bbox=[0.1, 0.2, 0.4, 0.5],
+        confidence=0.9,
+    )
+    unmatched = MarkQuestionLocalizationItem(
+        mark_id=3,
+        matched=False,
+        bbox=None,
+        confidence=0.4,
+    )
+
+    assert matched.bbox == [0.1, 0.2, 0.4, 0.5]
+    assert unmatched.bbox is None
+
+
+def test_mark_question_localization_rejects_duplicate_mark_ids():
+    from app.services.vision_recognition import (
+        MarkQuestionLocalizationItem,
+        MarkQuestionLocalizationResult,
+    )
+
+    item = MarkQuestionLocalizationItem(
+        mark_id=2,
+        matched=True,
+        bbox=[0.1, 0.2, 0.4, 0.5],
+        confidence=0.9,
+    )
+    with pytest.raises(Exception):
+        MarkQuestionLocalizationResult(items=[item, item])
+
+
 def test_localize_sends_all_recognized_indexes_in_one_request(tmp_path):
     source = tmp_path / "question.jpg"
     _write_image(source)

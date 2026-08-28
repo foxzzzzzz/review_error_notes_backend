@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import re
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -35,6 +36,7 @@ from app.services.error_mark_validation import (
     validate_localization_red_evidence,
 )
 from app.services.question_collection import collection_reason_for, collection_status_for
+from app.services.question_image import render_numbered_question_sheet
 from app.services.recognition_policy import decide_candidate
 from app.services.tag_normalization import normalize_tags
 
@@ -61,6 +63,43 @@ def recognition_correction_instruction(correction: Optional[str]) -> str:
         "both": "本图上次可能同时漏识别错题并误识别正确题：重点复查红色错误标记及其对应作答单元，并只保留具有可靠错误证据的题目。",
     }
     return instructions.get(correction, "")
+
+
+MARK_DETECTION_PROMPT = """你是小学作业红色批改几何标记检测器。只识别老师手写的红圈、红叉、删除线、下划线、批注或其他明确错误标记。
+
+要求：
+1. 逐个输出所有可见的独立几何标记，不得识别题目内容、学生作答或正确答案。
+2. 红圈输出 circle，红叉输出 cross；不得合并红圈和红叉，不得输出 cross_circle。
+3. 不要把印刷红色方格、页眉线、装饰色或单独红色对勾当作错误标记。
+4. bbox 使用归一化角点格式 [left, top, right, bottom]；mark_id 从 0 开始连续且唯一。
+5. 只返回严格 JSON：{"error_marks":[{"mark_id":0,"mark_type":"circle","bbox":[0.1,0.2,0.3,0.4],"cross_bbox":null,"circle_bbox":null,"confidence":0.95}]}。
+"""
+
+
+MARK_QUESTION_LOCALIZATION_PROMPT = """你是小学作业错题范围定位器。输入已经固定的红色判错事件，请逐个定位每个 mark_id 对应的最小独立作答单元。
+
+要求：
+1. 每个输入 mark_id 恰好返回一次，不得修改 mark_id，不得新增、删除或重排判错事件。
+2. 只输出题目范围 bbox 和定位置信度；不得识别学生答案、正确答案、题型或标签。
+3. cross_circle 和 circle 优先以红圈为答案锚点；仅 cross 时结合附近版面结构定位。
+4. 无法可靠定位时返回 matched=false、bbox=null，不得猜测。
+5. bbox 使用归一化角点格式 [left, top, right, bottom]，只返回严格 JSON。
+
+输入：__INPUT__
+"""
+
+
+CONTENT_RECOGNITION_PROMPT = """你是小学错题内容识别器。图片由若干带 mark_id 标签的独立题目裁图组成，请逐题识别结构化内容。
+
+要求：
+1. 每个输入 mark_id 恰好返回一次，不得修改 mark_id，不得增加图片中不存在的题目。
+2. 识别题目要求、印刷提示、学生实际作答、建议正确答案、科目、题型、标签、难度和置信度。
+3. 未作答时 raw_text 必须是空字符串；证据不足的片段写入 uncertain_segments。
+4. 不得修改题目坐标，不得识别或重新分配红色标记。
+5. 只返回严格 JSON。
+
+输入 mark_ids：__MARK_IDS__
+"""
 
 RECOGNITION_PROMPT = """你是小学错题内容与红色批改标记识别器。请观察整张图片，一次性输出题目内容和独立的红色错误标记。
 
@@ -310,6 +349,38 @@ class ErrorMark(BaseModel):
         return validate_normalized_bbox(value) if value is not None else None
 
 
+class MarkDetectionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    error_marks: List[ErrorMark] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def primitives_must_be_sequential_and_uncombined(self):
+        mark_ids = [mark.mark_id for mark in self.error_marks]
+        if mark_ids != list(range(len(mark_ids))):
+            raise ValueError("mark primitive ids must be unique and sequential")
+        if any(mark.mark_type == "cross_circle" for mark in self.error_marks):
+            raise ValueError("mark detection must not pre-combine cross and circle")
+        return self
+
+
+class ContentRecognitionItem(VisionItem):
+    mark_id: int = Field(ge=0)
+
+
+class ContentRecognitionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    items: List[ContentRecognitionItem] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def mark_ids_must_be_unique(self):
+        mark_ids = [item.mark_id for item in self.items]
+        if len(mark_ids) != len(set(mark_ids)):
+            raise ValueError("content mark ids must be unique")
+        return self
+
+
 class VisionResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -360,6 +431,39 @@ class LocalizationResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     items: List[LocalizationItem] = Field(min_length=1)
+
+
+class MarkQuestionLocalizationItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    mark_id: int = Field(ge=0)
+    matched: bool
+    bbox: Optional[List[float]] = None
+    confidence: float = Field(ge=0, le=1)
+
+    @field_validator("bbox")
+    @classmethod
+    def bbox_must_be_normalized(cls, value):
+        return validate_normalized_bbox(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def matched_result_must_have_bbox(self):
+        if self.matched != (self.bbox is not None):
+            raise ValueError("matched localization must have bbox")
+        return self
+
+
+class MarkQuestionLocalizationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    items: List[MarkQuestionLocalizationItem] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def mark_ids_must_be_unique(self):
+        mark_ids = [item.mark_id for item in self.items]
+        if len(mark_ids) != len(set(mark_ids)):
+            raise ValueError("localized mark ids must be unique")
+        return self
 
 
 def validated_localizations(
@@ -1156,6 +1260,217 @@ def localization_semantic_diagnostic(
     }
 
 
+def recognize_marked_three_stage(
+    *,
+    client,
+    image_path: str,
+    subject_hint: Optional[str],
+    local_red_regions: List[List[float]],
+    mark_confidence_threshold: float,
+    red_pixel_min_ratio: float,
+    red_pixel_expansion_ratio: float,
+    pair_max_distance_ratio: float,
+    dedup_iou_threshold: float,
+    crop_context_padding_ratio: float,
+    image_max_edge: int,
+    image_jpeg_quality: int,
+    image_max_pixels: int,
+    mark_stage_retry_count: int = 1,
+    localization_stage_retry_count: int = 1,
+    content_stage_retry_count: int = 1,
+    content_batch_size: int = 6,
+) -> tuple[VisionResult, dict[int, LocalizationItem], List[ErrorMark], dict]:
+    """Run isolated mark, geometry, and content stages for a marked page."""
+    diagnostic = {
+        "recognition_pipeline": "three_stage",
+        "mark_llm_ms": 0.0,
+        "mark_primitive_count": 0,
+        "mark_llm_attempts": 0,
+        "mark_event_count": 0,
+        "uncovered_local_red_region_count": 0,
+        "localization_llm_ms": 0.0,
+        "localized_mark_count": 0,
+        "localization_llm_attempts": 0,
+        "content_llm_ms": 0.0,
+        "content_item_count": 0,
+        "content_llm_attempts": 0,
+        "unlocalized_mark_ids": [],
+        "missing_content_mark_ids": [],
+    }
+    started = time.perf_counter()
+    valid_marks = []
+    grouping_diagnostic = {}
+    best_valid_marks = []
+    best_grouping_diagnostic = {}
+    best_uncovered_regions = list(local_red_regions)
+    for mark_attempt in range(mark_stage_retry_count + 1):
+        diagnostic["mark_llm_attempts"] += 1
+        detected = client.detect_marks(
+            image_path,
+            local_red_regions,
+            correction=(
+                "上次仍有本地红色候选区域未被覆盖，请重点复查这些区域并只输出独立几何形状："
+                + json.dumps(best_uncovered_regions, separators=(",", ":"))
+                if mark_attempt
+                else None
+            ),
+        )
+        diagnostic["mark_primitive_count"] = len(detected.error_marks)
+        valid_marks, _rejected_mark_ids, _mark_diagnostics = filter_valid_error_marks(
+            image_path,
+            detected.error_marks,
+            confidence_threshold=mark_confidence_threshold,
+            red_pixel_min_ratio=red_pixel_min_ratio,
+            expansion_ratio=red_pixel_expansion_ratio,
+            component_fallback_enabled=False,
+            component_pair_max_distance_ratio=pair_max_distance_ratio,
+        )
+        valid_marks, grouping_diagnostic = normalize_error_mark_groups(
+            valid_marks,
+            dedup_iou_threshold=dedup_iou_threshold,
+            pair_max_distance_ratio=pair_max_distance_ratio,
+        )
+        uncovered_regions = [
+            region
+            for region in local_red_regions
+            if not any(bboxes_intersect(region, mark.bbox) for mark in valid_marks)
+        ]
+        current_score = (len(valid_marks), -len(uncovered_regions))
+        best_score = (len(best_valid_marks), -len(best_uncovered_regions))
+        if current_score > best_score:
+            best_valid_marks = list(valid_marks)
+            best_grouping_diagnostic = dict(grouping_diagnostic)
+            best_uncovered_regions = list(uncovered_regions)
+        if valid_marks and not uncovered_regions:
+            break
+    valid_marks = best_valid_marks
+    grouping_diagnostic = best_grouping_diagnostic
+    diagnostic["mark_llm_ms"] = round((time.perf_counter() - started) * 1000, 2)
+    diagnostic["mark_event_count"] = len(valid_marks)
+    diagnostic["uncovered_local_red_region_count"] = len(best_uncovered_regions)
+    diagnostic["mark_grouping"] = grouping_diagnostic
+    if not valid_marks:
+        raise ImageReviewRequired(
+            "red_marks_unresolved",
+            "系统检测到批改痕迹，但没有找到可确认的红色判错事件。",
+            diagnostic={"operation": "mark_detection", **diagnostic},
+        )
+
+    started = time.perf_counter()
+    located_by_mark = {}
+    marks_by_id = {mark.mark_id: mark for mark in valid_marks}
+    for localization_attempt in range(localization_stage_retry_count + 1):
+        diagnostic["localization_llm_attempts"] += 1
+        missing_before = sorted(set(marks_by_id) - set(located_by_mark))
+        location_result = client.locate_marked_questions(
+            image_path,
+            valid_marks,
+            correction=(
+                {"missing_mark_ids": missing_before}
+                if localization_attempt and missing_before
+                else None
+            ),
+        )
+        located_by_mark.update(
+            {
+                item.mark_id: item
+                for item in location_result.items
+                if item.mark_id in marks_by_id
+                and item.matched
+                and item.bbox is not None
+            }
+        )
+        if set(located_by_mark) == set(marks_by_id):
+            break
+    diagnostic["localization_llm_ms"] = round(
+        (time.perf_counter() - started) * 1000, 2
+    )
+    diagnostic["localized_mark_count"] = len(located_by_mark)
+    diagnostic["unlocalized_mark_ids"] = sorted(
+        set(marks_by_id) - set(located_by_mark)
+    )
+    if not located_by_mark:
+        raise ImageReviewRequired(
+            "red_marks_unresolved",
+            "系统检测到批改痕迹，但没有找到可确认的错题区域。",
+            diagnostic={"operation": "mark_localization", **diagnostic},
+        )
+
+    content_by_mark = {}
+    started = time.perf_counter()
+    located_ids = sorted(located_by_mark)
+    for chunk_start in range(0, len(located_ids), content_batch_size):
+        pending_ids = located_ids[chunk_start : chunk_start + content_batch_size]
+        for _content_attempt in range(content_stage_retry_count + 1):
+            if not pending_ids:
+                break
+            sheet_content = render_numbered_question_sheet(
+                image_path,
+                [(mark_id, located_by_mark[mark_id].bbox) for mark_id in pending_ids],
+                padding_ratio=crop_context_padding_ratio,
+                max_edge=image_max_edge,
+                jpeg_quality=image_jpeg_quality,
+                max_pixels=image_max_pixels,
+            )
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temporary:
+                    temporary.write(sheet_content)
+                    temporary_path = temporary.name
+                diagnostic["content_llm_attempts"] += 1
+                content_result = client.recognize_localized_content(
+                    temporary_path,
+                    pending_ids,
+                    subject_hint,
+                )
+            finally:
+                if temporary_path is not None:
+                    Path(temporary_path).unlink(missing_ok=True)
+            content_by_mark.update(
+                {
+                    item.mark_id: item
+                    for item in content_result.items
+                    if item.mark_id in pending_ids
+                }
+            )
+            pending_ids = [
+                mark_id for mark_id in pending_ids if mark_id not in content_by_mark
+            ]
+    diagnostic["content_llm_ms"] = round((time.perf_counter() - started) * 1000, 2)
+    diagnostic["content_item_count"] = len(content_by_mark)
+    diagnostic["missing_content_mark_ids"] = sorted(
+        set(located_by_mark) - set(content_by_mark)
+    )
+    if not content_by_mark:
+        raise ImageReviewRequired(
+            "red_marks_unresolved",
+            "系统找到错题区域，但没有获得可确认的题目内容。",
+            diagnostic={"operation": "content_recognition", **diagnostic},
+        )
+
+    items = []
+    localizations = {}
+    for index, mark_id in enumerate(sorted(content_by_mark)):
+        content_item = content_by_mark[mark_id]
+        items.append(VisionItem.model_validate(content_item.model_dump(exclude={"mark_id"})))
+        located = located_by_mark[mark_id]
+        localizations[index] = LocalizationItem(
+            index=index,
+            matched=True,
+            mark_ids=[mark_id],
+            bbox=located.bbox,
+            observed_prompt_text=content_item.prompt_text,
+            observed_raw_text=content_item.raw_text,
+            confidence=located.confidence,
+        )
+    return (
+        VisionResult(items=items, error_marks=valid_marks, ignored_text=[]),
+        localizations,
+        valid_marks,
+        diagnostic,
+    )
+
+
 def recognize_question_batch(
     client,
     image_path: str,
@@ -1183,6 +1498,14 @@ def recognize_question_batch(
     semantic_retry_count: int = 0,
     marked_ocr_recheck_limit: int = 0,
     local_red_rescue_min_pixels: int = 80,
+    three_stage_enabled: bool = False,
+    mark_stage_retry_count: int = 1,
+    localization_stage_retry_count: int = 1,
+    content_stage_retry_count: int = 1,
+    content_batch_size: int = 6,
+    image_max_edge: int = 2048,
+    image_jpeg_quality: int = 90,
+    image_max_pixels: int = 40_000_000,
 ) -> tuple[VisionResult, List[dict]]:
     """Recognize, localize, and apply adaptive local evidence policy."""
     legacy_mode = local_red_scan is None
@@ -1191,6 +1514,80 @@ def recognize_question_batch(
     local_red_regions = [
         list(region.bbox) for region in (local_red_scan.regions if local_red_scan else [])
     ]
+
+    if three_stage_enabled and mode == "marked":
+        (
+            three_stage_result,
+            three_stage_localizations,
+            _three_stage_marks,
+            three_stage_diagnostic,
+        ) = recognize_marked_three_stage(
+            client=client,
+            image_path=image_path,
+            subject_hint=subject_hint,
+            local_red_regions=local_red_regions,
+            mark_confidence_threshold=mark_confidence_threshold,
+            red_pixel_min_ratio=red_pixel_min_ratio,
+            red_pixel_expansion_ratio=red_pixel_expansion_ratio,
+            pair_max_distance_ratio=pair_max_distance_ratio,
+            dedup_iou_threshold=dedup_iou_threshold,
+            crop_context_padding_ratio=crop_context_padding_ratio,
+            image_max_edge=image_max_edge,
+            image_jpeg_quality=image_jpeg_quality,
+            image_max_pixels=image_max_pixels,
+            mark_stage_retry_count=mark_stage_retry_count,
+            localization_stage_retry_count=localization_stage_retry_count,
+            content_stage_retry_count=content_stage_retry_count,
+            content_batch_size=content_batch_size,
+        )
+
+        class PrecomputedThreeStageClient:
+            def recognize(self, image_path, subject_hint=None):
+                return three_stage_result
+
+            def localize(self, image_path, items, error_marks):
+                return LocalizationResult(
+                    items=[
+                        three_stage_localizations[index]
+                        for index in sorted(three_stage_localizations)
+                    ]
+                )
+
+        final_result, question_values = recognize_question_batch(
+            client=PrecomputedThreeStageClient(),
+            image_path=image_path,
+            subject_hint=subject_hint,
+            confidence_threshold=confidence_threshold,
+            mark_confidence_threshold=mark_confidence_threshold,
+            localization_threshold=localization_threshold,
+            localization_max_area_ratio=localization_max_area_ratio,
+            red_pixel_min_ratio=red_pixel_min_ratio,
+            red_pixel_expansion_ratio=red_pixel_expansion_ratio,
+            tag_config_path=tag_config_path,
+            ocr_verifier=ocr_verifier,
+            crop_context_padding_ratio=crop_context_padding_ratio,
+            recognition_correction=recognition_correction,
+            local_red_scan=local_red_scan,
+            mark_mismatch_retry_count=0,
+            ocr_full_page_max_edge=ocr_full_page_max_edge,
+            ocr_crop_recheck_limit=ocr_crop_recheck_limit,
+            force_mode="marked",
+            correction_group_enabled=correction_group_enabled,
+            pair_max_distance_ratio=pair_max_distance_ratio,
+            dedup_iou_threshold=dedup_iou_threshold,
+            anchor_max_gap_ratio=anchor_max_gap_ratio,
+            cross_only_max_gap_ratio=cross_only_max_gap_ratio,
+            semantic_retry_count=0,
+            marked_ocr_recheck_limit=marked_ocr_recheck_limit,
+            local_red_rescue_min_pixels=local_red_rescue_min_pixels,
+            three_stage_enabled=False,
+            image_max_edge=image_max_edge,
+            image_jpeg_quality=image_jpeg_quality,
+            image_max_pixels=image_max_pixels,
+        )
+        for values in question_values:
+            values["ocr_raw_json"]["three_stage"] = dict(three_stage_diagnostic)
+        return final_result, question_values
 
     correction_group_validation = {
         "raw_mark_count": 0,
@@ -2134,6 +2531,88 @@ class MiniMaxVisionClient:
             max_edge=settings.MINIMAX_IMAGE_MAX_EDGE,
             jpeg_quality=settings.MINIMAX_IMAGE_JPEG_QUALITY,
             retry_delay_seconds=settings.MINIMAX_VISION_RETRY_DELAY_SECONDS,
+        )
+
+    def detect_marks(
+        self,
+        image_path: str,
+        local_red_regions: Optional[List[List[float]]] = None,
+        correction: Optional[str] = None,
+    ) -> MarkDetectionResult:
+        diagnostic = {
+            "operation": "mark_detection",
+            "local_red_region_count": len(local_red_regions or []),
+        }
+        image_url = prepare_image_data_url(
+            image_path, self.max_edge, self.jpeg_quality, diagnostic
+        )
+        prompt = MARK_DETECTION_PROMPT
+        if local_red_regions:
+            prompt += (
+                "\n\n本地红色像素候选区域如下；它们只用于防漏，仍须根据原图判断形状：\n"
+                + json.dumps(local_red_regions, separators=(",", ":"))
+            )
+        if correction:
+            prompt += "\n\n红标检测纠偏：" + correction
+        return self._request(
+            {"prompt": prompt, "image_url": image_url},
+            MarkDetectionResult,
+            diagnostic,
+        )
+
+    def locate_marked_questions(
+        self,
+        image_path: str,
+        error_marks: List[ErrorMark],
+        correction: Optional[dict] = None,
+    ) -> MarkQuestionLocalizationResult:
+        diagnostic = {
+            "operation": "mark_localization",
+            "mark_count": len(error_marks),
+        }
+        image_url = prepare_image_data_url(
+            image_path, self.max_edge, self.jpeg_quality, diagnostic
+        )
+        prompt = MARK_QUESTION_LOCALIZATION_PROMPT.replace(
+            "__INPUT__",
+            json.dumps(
+                {"error_marks": [mark.model_dump(mode="json") for mark in error_marks]},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        if correction:
+            prompt += "\n\n定位纠偏：" + json.dumps(
+                correction, ensure_ascii=False, separators=(",", ":")
+            )
+        return self._request(
+            {"prompt": prompt, "image_url": image_url},
+            MarkQuestionLocalizationResult,
+            diagnostic,
+        )
+
+    def recognize_localized_content(
+        self,
+        crop_sheet_path: str,
+        mark_ids: List[int],
+        subject_hint: Optional[str] = None,
+    ) -> ContentRecognitionResult:
+        diagnostic = {
+            "operation": "content_recognition",
+            "candidate_count": len(mark_ids),
+        }
+        image_url = prepare_image_data_url(
+            crop_sheet_path, self.max_edge, self.jpeg_quality, diagnostic
+        )
+        prompt = CONTENT_RECOGNITION_PROMPT.replace(
+            "__MARK_IDS__", json.dumps(mark_ids, separators=(",", ":"))
+        )
+        if subject_hint:
+            prompt += f"\n科目提示：{subject_hint}。"
+        return self._request(
+            {"prompt": prompt, "image_url": image_url},
+            ContentRecognitionResult,
+            diagnostic,
         )
 
     def recognize(

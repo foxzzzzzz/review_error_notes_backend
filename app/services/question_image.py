@@ -2,7 +2,7 @@ import math
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 
 
 class QuestionImageError(Exception):
@@ -77,6 +77,74 @@ def load_resized_rgb_image(image_path, max_edge, max_pixels):
     if max(image.size) > max_edge:
         image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
     return image
+
+
+def render_numbered_question_sheet(
+    image_path,
+    localizations,
+    padding_ratio,
+    max_edge,
+    jpeg_quality,
+    max_pixels,
+):
+    """Render stable mark-id labels above padded question crops."""
+    if not localizations:
+        raise QuestionImageInvalid("Question sheet localizations are empty")
+    image = _load_rgb_image(image_path, max_pixels)
+    panels = []
+    for mark_id, bbox in localizations:
+        if not isinstance(mark_id, int) or isinstance(mark_id, bool):
+            raise QuestionImageInvalid("Question sheet mark id is invalid")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            raise QuestionImageInvalid("Question sheet localization is invalid")
+        left, top, right, bottom = bbox
+        width = right - left
+        height = bottom - top
+        padded = [
+            max(0.0, left - width * padding_ratio),
+            max(0.0, top - height * padding_ratio),
+            min(1.0, right + width * padding_ratio),
+            min(1.0, bottom + height * padding_ratio),
+        ]
+        crop_box = _pixel_crop_box(
+            image.size,
+            {"bbox": padded, "bbox_format": "normalized_ltrb"},
+        )
+        if crop_box is None:
+            raise QuestionImageInvalid("Question sheet localization is invalid")
+        crop = image.crop(crop_box)
+        label_height = 28
+        panel = Image.new("RGB", (crop.width, crop.height + label_height), "white")
+        ImageDraw.Draw(panel).text((8, 7), f"mark_id={mark_id}", fill="black")
+        panel.paste(crop, (0, label_height))
+        panels.append(panel)
+
+    columns = 1 if len(panels) == 1 else 2
+    rows = math.ceil(len(panels) / columns)
+    cell_width = max(panel.width for panel in panels)
+    cell_height = max(panel.height for panel in panels)
+    gap = 8
+    sheet = Image.new(
+        "RGB",
+        (
+            columns * cell_width + (columns - 1) * gap,
+            rows * cell_height + (rows - 1) * gap,
+        ),
+        "white",
+    )
+    for index, panel in enumerate(panels):
+        column = index % columns
+        row = index // columns
+        sheet.paste(panel, (column * (cell_width + gap), row * (cell_height + gap)))
+    if max(sheet.size) > max_edge:
+        sheet.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+
+    try:
+        output = BytesIO()
+        sheet.save(output, format="JPEG", quality=jpeg_quality)
+        return output.getvalue()
+    except (OSError, ValueError) as exc:
+        raise QuestionImageInvalid("Question image is invalid") from exc
 
 
 def render_question_image(image_path, crop_region, view, jpeg_quality, max_pixels):

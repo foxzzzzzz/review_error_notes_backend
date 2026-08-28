@@ -9,6 +9,11 @@ from app.config import Settings
 BACKEND_ROOT = Path(__file__).parents[2]
 
 EXPECTED_ADAPTIVE_EVIDENCE_SETTINGS = {
+    "MINIMAX_THREE_STAGE_RECOGNITION_ENABLED": "true",
+    "MINIMAX_MARK_STAGE_RETRY_COUNT": "1",
+    "MINIMAX_LOCALIZATION_STAGE_RETRY_COUNT": "1",
+    "MINIMAX_CONTENT_STAGE_RETRY_COUNT": "1",
+    "MINIMAX_CONTENT_BATCH_SIZE": "6",
     "MARK_CORRECTION_GROUP_ENABLED": "true",
     "MARK_PAIR_MAX_DISTANCE_RATIO": "0.04",
     "MARK_ANCHOR_MAX_GAP_RATIO": "0.08",
@@ -90,6 +95,11 @@ def test_adaptive_local_evidence_settings_have_documented_safe_defaults():
 def test_adaptive_local_evidence_settings_are_bounded():
     settings = Settings(_env_file=None)
 
+    assert settings.MINIMAX_THREE_STAGE_RECOGNITION_ENABLED is True
+    assert settings.MINIMAX_MARK_STAGE_RETRY_COUNT == 1
+    assert settings.MINIMAX_LOCALIZATION_STAGE_RETRY_COUNT == 1
+    assert settings.MINIMAX_CONTENT_STAGE_RETRY_COUNT == 1
+    assert settings.MINIMAX_CONTENT_BATCH_SIZE == 6
     assert settings.MARK_CORRECTION_GROUP_ENABLED is True
     assert settings.MARK_PAIR_MAX_DISTANCE_RATIO == 0.04
     assert settings.MARK_ANCHOR_MAX_GAP_RATIO == 0.08
@@ -118,6 +128,8 @@ def test_adaptive_local_evidence_settings_are_bounded():
     with pytest.raises(ValidationError):
         Settings(_env_file=None, MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT=3)
     with pytest.raises(ValidationError):
+        Settings(_env_file=None, MINIMAX_CONTENT_BATCH_SIZE=0)
+    with pytest.raises(ValidationError):
         Settings(_env_file=None, CELERY_WORKER_CONCURRENCY=17)
 
 
@@ -127,6 +139,11 @@ def test_worker_passes_correction_group_settings_to_recognition_batch():
     )
 
     expected_arguments = {
+        "three_stage_enabled": "MINIMAX_THREE_STAGE_RECOGNITION_ENABLED",
+        "mark_stage_retry_count": "MINIMAX_MARK_STAGE_RETRY_COUNT",
+        "localization_stage_retry_count": "MINIMAX_LOCALIZATION_STAGE_RETRY_COUNT",
+        "content_stage_retry_count": "MINIMAX_CONTENT_STAGE_RETRY_COUNT",
+        "content_batch_size": "MINIMAX_CONTENT_BATCH_SIZE",
         "correction_group_enabled": "MARK_CORRECTION_GROUP_ENABLED",
         "pair_max_distance_ratio": "MARK_PAIR_MAX_DISTANCE_RATIO",
         "dedup_iou_threshold": "MARK_DEDUP_IOU_THRESHOLD",
