@@ -447,9 +447,15 @@ student (学生)
 | `QUESTION_CROP_CONTEXT_PADDING_RATIO` | 详情展示框每侧上下文扩展比例，并在包含完整题目的前提下向红标中心移动 | `0.15` |
 | `MARK_RED_PIXEL_MIN_RATIO` | 标记框内最低红色像素比例 | `0.005` |
 | `MARK_RED_PIXEL_EXPANSION_RATIO` | 红色像素检查框向外扩展比例 | `0.08` |
+| `MARK_CORRECTION_GROUP_ENABLED` | 将邻近红×与红圈合并为一次判错事件 | `true` |
+| `MARK_PAIR_MAX_DISTANCE_RATIO` | 红×与红圈组合的最大归一化距离 | `0.12` |
+| `MARK_ANCHOR_MAX_GAP_RATIO` | 判错事件锚点与题目候选的最大间距 | `0.08` |
+| `MARK_CROSS_ONLY_MAX_GAP_RATIO` | 仅红×与题目候选的最大间距 | `0.08` |
+| `MARK_DEDUP_IOU_THRESHOLD` | 重复红标合并的 IoU 阈值 | `0.8` |
 | `MINIMAX_IMAGE_MAX_EDGE` | 预处理图片最长边像素数 | `2048` |
 | `MINIMAX_IMAGE_JPEG_QUALITY` | 预处理 JPEG 质量 | `90` |
 | `MINIMAX_MARK_MISMATCH_RETRY_COUNT` | 本地检测到红标但模型未返回有效标记时的额外重试次数 | `1` |
+| `MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT` | 定位关联异常时的额外语义纠偏次数 | `1` |
 | `LOCAL_OCR_ENABLED` | 启用 RapidOCR 反证复核 | `true` |
 | `LOCAL_OCR_ENGINE` | RapidOCR 推理引擎 | `onnxruntime` |
 | `LOCAL_OCR_VERSION` | RapidOCR 固定版本 | `3.9.1` |
@@ -462,6 +468,7 @@ student (学生)
 | `LOCAL_OCR_CONTRADICTION_SIMILARITY_THRESHOLD` | OCR 明确匹配另一题的否决阈值 | `0.9` |
 | `LOCAL_OCR_FULL_PAGE_MAX_EDGE` | 无红标模式整页 OCR 的最长边像素数 | `1600` |
 | `LOCAL_OCR_CROP_RECHECK_LIMIT` | 单图最多补充裁图 OCR 次数 | `3` |
+| `LOCAL_OCR_MARKED_RECHECK_LIMIT` | 有红标模式歧义候选最多补充裁图 OCR 次数 | `3` |
 | `LOCAL_RED_SCAN_MAX_EDGE` | 独立本地红标扫描的最长边像素数 | `1600` |
 | `LOCAL_RED_COMPONENT_MIN_PIXELS` | 红色连通区域最少像素数 | `12` |
 | `LOCAL_RED_COMPONENT_MAX_AREA_RATIO` | 红色连通区域最大整图面积比例 | `0.08` |

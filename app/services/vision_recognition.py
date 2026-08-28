@@ -31,6 +31,7 @@ from app.services.error_mark_validation import (
     ErrorMarkImageInvalid,
     RedMarkScanResult,
     filter_valid_error_marks,
+    normalize_error_mark_groups,
     validate_localization_red_evidence,
 )
 from app.services.question_collection import collection_reason_for, collection_status_for
@@ -66,22 +67,23 @@ RECOGNITION_PROMPT = """你是小学错题内容与红色批改标记识别器�
 要求：
 1. 忽略 Date、日期栏、页码、装订线、空白横线和与错题无关的印刷页眉。
 2. 识别老师用于标识错误的红圈、红叉、红色删除线、红色波浪线、红色下划线或红色纠错批注；不要把印刷装饰色或单独的红色对勾误判为错误标记。
-3. 同一作答单元上的红圈、红叉和纠正笔迹视为同一标记组。每个标记组只输出一个 error_mark，mark_id 从 0 开始连续且唯一。
-4. error_mark.bbox 只覆盖实际可见的红色错误标记，使用归一化角点格式 [left, top, right, bottom]，满足 0 <= left < right <= 1 和 0 <= top < bottom <= 1。
-5. 题目 item 与 error_marks 必须分别识别。题目 item 不得输出 bbox，也不得预先绑定 mark_id；后续步骤会根据整图内容独立完成匹配和定位。
-6. item 的粒度必须是最小可独立作答单元，不能把整道编号大题合并成一个 item。拼音格、完整词语格组、单个填空、单个选择项或一道计算题分别视为独立作答单元。
-7. 若存在明确的红色错误标记，每个被标记的独立作答单元输出一个 item；同一道编号大题中有多个被标记的小题时，必须分别输出多个 item。同一行存在多个兄弟小题时，不得加入未标记的兄弟小题。
-8. 对于看词语写拼音、看拼音写词语等词语练习，最小可独立作答单元是完整词语格组。即使标记只覆盖单字、单音节或部分笔画，也要识别其所属完整词语；完整词语优先于红色标记的像素覆盖范围。
-9. 完整词语格组的各字段必须保持同一范围：raw_text 抄录学生对整个词语的实际作答，prompt_text 填写整个印刷提示，answer 填写整个正确答案，question_type 根据完整提示与完整作答判断。
-10. 所有字段必须从当前图片可见内容提取，不得复用提示中的示例或臆造图片中不存在的词语。
-11. 本次是有红标作业识别：只输出与可靠红色错误标记关联的最小作答单元；禁止在没有可靠红标关联时回退输出整页题目。
-12. 红色批改符号本身不要写入 raw_text；老师写出的纠正内容可作为 answer 的参考。
-13. raw_text 必须忠实抄录学生实际书写，包括错字、漏字、错误拼音和错误答案；禁止自动改正后覆盖原文。题目未作答时必须输出 "raw_text": ""，不得遗漏该字段或编造内容。
-14. instruction 必须填写图片中可见的原始练习要求；prompt_text 必须填写重新出卷时展示的干净提示材料。二者不得包含学生作答、正确答案或老师批改笔迹。
-15. question_type 只能是 write_pinyin、write_word、fill_blank、calculation、other 之一。无法确认的内容保留原样并写入 uncertain_segments。
-16. confidence 范围为 0 到 1。difficulty 必须是 1 到 5 的整数，1 表示很简单，5 表示很难。
-17. tags 只能使用中文标签，例如“拼音”“词语”“错别字”“老师批改”，不得返回 pinyin、word、teacher-marked 等英文编码。
-18. 只输出一个 JSON 对象，不要解释，不要 Markdown。
+3. 一个 error_mark 表示老师的一次判错事件；同一作答单元上的红圈、红叉和纠正笔迹视为同一标记组。同一作答单元上的邻近红×与红圈必须合并为一个 cross_circle 标记，不得分别输出；红×写入 cross_bbox，红圈写入 circle_bbox，bbox 覆盖二者联合范围。
+4. 只有红×、只有红圈或其他批改形式时不得伪造不存在的组成部分。每个判错事件只输出一个 error_mark，mark_id 从 0 开始连续且唯一。
+5. error_mark 的 bbox、cross_bbox 和 circle_bbox 使用归一化角点格式 [left, top, right, bottom]，满足 0 <= left < right <= 1 和 0 <= top < bottom <= 1。
+6. 题目 item 与 error_marks 必须分别识别。题目 item 不得输出 bbox，也不得预先绑定 mark_id；后续步骤会根据整图内容独立完成匹配和定位。
+7. item 的粒度必须是最小可独立作答单元，不能把整道编号大题合并成一个 item。拼音格、完整词语格组、单个填空、单个选择项或一道计算题分别视为独立作答单元。
+8. 若存在明确的红色错误标记，每个被标记的独立作答单元输出一个 item；同一道编号大题中有多个被标记的小题时，必须分别输出多个 item。同一行存在多个兄弟小题时，不得加入未标记的兄弟小题。
+9. 对于看词语写拼音、看拼音写词语等词语练习，最小可独立作答单元是完整词语格组。即使标记只覆盖单字、单音节或部分笔画，也要识别其所属完整词语；完整词语优先于红色标记的像素覆盖范围。
+10. 完整词语格组的各字段必须保持同一范围：raw_text 抄录学生对整个词语的实际作答，prompt_text 填写整个印刷提示，answer 填写整个正确答案，question_type 根据完整提示与完整作答判断。
+11. 所有字段必须从当前图片可见内容提取，不得复用提示中的示例或臆造图片中不存在的词语。
+12. 本次是有红标作业识别：只输出与可靠红色错误标记关联的最小作答单元；禁止在没有可靠红标关联时回退输出整页题目。
+13. 红色批改符号本身不要写入 raw_text；老师写出的纠正内容可作为 answer 的参考。
+14. raw_text 必须忠实抄录学生实际书写，包括错字、漏字、错误拼音和错误答案；禁止自动改正后覆盖原文。题目未作答时必须输出 "raw_text": ""，不得遗漏该字段或编造内容。
+15. instruction 必须填写图片中可见的原始练习要求；prompt_text 必须填写重新出卷时展示的干净提示材料。二者不得包含学生作答、正确答案或老师批改笔迹。
+16. question_type 只能是 write_pinyin、write_word、fill_blank、calculation、other 之一。无法确认的内容保留原样并写入 uncertain_segments。
+17. confidence 范围为 0 到 1。difficulty 必须是 1 到 5 的整数，1 表示很简单，5 表示很难。
+18. tags 只能使用中文标签，例如“拼音”“词语”“错别字”“老师批改”，不得返回 pinyin、word、teacher-marked 等英文编码。
+19. 只输出一个 JSON 对象，不要解释，不要 Markdown。
 
 JSON 格式：
 {{
@@ -100,12 +102,16 @@ JSON 格式：
   }}],
   "error_marks": [{{
     "mark_id": 0,
-    "mark_type": "circle|cross|deletion|underline|annotation|mixed",
+    "mark_type": "cross_circle|circle|cross|deletion|underline|annotation|mixed",
     "bbox": [0.0, 0.0, 1.0, 1.0],
+    "cross_bbox": [0.0, 0.0, 1.0, 1.0],
+    "circle_bbox": [0.0, 0.0, 1.0, 1.0],
     "confidence": 0.95
   }}],
   "ignored_text": ["被忽略的页眉"]
 }}
+
+cross_bbox 或 circle_bbox 不存在时，对应字段必须返回 null。
 
 科目提示：{subject_hint}
 """
@@ -122,7 +128,9 @@ def recognition_prompt_for(
         mode_instruction = (
             "本地红标扫描发现以下归一化候选区域："
             + json.dumps(local_red_regions[:50], ensure_ascii=False, separators=(",", ":"))
-            + "。这些区域只是定位提示，仍须按图片核验；只输出与可靠红色错误标记关联的作答单元，禁止输出整页未标记题目。"
+            + "。这些区域只是定位提示，仍须按图片核验；先识别老师的一次判错事件。"
+            + "邻近红×与红圈属于同一次批改时必须合并为一个 mark，不得分别输出；"
+            + "分别填写 cross_bbox 和 circle_bbox。只输出与可靠红色错误标记关联的作答单元，禁止输出整页未标记题目。"
         )
     else:
         mode_instruction = (
@@ -285,18 +293,21 @@ class ErrorMark(BaseModel):
     mark_type: Literal[
         "circle",
         "cross",
+        "cross_circle",
         "deletion",
         "underline",
         "annotation",
         "mixed",
     ]
     bbox: List[float]
+    cross_bbox: Optional[List[float]] = None
+    circle_bbox: Optional[List[float]] = None
     confidence: float = Field(ge=0, le=1)
 
-    @field_validator("bbox")
+    @field_validator("bbox", "cross_bbox", "circle_bbox")
     @classmethod
     def bbox_must_be_normalized(cls, value):
-        return validate_normalized_bbox(value)
+        return validate_normalized_bbox(value) if value is not None else None
 
 
 class VisionResult(BaseModel):
@@ -439,6 +450,48 @@ def mark_distance_diagnostic(
     }
 
 
+def mark_anchor_bbox(mark: ErrorMark) -> tuple[List[float], str]:
+    """Return the correction component that should anchor a question crop."""
+    if mark.mark_type == "cross_circle" and mark.circle_bbox is not None:
+        return mark.circle_bbox, "circle"
+    if mark.mark_type == "cross" and mark.cross_bbox is not None:
+        return mark.cross_bbox, "cross"
+    return mark.bbox, mark.mark_type
+
+
+def mark_anchor_diagnostic(
+    localization_bbox: List[float],
+    mark_id: int,
+    mark: ErrorMark,
+    max_gap_ratio: float,
+) -> dict:
+    anchor_bbox, anchor_type = mark_anchor_bbox(mark)
+    horizontal_gap = max(
+        localization_bbox[0] - anchor_bbox[2],
+        0.0,
+        anchor_bbox[0] - localization_bbox[2],
+    )
+    vertical_gap = max(
+        localization_bbox[1] - anchor_bbox[3],
+        0.0,
+        anchor_bbox[1] - localization_bbox[3],
+    )
+    distance = math.hypot(horizontal_gap, vertical_gap)
+    intersects = bboxes_intersect(localization_bbox, anchor_bbox)
+    return {
+        "mark_id": mark_id,
+        "mark_type": mark.mark_type,
+        "anchor_type": anchor_type,
+        "anchor_bbox": list(anchor_bbox),
+        "horizontal_gap_ratio": round(horizontal_gap, 6),
+        "vertical_gap_ratio": round(vertical_gap, 6),
+        "nearest_distance_ratio": round(distance, 6),
+        "max_gap_ratio": max_gap_ratio,
+        "intersects_question_bbox": intersects,
+        "accepted": intersects or distance <= max_gap_ratio,
+    }
+
+
 def nearest_red_region_diagnostic(
     localization_bbox: List[float],
     red_regions,
@@ -542,12 +595,16 @@ def localization_passes_geometry(
     marks: dict[int, ErrorMark],
     max_area_ratio: float,
     allow_unassigned_marks: bool = False,
+    anchor_max_gap_ratio: float = 0.0,
+    cross_only_max_gap_ratio: float = 0.0,
 ) -> bool:
     return localization_geometry_diagnostic(
         localization,
         marks=marks,
         max_area_ratio=max_area_ratio,
         allow_unassigned_marks=allow_unassigned_marks,
+        anchor_max_gap_ratio=anchor_max_gap_ratio,
+        cross_only_max_gap_ratio=cross_only_max_gap_ratio,
     )["passed"]
 
 
@@ -556,6 +613,8 @@ def localization_geometry_diagnostic(
     marks: dict[int, ErrorMark],
     max_area_ratio: float,
     allow_unassigned_marks: bool = False,
+    anchor_max_gap_ratio: float = 0.0,
+    cross_only_max_gap_ratio: float = 0.0,
 ) -> dict:
     """Explain geometry rejection without exposing recognized worksheet text."""
     failure_reasons = []
@@ -574,26 +633,64 @@ def localization_geometry_diagnostic(
     ]
     if missing_mark_ids:
         failure_reasons.append("unknown_mark_ids")
-    outside_mark_ids = [
-        mark_id
-        for mark_id in localization.mark_ids
-        if localization.bbox is not None
-        and mark_id in marks
-        and not bbox_contains_center(localization.bbox, marks[mark_id].bbox)
-    ]
+    use_tiered_anchors = anchor_max_gap_ratio > 0 or cross_only_max_gap_ratio > 0
+    anchor_diagnostics = []
+    if localization.bbox is not None and use_tiered_anchors:
+        for mark_id in localization.mark_ids:
+            if mark_id not in marks:
+                continue
+            mark = marks[mark_id]
+            max_gap_ratio = (
+                cross_only_max_gap_ratio
+                if mark.mark_type == "cross"
+                else anchor_max_gap_ratio
+            )
+            anchor_diagnostics.append(
+                mark_anchor_diagnostic(
+                    localization.bbox,
+                    mark_id,
+                    mark,
+                    max_gap_ratio,
+                )
+            )
+        outside_mark_ids = [
+            diagnostic["mark_id"]
+            for diagnostic in anchor_diagnostics
+            if not diagnostic["accepted"]
+        ]
+    else:
+        outside_mark_ids = [
+            mark_id
+            for mark_id in localization.mark_ids
+            if localization.bbox is not None
+            and mark_id in marks
+            and not bbox_contains_center(localization.bbox, marks[mark_id].bbox)
+        ]
     if outside_mark_ids:
-        failure_reasons.append("mark_center_outside_bbox")
-    outside_mark_diagnostics = [
-        mark_distance_diagnostic(
-            localization.bbox,
-            mark_id,
-            marks[mark_id].bbox,
+        failure_reasons.append(
+            "mark_anchor_too_far"
+            if use_tiered_anchors
+            else "mark_center_outside_bbox"
         )
-        for mark_id in outside_mark_ids
-        if localization.bbox is not None
-    ]
+    outside_mark_diagnostics = (
+        [
+            diagnostic
+            for diagnostic in anchor_diagnostics
+            if not diagnostic["accepted"]
+        ]
+        if use_tiered_anchors
+        else [
+            mark_distance_diagnostic(
+                localization.bbox,
+                mark_id,
+                marks[mark_id].bbox,
+            )
+            for mark_id in outside_mark_ids
+            if localization.bbox is not None
+        ]
+    )
 
-    return {
+    diagnostic = {
         "passed": not failure_reasons,
         "bbox_area_ratio": round(area_ratio, 6) if area_ratio is not None else None,
         "max_area_ratio": max_area_ratio,
@@ -603,6 +700,9 @@ def localization_geometry_diagnostic(
         "outside_mark_diagnostics": outside_mark_diagnostics,
         "failure_reasons": failure_reasons,
     }
+    if use_tiered_anchors:
+        diagnostic["anchor_diagnostics"] = anchor_diagnostics
+    return diagnostic
 
 
 def _normalized_evidence_text(value: Optional[str]) -> str:
@@ -627,6 +727,115 @@ def localization_matches_evidence(
     )
 
 
+def repair_unique_mark_assignments(
+    localizations: dict[int, LocalizationItem],
+    marks: dict[int, ErrorMark],
+    items: List[VisionItem],
+    *,
+    localization_threshold: float,
+    max_area_ratio: float,
+    anchor_max_gap_ratio: float,
+    cross_only_max_gap_ratio: float,
+) -> tuple[dict[int, LocalizationItem], List[dict]]:
+    """Assign an unused correction event only when both sides have one best match."""
+    repaired = dict(localizations)
+    assigned_mark_ids = {
+        mark_id
+        for localization in localizations.values()
+        for mark_id in localization.mark_ids
+    }
+    eligible_localizations = {
+        index: localization
+        for index, localization in localizations.items()
+        if 0 <= index < len(items)
+        and localization.matched
+        and localization.bbox is not None
+        and not localization.mark_ids
+        and localization.confidence >= localization_threshold
+        and bbox_area(localization.bbox) <= max_area_ratio
+        and localization_matches_evidence(localization, items[index])
+    }
+    available_marks = {
+        mark_id: mark
+        for mark_id, mark in marks.items()
+        if mark_id not in assigned_mark_ids
+    }
+
+    edges = []
+    for index, localization in eligible_localizations.items():
+        for mark_id, mark in available_marks.items():
+            max_gap_ratio = (
+                cross_only_max_gap_ratio
+                if mark.mark_type == "cross"
+                else anchor_max_gap_ratio
+            )
+            diagnostic = mark_anchor_diagnostic(
+                localization.bbox,
+                mark_id,
+                mark,
+                max_gap_ratio,
+            )
+            if diagnostic["accepted"]:
+                edges.append(
+                    (
+                        diagnostic["nearest_distance_ratio"],
+                        index,
+                        mark_id,
+                        diagnostic,
+                    )
+                )
+
+    def unique_best(candidates, identity_position):
+        if not candidates:
+            return None
+        ordered = sorted(candidates, key=lambda candidate: (candidate[0], candidate[identity_position]))
+        if len(ordered) > 1 and math.isclose(
+            ordered[0][0],
+            ordered[1][0],
+            abs_tol=1e-9,
+        ):
+            return None
+        return ordered[0]
+
+    best_by_index = {
+        index: unique_best(
+            [edge for edge in edges if edge[1] == index],
+            2,
+        )
+        for index in eligible_localizations
+    }
+    best_by_mark = {
+        mark_id: unique_best(
+            [edge for edge in edges if edge[2] == mark_id],
+            1,
+        )
+        for mark_id in available_marks
+    }
+
+    repair_diagnostics = []
+    for index in sorted(best_by_index):
+        edge = best_by_index[index]
+        if edge is None:
+            continue
+        _, _, mark_id, anchor_diagnostic = edge
+        reverse_edge = best_by_mark.get(mark_id)
+        if reverse_edge is None or reverse_edge[1] != index:
+            continue
+        repaired[index] = repaired[index].model_copy(update={"mark_ids": [mark_id]})
+        repair_diagnostics.append(
+            {
+                "index": index,
+                "mark_id": mark_id,
+                "assignment_source": "deterministic",
+                "anchor_type": anchor_diagnostic["anchor_type"],
+                "nearest_distance_ratio": anchor_diagnostic[
+                    "nearest_distance_ratio"
+                ],
+            }
+        )
+    return repaired, repair_diagnostics
+
+
 def build_question_values(
     item: VisionItem,
     index: int,
@@ -638,6 +847,9 @@ def build_question_values(
     normalized_tags: List[str],
     crop_context_padding_ratio: float = 0.0,
     localization_red_verified: bool = False,
+    anchor_max_gap_ratio: float = 0.0,
+    cross_only_max_gap_ratio: float = 0.0,
+    circle_only_requires_review: bool = False,
 ) -> dict:
     """Map a validated vision item to the existing question persistence contract."""
     localization_present = localization is not None
@@ -652,6 +864,8 @@ def build_question_values(
             marks=marks,
             max_area_ratio=localization_max_area_ratio,
             allow_unassigned_marks=localization_red_verified,
+            anchor_max_gap_ratio=anchor_max_gap_ratio,
+            cross_only_max_gap_ratio=cross_only_max_gap_ratio,
         )
         if localization is not None
         else None
@@ -661,6 +875,14 @@ def build_question_values(
     )
     localization_text_evidence_passed = bool(
         localization and localization_matches_evidence(localization, item)
+    )
+    assigned_marks = [
+        marks[mark_id]
+        for mark_id in (localization.mark_ids if localization else [])
+        if mark_id in marks
+    ]
+    circle_only_evidence = circle_only_requires_review and bool(assigned_marks) and all(
+        mark.mark_type == "circle" for mark in assigned_marks
     )
     localization_verified = (
         localization_present
@@ -674,6 +896,7 @@ def build_question_values(
         item.confidence < confidence_threshold
         or bool(item.uncertain_segments)
         or not localization_verified
+        or circle_only_evidence
     )
     crop_region = {
         "bbox_source": "unverified",
@@ -744,6 +967,7 @@ def build_question_values(
         "geometry_passed": localization_geometry_passed,
         "text_evidence_passed": localization_text_evidence_passed,
         "local_red_verified": localization_red_verified,
+        "circle_only_evidence": circle_only_evidence,
         "verified": localization_verified,
         "geometry": geometry_diagnostic,
     }
@@ -773,6 +997,68 @@ def _recognize_with_mode(
     return client.recognize(image_path, **kwargs)
 
 
+def _localize_with_correction(
+    client,
+    image_path: str,
+    items: List[VisionItem],
+    marks: List[ErrorMark],
+    correction: Optional[dict] = None,
+) -> LocalizationResult:
+    supported = inspect.signature(client.localize).parameters
+    kwargs = {"correction": correction} if "correction" in supported else {}
+    return client.localize(image_path, items, marks, **kwargs)
+
+
+def localization_semantic_diagnostic(
+    localizations: dict[int, LocalizationItem],
+    marks: dict[int, ErrorMark],
+    *,
+    max_area_ratio: float,
+    anchor_max_gap_ratio: float,
+    cross_only_max_gap_ratio: float,
+) -> dict:
+    reason_counts: dict[str, int] = {}
+    failed_items = []
+    passed_count = 0
+    for index, localization in sorted(localizations.items()):
+        diagnostic = localization_geometry_diagnostic(
+            localization,
+            marks,
+            max_area_ratio,
+            anchor_max_gap_ratio=anchor_max_gap_ratio,
+            cross_only_max_gap_ratio=cross_only_max_gap_ratio,
+        )
+        if diagnostic["passed"]:
+            passed_count += 1
+            continue
+        for reason in diagnostic["failure_reasons"]:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        failed_items.append(
+            {
+                "index": index,
+                "mark_ids": list(localization.mark_ids),
+                "failure_reasons": list(diagnostic["failure_reasons"]),
+            }
+        )
+    assigned_mark_ids = sorted(
+        {
+            mark_id
+            for localization in localizations.values()
+            for mark_id in localization.mark_ids
+            if mark_id in marks
+        }
+    )
+    unassigned_mark_ids = sorted(set(marks) - set(assigned_mark_ids))
+    if unassigned_mark_ids:
+        reason_counts["unassigned_marks"] = len(unassigned_mark_ids)
+    return {
+        "reason_counts": reason_counts,
+        "failed_items": failed_items,
+        "unassigned_mark_ids": unassigned_mark_ids,
+        "quality": (passed_count, len(assigned_mark_ids)),
+    }
+
+
 def recognize_question_batch(
     client,
     image_path: str,
@@ -792,6 +1078,13 @@ def recognize_question_batch(
     ocr_full_page_max_edge: int = 1600,
     ocr_crop_recheck_limit: int = 3,
     force_mode: Optional[Literal["marked", "unmarked"]] = None,
+    correction_group_enabled: bool = True,
+    pair_max_distance_ratio: float = 0.12,
+    dedup_iou_threshold: float = 0.8,
+    anchor_max_gap_ratio: float = 0.0,
+    cross_only_max_gap_ratio: float = 0.0,
+    semantic_retry_count: int = 0,
+    marked_ocr_recheck_limit: int = 0,
 ) -> tuple[VisionResult, List[dict]]:
     """Recognize, localize, and apply adaptive local evidence policy."""
     legacy_mode = local_red_scan is None
@@ -801,6 +1094,13 @@ def recognize_question_batch(
         list(region.bbox) for region in (local_red_scan.regions if local_red_scan else [])
     ]
 
+    correction_group_validation = {
+        "raw_mark_count": 0,
+        "correction_group_count": 0,
+        "paired_group_count": 0,
+        "single_mark_group_count": 0,
+        "deduplicated_mark_count": 0,
+    }
     for attempt in range(mark_mismatch_retry_count + 1):
         result = _recognize_with_mode(
             client,
@@ -822,6 +1122,24 @@ def recognize_question_batch(
             valid_marks = []
             rejected_mark_ids = [mark.mark_id for mark in result.error_marks]
             mark_diagnostics = []
+        if correction_group_enabled:
+            valid_marks, correction_group_validation = normalize_error_mark_groups(
+                valid_marks,
+                dedup_iou_threshold=dedup_iou_threshold,
+                pair_max_distance_ratio=pair_max_distance_ratio,
+            )
+        else:
+            correction_group_validation = {
+                "raw_mark_count": len(valid_marks),
+                "correction_group_count": len(valid_marks),
+                "paired_group_count": sum(
+                    mark.mark_type == "cross_circle" for mark in valid_marks
+                ),
+                "single_mark_group_count": sum(
+                    mark.mark_type != "cross_circle" for mark in valid_marks
+                ),
+                "deduplicated_mark_count": 0,
+            }
         if mode != "marked" or valid_marks or not scan_detected:
             break
         if attempt == mark_mismatch_retry_count:
@@ -842,6 +1160,7 @@ def recognize_question_batch(
     marks_by_id = {mark.mark_id: mark for mark in valid_marks}
 
     localizations = {}
+    assignment_sources: dict[int, str] = {}
     localization_batch_validation = {
         "status": "skipped",
         "error_code": None,
@@ -858,6 +1177,10 @@ def recognize_question_batch(
         "unassigned_mark_ids": [],
         "unassigned_mark_count": 0,
         "missing_mark_diagnostics": [],
+        "assignment_diagnostics": [],
+        "semantic_retry_attempts": 0,
+        "semantic_retry_reason_counts": {},
+        "marked_ocr_recheck_count": 0,
     }
     try:
         if (
@@ -865,7 +1188,8 @@ def recognize_question_batch(
             or not result.error_marks
             or valid_marks
         ):
-            localization_result = client.localize(
+            localization_result = _localize_with_correction(
+                client,
                 image_path,
                 result.items,
                 valid_marks,
@@ -878,6 +1202,118 @@ def recognize_question_batch(
                 item_count=len(result.items),
                 marks=marks_by_id,
             )
+            assignment_sources = {
+                index: "model"
+                for index, localization in localizations.items()
+                if localization.mark_ids
+            }
+            if correction_group_enabled:
+                localizations, assignment_diagnostics = (
+                    repair_unique_mark_assignments(
+                        localizations,
+                        marks_by_id,
+                        result.items,
+                        localization_threshold=localization_threshold,
+                        max_area_ratio=localization_max_area_ratio,
+                        anchor_max_gap_ratio=anchor_max_gap_ratio,
+                        cross_only_max_gap_ratio=cross_only_max_gap_ratio,
+                    )
+                )
+                localization_batch_validation["assignment_diagnostics"] = (
+                    assignment_diagnostics
+                )
+                assignment_sources.update(
+                    {
+                        diagnostic["index"]: "deterministic"
+                        for diagnostic in assignment_diagnostics
+                    }
+                )
+            semantic_diagnostic = localization_semantic_diagnostic(
+                localizations,
+                marks_by_id,
+                max_area_ratio=localization_max_area_ratio,
+                anchor_max_gap_ratio=anchor_max_gap_ratio,
+                cross_only_max_gap_ratio=cross_only_max_gap_ratio,
+            )
+            localization_batch_validation["semantic_retry_reason_counts"] = dict(
+                semantic_diagnostic["reason_counts"]
+            )
+            for _retry_index in range(
+                semantic_retry_count if correction_group_enabled else 0
+            ):
+                if not semantic_diagnostic["reason_counts"]:
+                    break
+                correction = {
+                    "reason_counts": semantic_diagnostic["reason_counts"],
+                    "failed_items": semantic_diagnostic["failed_items"],
+                    "unassigned_mark_ids": semantic_diagnostic[
+                        "unassigned_mark_ids"
+                    ],
+                    "correction_events": [
+                        {
+                            "mark_id": mark.mark_id,
+                            "mark_type": mark.mark_type,
+                            "bbox": mark.bbox,
+                            "cross_bbox": mark.cross_bbox,
+                            "circle_bbox": mark.circle_bbox,
+                        }
+                        for mark in valid_marks
+                    ],
+                }
+                localization_batch_validation["semantic_retry_attempts"] += 1
+                try:
+                    retry_result = _localize_with_correction(
+                        client,
+                        image_path,
+                        result.items,
+                        valid_marks,
+                        correction,
+                    )
+                    retry_localizations = validated_localizations(
+                        retry_result,
+                        item_count=len(result.items),
+                        marks=marks_by_id,
+                    )
+                    retry_localizations, _retry_assignments = (
+                        repair_unique_mark_assignments(
+                            retry_localizations,
+                            marks_by_id,
+                            result.items,
+                            localization_threshold=localization_threshold,
+                            max_area_ratio=localization_max_area_ratio,
+                            anchor_max_gap_ratio=anchor_max_gap_ratio,
+                            cross_only_max_gap_ratio=cross_only_max_gap_ratio,
+                        )
+                    )
+                    retry_diagnostic = localization_semantic_diagnostic(
+                        retry_localizations,
+                        marks_by_id,
+                        max_area_ratio=localization_max_area_ratio,
+                        anchor_max_gap_ratio=anchor_max_gap_ratio,
+                        cross_only_max_gap_ratio=cross_only_max_gap_ratio,
+                    )
+                except VisionRecognitionError:
+                    break
+                if retry_diagnostic["quality"] > semantic_diagnostic["quality"]:
+                    localizations = retry_localizations
+                    semantic_diagnostic = retry_diagnostic
+                    assignment_sources = {
+                        index: "semantic_retry"
+                        for index, localization in localizations.items()
+                        if localization.mark_ids
+                    }
+                    localization_batch_validation["returned_count"] = len(
+                        retry_result.items
+                    )
+                    localization_batch_validation["assignment_diagnostics"] = [
+                        {
+                            "index": index,
+                            "mark_ids": list(localization.mark_ids),
+                            "assignment_source": "semantic_retry",
+                        }
+                        for index, localization in sorted(localizations.items())
+                        if localization.mark_ids
+                    ]
             localization_batch_validation["status"] = "validated"
             localization_batch_validation["validated_count"] = len(localizations)
             assigned_mark_ids = sorted(
@@ -952,6 +1388,13 @@ def recognize_question_batch(
             ),
             crop_context_padding_ratio=crop_context_padding_ratio,
             localization_red_verified=localization_red_verified,
+            anchor_max_gap_ratio=(
+                anchor_max_gap_ratio if correction_group_enabled else 0.0
+            ),
+            cross_only_max_gap_ratio=(
+                cross_only_max_gap_ratio if correction_group_enabled else 0.0
+            ),
+            circle_only_requires_review=correction_group_enabled,
         )
         question_values["ocr_raw_json"].update(
             {
@@ -959,6 +1402,7 @@ def recognize_question_batch(
                     mark.model_dump(mode="json") for mark in result.error_marks
                 ],
                 "error_mark_validation": mark_diagnostics,
+                "correction_group_validation": correction_group_validation,
                 "valid_error_mark_ids": [mark.mark_id for mark in valid_marks],
                 "rejected_error_mark_ids": rejected_mark_ids,
                 "localization": (
@@ -968,6 +1412,7 @@ def recognize_question_batch(
                 ),
                 "localization_red_validation": localization_red_validation,
                 "recognition_mode": mode,
+                "assignment_source": assignment_sources.get(index),
             }
         )
         values.append(question_values)
@@ -1021,6 +1466,22 @@ def recognize_question_batch(
                 items=result.items,
             )
 
+    deterministic_rescue_indexes = {
+        diagnostic["index"]
+        for diagnostic in sorted(
+            (
+                diagnostic
+                for diagnostic in localization_batch_validation[
+                    "assignment_diagnostics"
+                ]
+                if diagnostic.get("assignment_source") == "deterministic"
+            ),
+            key=lambda diagnostic: (
+                diagnostic.get("nearest_distance_ratio", 1.0),
+                diagnostic["index"],
+            ),
+        )[:marked_ocr_recheck_limit]
+    }
     for index, question_values in enumerate(values):
         reliable_mark = question_values["ocr_raw_json"]["reliable_error_mark"]
         localization = localizations.get(index)
@@ -1030,7 +1491,16 @@ def recognize_question_batch(
             and question_values["crop_region"].get("bbox") is not None
             else None
         )
-        if mode == "marked" and reliable_mark and proposed_bbox is not None:
+        assignment_source = question_values["ocr_raw_json"]["assignment_source"]
+        should_run_marked_ocr = assignment_source != "deterministic" or (
+            index in deterministic_rescue_indexes
+        )
+        if (
+            mode == "marked"
+            and reliable_mark
+            and proposed_bbox is not None
+            and should_run_marked_ocr
+        ):
             verify_crop = getattr(ocr_verifier, "verify_crop", ocr_verifier.verify)
             verifications[index] = verify_crop(
                 image_path,
@@ -1038,6 +1508,8 @@ def recognize_question_batch(
                 target_index=index,
                 items=result.items,
             )
+            if assignment_source == "deterministic":
+                localization_batch_validation["marked_ocr_recheck_count"] += 1
         elif mode == "unmarked" and not hasattr(ocr_verifier, "recognize_page") and proposed_bbox:
             verifications[index] = ocr_verifier.verify(
                 image_path,
@@ -1458,6 +1930,7 @@ class MiniMaxVisionClient:
         image_path: str,
         items: List[VisionItem],
         error_marks: List[ErrorMark],
+        correction: Optional[dict] = None,
     ) -> LocalizationResult:
         diagnostic = {
             "operation": "localization",
@@ -1495,6 +1968,13 @@ class MiniMaxVisionClient:
                 indent=2,
             ),
         )
+        if correction:
+            prompt += (
+                "\n\n定位纠偏：上一次定位存在下列结构或几何问题。"
+                "请重新观察整张图片，修正标记归属与完整题目 bbox；"
+                "仍须让每个 index 恰好返回一次，不得只返回失败子集。\n"
+                + json.dumps(correction, ensure_ascii=False, separators=(",", ":"))
+            )
         return self._request(
             {"prompt": prompt, "image_url": image_url},
             LocalizationResult,

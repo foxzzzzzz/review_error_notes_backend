@@ -54,7 +54,11 @@ def _client(handler):
 
 
 def test_localization_prompt_defines_the_complete_independent_unit():
-    from app.services.vision_recognition import LOCALIZATION_PROMPT, RECOGNITION_PROMPT
+    from app.services.vision_recognition import (
+        LOCALIZATION_PROMPT,
+        RECOGNITION_PROMPT,
+        recognition_prompt_for,
+    )
 
     assert "印刷提示、学生答案和相关红色批改标记" in LOCALIZATION_PROMPT
     assert "未标记的相邻兄弟小题" in LOCALIZATION_PROMPT
@@ -64,6 +68,27 @@ def test_localization_prompt_defines_the_complete_independent_unit():
     assert "recognition_bbox" not in LOCALIZATION_PROMPT
     assert "保持重叠" not in LOCALIZATION_PROMPT
     assert "tags 只能使用中文标签" in RECOGNITION_PROMPT
+    marked_prompt = recognition_prompt_for("marked", "chinese", [])
+    assert "一次判错事件" in marked_prompt
+    assert "cross_bbox" in marked_prompt
+    assert "circle_bbox" in marked_prompt
+    assert "不得分别输出" in marked_prompt
+
+
+def test_error_mark_accepts_cross_circle_components():
+    from app.services.vision_recognition import ErrorMark
+
+    mark = ErrorMark(
+        mark_id=0,
+        mark_type="cross_circle",
+        bbox=[0.1, 0.1, 0.4, 0.4],
+        cross_bbox=[0.3, 0.1, 0.4, 0.2],
+        circle_bbox=[0.1, 0.2, 0.35, 0.4],
+        confidence=0.95,
+    )
+
+    assert mark.cross_bbox == [0.3, 0.1, 0.4, 0.2]
+    assert mark.circle_bbox == [0.1, 0.2, 0.35, 0.4]
 
 
 def test_localize_sends_all_recognized_indexes_in_one_request(tmp_path):
@@ -387,6 +412,237 @@ def test_geometry_diagnostic_distinguishes_area_and_mark_center_failures():
         ],
         "failure_reasons": ["mark_center_outside_bbox"],
     }
+
+
+def test_cross_circle_uses_circle_as_question_anchor():
+    from app.services.vision_recognition import (
+        ErrorMark,
+        LocalizationItem,
+        localization_geometry_diagnostic,
+    )
+
+    localization = LocalizationItem(
+        index=0,
+        matched=True,
+        mark_ids=[0],
+        bbox=[0.2, 0.3, 0.5, 0.5],
+        observed_prompt_text="词语",
+        observed_raw_text="作答",
+        confidence=0.95,
+    )
+    mark = ErrorMark(
+        mark_id=0,
+        mark_type="cross_circle",
+        bbox=[0.22, 0.2, 0.48, 0.48],
+        cross_bbox=[0.4, 0.2, 0.48, 0.28],
+        circle_bbox=[0.22, 0.3, 0.46, 0.48],
+        confidence=0.95,
+    )
+
+    diagnostic = localization_geometry_diagnostic(
+        localization,
+        marks={0: mark},
+        max_area_ratio=0.35,
+        anchor_max_gap_ratio=0.08,
+        cross_only_max_gap_ratio=0.08,
+    )
+
+    assert diagnostic["passed"] is True
+    assert diagnostic["anchor_diagnostics"][0]["anchor_type"] == "circle"
+    assert diagnostic["anchor_diagnostics"][0]["intersects_question_bbox"] is True
+
+
+@pytest.mark.parametrize(
+    ("bbox", "expected"),
+    [
+        ([0.54, 0.3, 0.58, 0.36], True),
+        ([0.68, 0.3, 0.72, 0.36], False),
+    ],
+)
+def test_cross_only_uses_bounded_distance(bbox, expected):
+    from app.services.vision_recognition import (
+        ErrorMark,
+        LocalizationItem,
+        localization_geometry_diagnostic,
+    )
+
+    localization = LocalizationItem(
+        index=0,
+        matched=True,
+        mark_ids=[0],
+        bbox=[0.2, 0.3, 0.5, 0.5],
+        observed_prompt_text="词语",
+        observed_raw_text="作答",
+        confidence=0.95,
+    )
+    mark = ErrorMark(
+        mark_id=0,
+        mark_type="cross",
+        bbox=bbox,
+        confidence=0.95,
+    )
+
+    diagnostic = localization_geometry_diagnostic(
+        localization,
+        marks={0: mark},
+        max_area_ratio=0.35,
+        anchor_max_gap_ratio=0.08,
+        cross_only_max_gap_ratio=0.08,
+    )
+
+    assert diagnostic["passed"] is expected
+
+
+def test_repairs_unique_missing_mark_assignment_with_circle_anchor():
+    from app.services.vision_recognition import (
+        ErrorMark,
+        LocalizationItem,
+        repair_unique_mark_assignments,
+    )
+
+    items = [
+        _vision_item("甲", "第一题", "write_word"),
+        _vision_item("乙", "第二题", "write_word"),
+    ]
+    localizations = {
+        0: LocalizationItem(
+            index=0,
+            matched=True,
+            mark_ids=[],
+            bbox=[0.05, 0.1, 0.35, 0.3],
+            observed_prompt_text="第一题",
+            observed_raw_text="甲",
+            confidence=0.95,
+        ),
+        1: LocalizationItem(
+            index=1,
+            matched=True,
+            mark_ids=[],
+            bbox=[0.55, 0.1, 0.85, 0.3],
+            observed_prompt_text="第二题",
+            observed_raw_text="乙",
+            confidence=0.95,
+        ),
+    }
+    mark = ErrorMark(
+        mark_id=0,
+        mark_type="cross_circle",
+        bbox=[0.6, 0.05, 0.82, 0.28],
+        cross_bbox=[0.75, 0.05, 0.82, 0.12],
+        circle_bbox=[0.6, 0.12, 0.8, 0.28],
+        confidence=0.96,
+    )
+
+    repaired, diagnostics = repair_unique_mark_assignments(
+        localizations,
+        {0: mark},
+        items,
+        localization_threshold=0.8,
+        max_area_ratio=0.35,
+        anchor_max_gap_ratio=0.08,
+        cross_only_max_gap_ratio=0.08,
+    )
+
+    assert repaired[0].mark_ids == []
+    assert repaired[1].mark_ids == [0]
+    assert diagnostics == [
+        {
+            "index": 1,
+            "mark_id": 0,
+            "assignment_source": "deterministic",
+            "anchor_type": "circle",
+            "nearest_distance_ratio": 0.0,
+        }
+    ]
+
+
+def test_does_not_repair_ambiguous_or_already_assigned_marks():
+    from app.services.vision_recognition import (
+        LocalizationItem,
+        repair_unique_mark_assignments,
+    )
+
+    items = [
+        _vision_item("甲", "第一题", "write_word"),
+        _vision_item("乙", "第二题", "write_word"),
+    ]
+    ambiguous = {
+        0: LocalizationItem(
+            index=0,
+            matched=True,
+            mark_ids=[],
+            bbox=[0.1, 0.1, 0.4, 0.3],
+            observed_prompt_text="第一题",
+            observed_raw_text="甲",
+            confidence=0.95,
+        ),
+        1: LocalizationItem(
+            index=1,
+            matched=True,
+            mark_ids=[],
+            bbox=[0.6, 0.1, 0.9, 0.3],
+            observed_prompt_text="第二题",
+            observed_raw_text="乙",
+            confidence=0.95,
+        ),
+    }
+    centered_mark = _error_mark(0, [0.48, 0.15, 0.52, 0.25])
+
+    repaired, diagnostics = repair_unique_mark_assignments(
+        ambiguous,
+        {0: centered_mark},
+        items,
+        localization_threshold=0.8,
+        max_area_ratio=0.35,
+        anchor_max_gap_ratio=0.08,
+        cross_only_max_gap_ratio=0.08,
+    )
+    assert all(not localization.mark_ids for localization in repaired.values())
+    assert diagnostics == []
+
+    occupied = dict(ambiguous)
+    occupied[0] = occupied[0].model_copy(update={"mark_ids": [0]})
+    repaired, diagnostics = repair_unique_mark_assignments(
+        occupied,
+        {0: centered_mark},
+        items,
+        localization_threshold=0.8,
+        max_area_ratio=0.35,
+        anchor_max_gap_ratio=0.08,
+        cross_only_max_gap_ratio=0.08,
+    )
+    assert repaired[1].mark_ids == []
+    assert diagnostics == []
+
+
+def test_does_not_repair_far_missing_mark():
+    from app.services.vision_recognition import (
+        LocalizationItem,
+        repair_unique_mark_assignments,
+    )
+
+    item = _vision_item("甲", "第一题", "write_word")
+    localization = LocalizationItem(
+        index=0,
+        matched=True,
+        mark_ids=[],
+        bbox=[0.1, 0.1, 0.3, 0.3],
+        observed_prompt_text="第一题",
+        observed_raw_text="甲",
+        confidence=0.95,
+    )
+
+    repaired, diagnostics = repair_unique_mark_assignments(
+        {0: localization},
+        {0: _error_mark(0, [0.7, 0.7, 0.8, 0.8])},
+        [item],
+        localization_threshold=0.8,
+        max_area_ratio=0.35,
+        anchor_max_gap_ratio=0.08,
+        cross_only_max_gap_ratio=0.08,
+    )
+    assert repaired[0].mark_ids == []
+    assert diagnostics == []
 
 
 def test_geometry_diagnostic_reports_missing_and_unknown_mark_ids():

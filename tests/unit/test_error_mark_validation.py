@@ -94,6 +94,133 @@ def test_rejects_white_region_and_low_confidence_mark(tmp_path):
     assert rejected == [0, 1]
 
 
+def test_cross_circle_requires_red_pixels_in_both_components(tmp_path):
+    from app.services.error_mark_validation import filter_valid_error_marks
+
+    image_path = tmp_path / "cross-circle.png"
+    image = Image.new("RGB", (100, 100), "white")
+    draw = ImageDraw.Draw(image)
+    draw.line((55, 10, 65, 20), fill=(220, 20, 20), width=3)
+    draw.line((65, 10, 55, 20), fill=(220, 20, 20), width=3)
+    draw.ellipse((20, 25, 70, 70), outline=(220, 20, 20), width=4)
+    image.save(image_path)
+    mark = ErrorMark(
+        mark_id=0,
+        mark_type="cross_circle",
+        bbox=[0.2, 0.1, 0.7, 0.7],
+        cross_bbox=[0.54, 0.09, 0.66, 0.21],
+        circle_bbox=[0.19, 0.24, 0.71, 0.71],
+        confidence=0.95,
+    )
+
+    valid, rejected, diagnostics = filter_valid_error_marks(
+        str(image_path),
+        [mark],
+        confidence_threshold=0.85,
+        red_pixel_min_ratio=0.005,
+        expansion_ratio=0.02,
+    )
+
+    assert [item.mark_id for item in valid] == [0]
+    assert rejected == []
+    assert diagnostics[0]["component_validation"]["cross"]["accepted"] is True
+    assert diagnostics[0]["component_validation"]["circle"]["accepted"] is True
+
+
+def test_cross_circle_is_rejected_when_circle_component_has_no_red_pixels(tmp_path):
+    from app.services.error_mark_validation import filter_valid_error_marks
+
+    image_path = tmp_path / "cross-without-circle.png"
+    image = Image.new("RGB", (100, 100), "white")
+    draw = ImageDraw.Draw(image)
+    draw.line((55, 10, 65, 20), fill=(220, 20, 20), width=3)
+    draw.line((65, 10, 55, 20), fill=(220, 20, 20), width=3)
+    image.save(image_path)
+    mark = ErrorMark(
+        mark_id=0,
+        mark_type="cross_circle",
+        bbox=[0.2, 0.1, 0.7, 0.7],
+        cross_bbox=[0.54, 0.09, 0.66, 0.21],
+        circle_bbox=[0.19, 0.24, 0.71, 0.71],
+        confidence=0.95,
+    )
+
+    valid, rejected, diagnostics = filter_valid_error_marks(
+        str(image_path),
+        [mark],
+        confidence_threshold=0.85,
+        red_pixel_min_ratio=0.005,
+        expansion_ratio=0.02,
+    )
+
+    assert valid == []
+    assert rejected == [0]
+    assert diagnostics[0]["reason"] == "invalid_component_pixels"
+    assert diagnostics[0]["component_validation"]["cross"]["accepted"] is True
+    assert diagnostics[0]["component_validation"]["circle"]["accepted"] is False
+
+
+def test_normalize_error_mark_groups_deduplicates_overlapping_marks():
+    from app.services.error_mark_validation import normalize_error_mark_groups
+
+    marks = [
+        _mark([0.2, 0.2, 0.5, 0.5]),
+        _mark([0.2, 0.2, 0.5, 0.5]).model_copy(update={"mark_id": 1}),
+        _mark([0.28, 0.28, 0.34, 0.34]).model_copy(update={"mark_id": 2}),
+    ]
+
+    groups, diagnostic = normalize_error_mark_groups(
+        marks,
+        dedup_iou_threshold=0.8,
+        pair_max_distance_ratio=0.12,
+    )
+
+    assert [group.mark_id for group in groups] == [0]
+    assert diagnostic == {
+        "raw_mark_count": 3,
+        "correction_group_count": 1,
+        "paired_group_count": 0,
+        "single_mark_group_count": 1,
+        "deduplicated_mark_count": 2,
+    }
+
+
+def test_normalize_error_mark_groups_does_not_force_ambiguous_pair():
+    from app.services.error_mark_validation import normalize_error_mark_groups
+
+    marks = [
+        ErrorMark(
+            mark_id=0,
+            mark_type="cross",
+            bbox=[0.2, 0.2, 0.25, 0.25],
+            confidence=0.95,
+        ),
+        ErrorMark(
+            mark_id=1,
+            mark_type="cross",
+            bbox=[0.35, 0.2, 0.4, 0.25],
+            confidence=0.95,
+        ),
+        ErrorMark(
+            mark_id=2,
+            mark_type="circle",
+            bbox=[0.27, 0.2, 0.33, 0.25],
+            confidence=0.95,
+        ),
+    ]
+
+    groups, diagnostic = normalize_error_mark_groups(
+        marks,
+        dedup_iou_threshold=0.8,
+        pair_max_distance_ratio=0.12,
+    )
+
+    assert [group.mark_type for group in groups] == ["cross", "cross", "circle"]
+    assert [group.mark_id for group in groups] == [0, 1, 2]
+    assert diagnostic["paired_group_count"] == 0
+    assert diagnostic["single_mark_group_count"] == 3
+
+
 def test_expanded_mark_at_image_edge_is_clipped(tmp_path):
     from app.services.error_mark_validation import filter_valid_error_marks
 

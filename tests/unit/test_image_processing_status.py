@@ -53,6 +53,46 @@ def test_processing_failure_preserves_a_safe_recognition_error_category():
     )
 
 
+def test_mark_validation_log_uses_safe_group_and_localization_diagnostics(caplog):
+    from app.tasks.process_image import log_mark_validation_diagnostics
+
+    values = [
+        {
+            "ocr_raw_json": {
+                "raw_text": "不应写入日志的学生答案",
+                "error_mark_validation": [{"mark_id": 0, "accepted": True}],
+                "correction_group_validation": {
+                    "raw_mark_count": 2,
+                    "correction_group_count": 1,
+                    "paired_group_count": 1,
+                    "single_mark_group_count": 0,
+                    "deduplicated_mark_count": 1,
+                },
+                "localization_batch_validation": {
+                    "semantic_retry_attempts": 1,
+                    "marked_ocr_recheck_count": 1,
+                    "assignment_diagnostics": [
+                        {
+                            "index": 0,
+                            "mark_id": 0,
+                            "assignment_source": "deterministic",
+                        }
+                    ],
+                },
+            }
+        }
+    ]
+
+    with caplog.at_level("INFO"):
+        log_mark_validation_diagnostics("image-1", values)
+
+    assert "correction_group_count" in caplog.text
+    assert "semantic_retry_attempts" in caplog.text
+    assert "marked_ocr_recheck_count" in caplog.text
+    assert "assignment_source" in caplog.text
+    assert "不应写入日志的学生答案" not in caplog.text
+
+
 class RetryDB:
     def __init__(self, image):
         self.image = image

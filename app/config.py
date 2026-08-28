@@ -43,9 +43,15 @@ class Settings(BaseSettings):
     QUESTION_CROP_CONTEXT_PADDING_RATIO: float = Field(default=0.15, ge=0, le=1)
     MARK_RED_PIXEL_MIN_RATIO: float = Field(default=0.005, ge=0, le=1)
     MARK_RED_PIXEL_EXPANSION_RATIO: float = Field(default=0.08, ge=0, le=1)
+    MARK_CORRECTION_GROUP_ENABLED: bool = True
+    MARK_PAIR_MAX_DISTANCE_RATIO: float = Field(default=0.12, ge=0, le=1)
+    MARK_ANCHOR_MAX_GAP_RATIO: float = Field(default=0.08, ge=0, le=1)
+    MARK_CROSS_ONLY_MAX_GAP_RATIO: float = Field(default=0.08, ge=0, le=1)
+    MARK_DEDUP_IOU_THRESHOLD: float = Field(default=0.8, gt=0, le=1)
     MINIMAX_IMAGE_MAX_EDGE: int = 2048
     MINIMAX_IMAGE_JPEG_QUALITY: int = 90
     MINIMAX_MARK_MISMATCH_RETRY_COUNT: int = Field(default=1, ge=0, le=2)
+    MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT: int = Field(default=1, ge=0, le=2)
     LOCAL_OCR_ENABLED: bool = True
     LOCAL_OCR_ENGINE: str = "onnxruntime"
     LOCAL_OCR_VERSION: str = "3.9.1"
@@ -62,6 +68,7 @@ class Settings(BaseSettings):
     )
     LOCAL_OCR_FULL_PAGE_MAX_EDGE: int = Field(default=1600, ge=640, le=4096)
     LOCAL_OCR_CROP_RECHECK_LIMIT: int = Field(default=3, ge=0, le=20)
+    LOCAL_OCR_MARKED_RECHECK_LIMIT: int = Field(default=3, ge=0, le=20)
     LOCAL_RED_SCAN_MAX_EDGE: int = Field(default=1600, ge=640, le=4096)
     LOCAL_RED_COMPONENT_MIN_PIXELS: int = Field(default=12, ge=1)
     LOCAL_RED_COMPONENT_MAX_AREA_RATIO: float = Field(default=0.08, gt=0, le=1)

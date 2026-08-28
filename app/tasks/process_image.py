@@ -101,6 +101,21 @@ def log_mark_validation_diagnostics(
                 separators=(",", ":"),
             ),
         )
+    correction_group = (
+        question_values[0]["ocr_raw_json"].get("correction_group_validation")
+        if question_values
+        else None
+    )
+    if correction_group is not None:
+        logger.info(
+            "correction_group_validation image_id=%s diagnostic=%s",
+            image_id,
+            json.dumps(
+                correction_group,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
 
 
 @celery_app.task(bind=True)
@@ -170,6 +185,13 @@ def process_image(self, image_id: str, filepath: str):
             force_mode=(
                 "unmarked" if recognition_correction == "force_unmarked" else None
             ),
+            correction_group_enabled=settings.MARK_CORRECTION_GROUP_ENABLED,
+            pair_max_distance_ratio=settings.MARK_PAIR_MAX_DISTANCE_RATIO,
+            dedup_iou_threshold=settings.MARK_DEDUP_IOU_THRESHOLD,
+            anchor_max_gap_ratio=settings.MARK_ANCHOR_MAX_GAP_RATIO,
+            cross_only_max_gap_ratio=settings.MARK_CROSS_ONLY_MAX_GAP_RATIO,
+            semantic_retry_count=settings.MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT,
+            marked_ocr_recheck_limit=settings.LOCAL_OCR_MARKED_RECHECK_LIMIT,
         )
         log_mark_validation_diagnostics(image_id, question_values)
         question_values = discard_pending_duplicates_of_collected(question_values)

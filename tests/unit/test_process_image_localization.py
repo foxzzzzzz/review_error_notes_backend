@@ -153,6 +153,13 @@ def _run_batch(
     local_red_scan=None,
     mark_mismatch_retry_count=0,
     force_mode=None,
+    correction_group_enabled=False,
+    pair_max_distance_ratio=0.12,
+    dedup_iou_threshold=0.8,
+    anchor_max_gap_ratio=0.08,
+    cross_only_max_gap_ratio=0.08,
+    semantic_retry_count=0,
+    marked_ocr_recheck_limit=0,
 ):
     from app.services.vision_recognition import recognize_question_batch
 
@@ -172,6 +179,13 @@ def _run_batch(
         local_red_scan=local_red_scan,
         mark_mismatch_retry_count=mark_mismatch_retry_count,
         force_mode=force_mode,
+        correction_group_enabled=correction_group_enabled,
+        pair_max_distance_ratio=pair_max_distance_ratio,
+        dedup_iou_threshold=dedup_iou_threshold,
+        anchor_max_gap_ratio=anchor_max_gap_ratio,
+        cross_only_max_gap_ratio=cross_only_max_gap_ratio,
+        semantic_retry_count=semantic_retry_count,
+        marked_ocr_recheck_limit=marked_ocr_recheck_limit,
     )
 
 
@@ -193,6 +207,178 @@ def _detected_red_scan():
         scanned_height=300,
         duration_ms=1.0,
     )
+
+
+def test_marked_mode_localizes_normalized_error_mark_groups(tmp_path):
+    class DuplicateMarkClient(FakeClient):
+        def recognize(self, image_path, subject_hint=None, **_kwargs):
+            self.recognize_calls += 1
+            result = _vision_result()
+            result.items = result.items[:1]
+            result.error_marks = [
+                ErrorMark(
+                    mark_id=0,
+                    mark_type="circle",
+                    bbox=[0.2, 0.23, 0.3, 0.34],
+                    confidence=0.96,
+                ),
+                ErrorMark(
+                    mark_id=1,
+                    mark_type="circle",
+                    bbox=[0.2, 0.23, 0.3, 0.34],
+                    confidence=0.95,
+                ),
+            ]
+            return result
+
+        def localize(self, image_path, items, error_marks):
+            self.localize_calls += 1
+            self.localized_marks = error_marks
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=0,
+                        matched=True,
+                        mark_ids=[0],
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        observed_prompt_text="课文",
+                        observed_raw_text="kè wén",
+                        confidence=0.94,
+                    )
+                ]
+            )
+
+    client = DuplicateMarkClient()
+    _result, values = _run_batch(
+        tmp_path,
+        client=client,
+        local_red_scan=_detected_red_scan(),
+        correction_group_enabled=True,
+    )
+
+    assert [mark.mark_id for mark in client.localized_marks] == [0]
+    assert values[0]["ocr_raw_json"]["correction_group_validation"] == {
+        "raw_mark_count": 2,
+        "correction_group_count": 1,
+        "paired_group_count": 0,
+        "single_mark_group_count": 1,
+        "deduplicated_mark_count": 1,
+    }
+
+
+def test_semantic_localization_retry_is_skipped_when_first_result_is_valid(tmp_path):
+    client = FakeClient()
+
+    _run_batch(
+        tmp_path,
+        client=client,
+        correction_group_enabled=True,
+        semantic_retry_count=1,
+    )
+
+    assert client.localize_calls == 1
+
+
+def test_semantic_localization_retry_replaces_wrong_mark_assignment(tmp_path):
+    class SemanticRetryClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.corrections = []
+
+        def localize(self, image_path, items, error_marks, correction=None):
+            self.localize_calls += 1
+            self.corrections.append(correction)
+            mark_ids = ([1], [0]) if self.localize_calls == 1 else ([0], [1])
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=0,
+                        matched=True,
+                        mark_ids=mark_ids[0],
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        observed_prompt_text=items[0].prompt_text,
+                        observed_raw_text=items[0].raw_text,
+                        confidence=0.94,
+                    ),
+                    LocalizationItem(
+                        index=1,
+                        matched=True,
+                        mark_ids=mark_ids[1],
+                        bbox=[0.55, 0.5, 0.8, 0.8],
+                        observed_prompt_text=items[1].prompt_text,
+                        observed_raw_text=items[1].raw_text,
+                        confidence=0.91,
+                    ),
+                ]
+            )
+
+    client = SemanticRetryClient()
+    _result, values = _run_batch(
+        tmp_path,
+        client=client,
+        correction_group_enabled=True,
+        semantic_retry_count=1,
+    )
+
+    assert client.localize_calls == 2
+    assert client.corrections[0] is None
+    assert client.corrections[1]["reason_counts"] == {"mark_anchor_too_far": 2}
+    assert values[0]["crop_region"]["mark_ids"] == [0]
+    assert values[1]["crop_region"]["mark_ids"] == [1]
+    batch = values[0]["ocr_raw_json"]["localization_batch_validation"]
+    assert batch["semantic_retry_attempts"] == 1
+    assert batch["semantic_retry_reason_counts"] == {"mark_anchor_too_far": 2}
+
+
+def test_marked_ocr_rescue_is_bounded_for_deterministic_assignments(tmp_path):
+    class MissingAssignmentsClient(FakeClient):
+        def localize(self, image_path, items, error_marks):
+            self.localize_calls += 1
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=0,
+                        matched=True,
+                        mark_ids=[],
+                        bbox=[0.15, 0.15, 0.4, 0.45],
+                        observed_prompt_text=items[0].prompt_text,
+                        observed_raw_text=items[0].raw_text,
+                        confidence=0.94,
+                    ),
+                    LocalizationItem(
+                        index=1,
+                        matched=True,
+                        mark_ids=[],
+                        bbox=[0.55, 0.5, 0.8, 0.8],
+                        observed_prompt_text=items[1].prompt_text,
+                        observed_raw_text=items[1].raw_text,
+                        confidence=0.91,
+                    ),
+                ]
+            )
+
+    verifier = FakeOCRVerifier(
+        {
+            0: OCRVerification(status="support"),
+            1: OCRVerification(status="support"),
+        }
+    )
+    _result, values = _run_batch(
+        tmp_path,
+        client=MissingAssignmentsClient(),
+        ocr_verifier=verifier,
+        correction_group_enabled=True,
+        marked_ocr_recheck_limit=1,
+    )
+
+    assert len(verifier.calls) == 1
+    assert sum(
+        value["ocr_raw_json"]["assignment_source"] == "deterministic"
+        for value in values
+    ) == 2
+    assert values[0]["ocr_raw_json"]["localization_batch_validation"][
+        "marked_ocr_recheck_count"
+    ] == 1
 
 
 def test_marked_mode_retries_once_when_model_misses_local_red_mark(tmp_path):

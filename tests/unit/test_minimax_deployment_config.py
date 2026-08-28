@@ -9,6 +9,13 @@ from app.config import Settings
 BACKEND_ROOT = Path(__file__).parents[2]
 
 EXPECTED_ADAPTIVE_EVIDENCE_SETTINGS = {
+    "MARK_CORRECTION_GROUP_ENABLED": "true",
+    "MARK_PAIR_MAX_DISTANCE_RATIO": "0.12",
+    "MARK_ANCHOR_MAX_GAP_RATIO": "0.08",
+    "MARK_CROSS_ONLY_MAX_GAP_RATIO": "0.08",
+    "MARK_DEDUP_IOU_THRESHOLD": "0.8",
+    "MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT": "1",
+    "LOCAL_OCR_MARKED_RECHECK_LIMIT": "3",
     "LOCAL_OCR_ENABLED": "true",
     "LOCAL_OCR_FULL_PAGE_MAX_EDGE": "1600",
     "LOCAL_OCR_CROP_RECHECK_LIMIT": "3",
@@ -82,6 +89,13 @@ def test_adaptive_local_evidence_settings_have_documented_safe_defaults():
 def test_adaptive_local_evidence_settings_are_bounded():
     settings = Settings(_env_file=None)
 
+    assert settings.MARK_CORRECTION_GROUP_ENABLED is True
+    assert settings.MARK_PAIR_MAX_DISTANCE_RATIO == 0.12
+    assert settings.MARK_ANCHOR_MAX_GAP_RATIO == 0.08
+    assert settings.MARK_CROSS_ONLY_MAX_GAP_RATIO == 0.08
+    assert settings.MARK_DEDUP_IOU_THRESHOLD == 0.8
+    assert settings.MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT == 1
+    assert settings.LOCAL_OCR_MARKED_RECHECK_LIMIT == 3
     assert settings.LOCAL_OCR_ENABLED is True
     assert settings.LOCAL_OCR_FULL_PAGE_MAX_EDGE == 1600
     assert settings.LOCAL_OCR_CROP_RECHECK_LIMIT == 3
@@ -94,7 +108,32 @@ def test_adaptive_local_evidence_settings_are_bounded():
     with pytest.raises(ValidationError):
         Settings(_env_file=None, LOCAL_RED_COMPONENT_MAX_AREA_RATIO=0)
     with pytest.raises(ValidationError):
+        Settings(_env_file=None, MARK_PAIR_MAX_DISTANCE_RATIO=1.01)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, MARK_DEDUP_IOU_THRESHOLD=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT=3)
+    with pytest.raises(ValidationError):
         Settings(_env_file=None, CELERY_WORKER_CONCURRENCY=17)
+
+
+def test_worker_passes_correction_group_settings_to_recognition_batch():
+    task = (BACKEND_ROOT / "app" / "tasks" / "process_image.py").read_text(
+        encoding="utf-8"
+    )
+
+    expected_arguments = {
+        "correction_group_enabled": "MARK_CORRECTION_GROUP_ENABLED",
+        "pair_max_distance_ratio": "MARK_PAIR_MAX_DISTANCE_RATIO",
+        "dedup_iou_threshold": "MARK_DEDUP_IOU_THRESHOLD",
+        "anchor_max_gap_ratio": "MARK_ANCHOR_MAX_GAP_RATIO",
+        "cross_only_max_gap_ratio": "MARK_CROSS_ONLY_MAX_GAP_RATIO",
+        "semantic_retry_count": "MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT",
+        "marked_ocr_recheck_limit": "LOCAL_OCR_MARKED_RECHECK_LIMIT",
+    }
+    compact_task = "".join(task.split())
+    for argument, setting_name in expected_arguments.items():
+        assert f"{argument}=settings.{setting_name}" in compact_task
 
 
 def test_marker_focused_crop_padding_is_external_and_validated():
