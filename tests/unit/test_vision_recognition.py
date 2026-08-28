@@ -392,6 +392,47 @@ def test_client_exposes_three_isolated_stage_operations(tmp_path):
     assert all(payload["image_url"].startswith("data:image/jpeg;base64,") for payload in payloads)
 
 
+def test_context_localization_returns_distinct_answer_prompt_and_question_bboxes(tmp_path):
+    response = {
+        "items": [
+            {
+                "mark_id": 0,
+                "matched": True,
+                "answer_bbox": [0.2, 0.3, 0.6, 0.6],
+                "prompt_bbox": [0.2, 0.1, 0.6, 0.25],
+                "question_bbox": [0.1, 0.05, 0.7, 0.7],
+                "incomplete_reason": None,
+                "confidence": 0.93,
+            }
+        ]
+    }
+    client, source, requests = _mock_stage_client(tmp_path, [response])
+
+    result = client.locate_marked_question_context(source, _error_mark())
+
+    assert result.items[0].answer_bbox == [0.2, 0.3, 0.6, 0.6]
+    assert result.items[0].question_bbox == [0.1, 0.05, 0.7, 0.7]
+    assert "红圈只是答案区域的近似边界" in requests[0]["prompt"]
+    assert "只覆盖红叉" in requests[0]["prompt"]
+
+
+def test_unmatched_context_localization_rejects_non_null_geometry():
+    from pydantic import ValidationError
+
+    from app.services.vision_recognition import MarkQuestionLocalizationItem
+
+    with pytest.raises(ValidationError):
+        MarkQuestionLocalizationItem(
+            mark_id=0,
+            matched=False,
+            answer_bbox=[0.2, 0.3, 0.6, 0.6],
+            prompt_bbox=None,
+            question_bbox=None,
+            incomplete_reason="not_visible",
+            confidence=0.2,
+        )
+
+
 @pytest.mark.parametrize(
     "response_payload",
     [

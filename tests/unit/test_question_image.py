@@ -37,6 +37,71 @@ def test_crop_uses_normalized_ltrb_coordinates(tmp_path):
     assert _rendered_size(content) == (50, 40)
 
 
+def test_mark_context_preserves_page_bbox_and_converts_local_coordinates(tmp_path):
+    from app.services.question_image import (
+        local_bbox_to_page,
+        page_bbox_to_local,
+        render_mark_context,
+    )
+
+    source = tmp_path / "context.png"
+    Image.new("RGB", (1000, 800), "white").save(source)
+
+    context = render_mark_context(
+        source,
+        [0.4, 0.4, 0.6, 0.6],
+        padding_ratio=1.0,
+        max_edge=1200,
+        jpeg_quality=90,
+        max_pixels=2_000_000,
+    )
+
+    assert context.page_bbox == pytest.approx([0.2, 0.2, 0.8, 0.8])
+    assert local_bbox_to_page(
+        [0.25, 0.25, 0.75, 0.75], context.page_bbox
+    ) == pytest.approx([0.35, 0.35, 0.65, 0.65])
+    assert page_bbox_to_local(
+        [0.35, 0.35, 0.65, 0.65], context.page_bbox
+    ) == pytest.approx([0.25, 0.25, 0.75, 0.75])
+    assert context.image_bytes.startswith(b"\xff\xd8")
+
+
+def test_mark_context_clamps_at_page_edges(tmp_path):
+    from app.services.question_image import render_mark_context
+
+    source = tmp_path / "edge-context.png"
+    Image.new("RGB", (100, 100), "white").save(source)
+
+    context = render_mark_context(
+        source,
+        [0.0, 0.0, 0.1, 0.1],
+        padding_ratio=1.0,
+        max_edge=1200,
+        jpeg_quality=90,
+        max_pixels=20_000,
+    )
+
+    assert context.page_bbox == pytest.approx([0.0, 0.0, 0.2, 0.2])
+
+
+def test_mark_context_reports_actual_pixel_aligned_page_bbox(tmp_path):
+    from app.services.question_image import render_mark_context
+
+    source = tmp_path / "fractional-context.png"
+    Image.new("RGB", (10, 10), "white").save(source)
+
+    context = render_mark_context(
+        source,
+        [0.26, 0.26, 0.54, 0.54],
+        padding_ratio=0.0,
+        max_edge=1200,
+        jpeg_quality=90,
+        max_pixels=20_000,
+    )
+
+    assert context.page_bbox == pytest.approx([0.2, 0.2, 0.6, 0.6])
+
+
 def test_in_memory_crop_uses_the_same_normalized_coordinates(tmp_path):
     source = tmp_path / "source.jpg"
     _save_image(source)

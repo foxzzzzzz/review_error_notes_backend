@@ -13,6 +13,59 @@ def _mark(bbox=None, confidence=0.95):
     )
 
 
+def test_groups_neighboring_red_fragments_without_merging_distant_regions():
+    from app.services.error_mark_validation import (
+        RedMarkRegion,
+        group_red_evidence_regions,
+    )
+
+    regions = [
+        RedMarkRegion(bbox=[0.10, 0.10, 0.12, 0.12], pixel_count=20, area_ratio=0.0004, thinness_ratio=1),
+        RedMarkRegion(bbox=[0.13, 0.10, 0.15, 0.12], pixel_count=30, area_ratio=0.0004, thinness_ratio=1),
+        RedMarkRegion(bbox=[0.70, 0.70, 0.72, 0.72], pixel_count=40, area_ratio=0.0004, thinness_ratio=1),
+    ]
+
+    grouped, diagnostic = group_red_evidence_regions(
+        regions, max_gap_ratio=0.03, max_group_area_ratio=0.08
+    )
+
+    assert len(grouped) == 2
+    assert grouped[0].bbox == [0.10, 0.10, 0.15, 0.12]
+    assert grouped[0].pixel_count == 50
+    assert diagnostic == {"raw_component_count": 3, "evidence_group_count": 2}
+
+
+def test_merges_mark_attempts_without_losing_different_shape_types():
+    from app.services.error_mark_validation import merge_error_mark_attempts
+
+    cross = ErrorMark(mark_id=0, mark_type="cross", bbox=[0.4, 0.2, 0.46, 0.28], cross_bbox=[0.4, 0.2, 0.46, 0.28], confidence=0.95)
+    circle = ErrorMark(mark_id=0, mark_type="circle", bbox=[0.3, 0.25, 0.5, 0.42], circle_bbox=[0.3, 0.25, 0.5, 0.42], confidence=0.94)
+
+    merged, diagnostic = merge_error_mark_attempts(
+        [[cross], [circle]], dedup_iou_threshold=0.8
+    )
+
+    assert [mark.mark_type for mark in merged] == ["cross", "circle"]
+    assert [mark.mark_id for mark in merged] == [0, 1]
+    assert diagnostic["attempt_primitive_counts"] == [1, 1]
+    assert diagnostic["cross_attempt_deduplicated_count"] == 0
+
+
+def test_merges_duplicate_same_shape_across_attempts():
+    from app.services.error_mark_validation import merge_error_mark_attempts
+
+    first = _mark([0.2, 0.2, 0.4, 0.4])
+    second = _mark([0.21, 0.2, 0.4, 0.4]).model_copy(update={"confidence": 0.96})
+
+    merged, diagnostic = merge_error_mark_attempts(
+        [[first], [second]], dedup_iou_threshold=0.8
+    )
+
+    assert len(merged) == 1
+    assert merged[0].confidence == 0.96
+    assert diagnostic["cross_attempt_deduplicated_count"] == 1
+
+
 def test_accepts_mark_box_with_red_pixels(tmp_path):
     from app.services.error_mark_validation import filter_valid_error_marks
 
@@ -289,6 +342,7 @@ def test_normalize_error_mark_groups_deduplicates_overlapping_marks():
         "paired_group_count": 0,
         "single_mark_group_count": 1,
         "deduplicated_mark_count": 2,
+        "review_required_mark_ids": [],
     }
 
 
@@ -325,6 +379,124 @@ def test_normalize_error_mark_groups_does_not_force_ambiguous_pair():
     assert [group.mark_type for group in groups] == ["cross", "cross", "circle"]
     assert [group.mark_id for group in groups] == [0, 1, 2]
     assert diagnostic["paired_group_count"] == 0
+
+
+def test_normalize_error_mark_groups_pairs_mutual_nearest_with_clear_margin():
+    from app.services.error_mark_validation import normalize_error_mark_groups
+
+    marks = [
+        ErrorMark(mark_id=0, mark_type="cross", bbox=[0.30, 0.18, 0.36, 0.24], cross_bbox=[0.30, 0.18, 0.36, 0.24], confidence=0.95),
+        ErrorMark(mark_id=1, mark_type="circle", bbox=[0.25, 0.22, 0.45, 0.42], circle_bbox=[0.25, 0.22, 0.45, 0.42], confidence=0.95),
+        ErrorMark(mark_id=2, mark_type="circle", bbox=[0.70, 0.22, 0.90, 0.42], circle_bbox=[0.70, 0.22, 0.90, 0.42], confidence=0.95),
+    ]
+
+    groups, diagnostic = normalize_error_mark_groups(
+        marks,
+        dedup_iou_threshold=0.8,
+        pair_max_distance_ratio=0.12,
+        pair_max_relative_distance_ratio=1.0,
+        pair_min_margin_ratio=0.2,
+    )
+
+    assert [group.mark_type for group in groups] == ["cross_circle", "circle"]
+    assert diagnostic["pair_diagnostics"][0]["accepted"] is True
+    assert diagnostic["pair_diagnostics"][0]["pair_tier"] == "strong"
+    assert diagnostic["review_required_mark_ids"] == []
+
+
+def test_normalize_error_mark_groups_marks_non_intersecting_pair_for_review():
+    from app.services.error_mark_validation import normalize_error_mark_groups
+
+    marks = [
+        ErrorMark(
+            mark_id=0,
+            mark_type="cross",
+            bbox=[0.30, 0.10, 0.35, 0.15],
+            confidence=0.95,
+        ),
+        ErrorMark(
+            mark_id=1,
+            mark_type="circle",
+            bbox=[0.30, 0.18, 0.50, 0.40],
+            confidence=0.95,
+        ),
+    ]
+
+    groups, diagnostic = normalize_error_mark_groups(
+        marks,
+        dedup_iou_threshold=0.8,
+        pair_max_distance_ratio=0.12,
+        pair_max_relative_distance_ratio=1.0,
+        pair_min_margin_ratio=0.2,
+    )
+
+    assert [group.mark_type for group in groups] == ["cross_circle"]
+    assert diagnostic["pair_diagnostics"][0]["pair_tier"] == "nearby_review"
+    assert diagnostic["review_required_mark_ids"] == [0]
+
+
+def test_group_red_evidence_regions_merges_transitive_bridge_components():
+    from app.services.error_mark_validation import (
+        RedMarkRegion,
+        group_red_evidence_regions,
+    )
+
+    regions = [
+        RedMarkRegion(
+            bbox=[0.10, 0.10, 0.12, 0.12],
+            pixel_count=10,
+            area_ratio=0.0004,
+            thinness_ratio=1.0,
+        ),
+        RedMarkRegion(
+            bbox=[0.18, 0.10, 0.20, 0.12],
+            pixel_count=10,
+            area_ratio=0.0004,
+            thinness_ratio=1.0,
+        ),
+        RedMarkRegion(
+            bbox=[0.135, 0.10, 0.165, 0.12],
+            pixel_count=10,
+            area_ratio=0.0006,
+            thinness_ratio=1.5,
+        ),
+    ]
+
+    groups, diagnostic = group_red_evidence_regions(
+        regions,
+        max_gap_ratio=0.05,
+        max_group_area_ratio=0.08,
+    )
+
+    assert len(groups) == 1
+    assert groups[0].bbox == pytest.approx([0.10, 0.10, 0.20, 0.12])
+    assert groups[0].pixel_count == 30
+    assert diagnostic["evidence_group_count"] == 1
+
+
+def test_normalize_error_mark_groups_rejects_relative_distance_and_ambiguous_margin():
+    from app.services.error_mark_validation import normalize_error_mark_groups
+
+    marks = [
+        ErrorMark(mark_id=0, mark_type="cross", bbox=[0.30, 0.10, 0.32, 0.12], cross_bbox=[0.30, 0.10, 0.32, 0.12], confidence=0.95),
+        ErrorMark(mark_id=1, mark_type="circle", bbox=[0.30, 0.16, 0.32, 0.18], circle_bbox=[0.30, 0.16, 0.32, 0.18], confidence=0.95),
+        ErrorMark(mark_id=2, mark_type="circle", bbox=[0.33, 0.16, 0.35, 0.18], circle_bbox=[0.33, 0.16, 0.35, 0.18], confidence=0.95),
+    ]
+
+    groups, diagnostic = normalize_error_mark_groups(
+        marks,
+        dedup_iou_threshold=0.8,
+        pair_max_distance_ratio=0.12,
+        pair_max_relative_distance_ratio=1.0,
+        pair_min_margin_ratio=0.2,
+    )
+
+    assert [group.mark_type for group in groups] == ["cross", "circle", "circle"]
+    assert diagnostic["pair_diagnostics"][0]["accepted"] is False
+    assert diagnostic["pair_diagnostics"][0]["reason"] in {
+        "relative_distance_exceeded",
+        "ambiguous_margin",
+    }
     assert diagnostic["single_mark_group_count"] == 3
 
 

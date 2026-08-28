@@ -458,6 +458,15 @@ student (学生)
 | `MARK_RED_PIXEL_EXPANSION_RATIO` | 红色像素检查框向外扩展比例 | `0.08` |
 | `MARK_CORRECTION_GROUP_ENABLED` | 将邻近红×与红圈合并为一次判错事件 | `true` |
 | `MARK_PAIR_MAX_DISTANCE_RATIO` | 红×与红圈组合的最大归一化距离 | `0.04` |
+| `MARK_PAIR_MAX_RELATIVE_DISTANCE_RATIO` | 圈叉距离相对红圈最长边的上限 | `1.0` |
+| `MARK_PAIR_MIN_MARGIN_RATIO` | 最佳配对相对第二候选的最小领先比例 | `0.2` |
+| `MARK_CIRCLE_CONTEXT_PADDING_RATIO` | 红圈局部定位上下文扩展比例 | `1.0` |
+| `MARK_ANSWER_MIN_CIRCLE_OVERLAP_RATIO` | 答案框至少覆盖的红圈面积比例；不足时重试或待确认 | `0.25` |
+| `MARK_ANSWER_MIN_ANSWER_OVERLAP_RATIO` | 答案框自身至少位于红圈内的面积比例 | `0.5` |
+| `MARK_ANSWER_HARD_MIN_CIRCLE_COVERAGE_RATIO` | 红圈覆盖明显错位的硬下限；低于时仍保留待确认候选 | `0.1` |
+| `MARK_ANSWER_MAX_CENTER_OFFSET_RATIO` | 答案框中心相对红圈允许的最大偏移比例 | `0.75` |
+| `MARK_ANSWER_MAX_OVERFLOW_RATIO` | 答案框超出红圈允许的最大比例 | `0.5` |
+| `MARK_LOCALIZATION_EDGE_MARGIN_RATIO` | 局部题目框触边重试阈值 | `0.02` |
 | `MARK_ANCHOR_MAX_GAP_RATIO` | 判错事件锚点与题目候选的最大间距 | `0.08` |
 | `MARK_CROSS_ONLY_MAX_GAP_RATIO` | 仅红×与题目候选的最大间距 | `0.08` |
 | `MARK_DEDUP_IOU_THRESHOLD` | 重复红标合并的 IoU 阈值 | `0.8` |
@@ -482,6 +491,7 @@ student (学生)
 | `LOCAL_RED_COMPONENT_MIN_PIXELS` | 红色连通区域最少像素数 | `12` |
 | `LOCAL_RED_COMPONENT_MAX_AREA_RATIO` | 红色连通区域最大整图面积比例 | `0.08` |
 | `LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO` | 红色连通区域最大长宽比 | `18` |
+| `LOCAL_RED_GROUP_MAX_GAP_RATIO` | 相邻红色碎片聚合提示组的最大间距 | `0.03` |
 | `LOCAL_RED_RESCUE_MIN_PIXELS` | 未被模型红标覆盖的本地红区用于兜底关联时的最少像素数 | `80` |
 | `CELERY_WORKER_CONCURRENCY` | CPU OCR Worker 并发数 | `2` |
 | `QUESTION_SOFT_DELETE_RETENTION_DAYS` | 软删除错题和无引用图片在物理清理前的保留天数 | `30` |
@@ -516,3 +526,5 @@ RUN_LIVE_API_TESTS=true bash scripts/verify_adaptive_ocr_server.sh /path/to/imag
 ### 三阶段红标错题识别
 
 Worker 默认通过 `MINIMAX_THREE_STAGE_RECOGNITION_ENABLED` 启用准确率优先的三阶段视觉链路。`MINIMAX_MARK_STAGE_RETRY_COUNT`、`MINIMAX_LOCALIZATION_STAGE_RETRY_COUNT`、`MINIMAX_CONTENT_STAGE_RETRY_COUNT` 分别限制红标、定位和内容阶段的额外重试，`MINIMAX_CONTENT_BATCH_SIZE` 限制单次内容识别题数。紧急回滚时可设置 `MINIMAX_THREE_STAGE_RECOGNITION_ENABLED=false`，同一图片不会混用两种流程。
+
+答案区域同时校验答案框自身交叠率与红圈覆盖率；灰区定位只重试当前标记，重试耗尽以及非相交近邻圈×、单叉保底定位均只进入待确认。上下文边缘判断会排除整页真实边缘，红色碎片按有界传递关系合并，局部坐标使用实际像素裁切边界回映整页。

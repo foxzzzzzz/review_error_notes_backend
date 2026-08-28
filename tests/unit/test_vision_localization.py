@@ -840,3 +840,122 @@ def test_local_red_rescue_rejects_small_noise_component():
 
     assert rescued == set()
     assert diagnostics == []
+
+
+def test_circle_answer_geometry_accepts_tolerant_answer_ranges():
+    from app.services.vision_recognition import circle_answer_geometry_diagnostic
+
+    contained = circle_answer_geometry_diagnostic(
+        circle_bbox=[0.4, 0.4, 0.6, 0.6],
+        answer_bbox=[0.42, 0.42, 0.58, 0.58],
+        question_bbox=[0.3, 0.3, 0.7, 0.7],
+        prompt_bbox=[0.32, 0.31, 0.68, 0.39],
+        min_circle_overlap_ratio=0.25,
+        max_center_offset_ratio=0.75,
+        max_overflow_ratio=0.5,
+    )
+    expanded = circle_answer_geometry_diagnostic(
+        circle_bbox=[0.4, 0.4, 0.6, 0.6],
+        answer_bbox=[0.36, 0.36, 0.64, 0.64],
+        question_bbox=[0.3, 0.3, 0.7, 0.7],
+        prompt_bbox=None,
+        min_circle_overlap_ratio=0.25,
+        max_center_offset_ratio=0.75,
+        max_overflow_ratio=0.5,
+    )
+
+    assert contained["passed"] is True
+    assert expanded["passed"] is True
+
+
+def test_circle_answer_geometry_reports_specific_failures():
+    from app.services.vision_recognition import circle_answer_geometry_diagnostic
+
+    diagnostic = circle_answer_geometry_diagnostic(
+        circle_bbox=[0.1, 0.1, 0.2, 0.2],
+        answer_bbox=[0.42, 0.42, 0.52, 0.52],
+        question_bbox=[0.4, 0.4, 0.5, 0.5],
+        prompt_bbox=[0.0, 0.0, 0.05, 0.05],
+        min_circle_overlap_ratio=0.25,
+        max_center_offset_ratio=0.75,
+        max_overflow_ratio=0.5,
+    )
+
+    assert diagnostic["passed"] is False
+    assert diagnostic["failure_reasons"] == [
+        "answer_overlap_insufficient",
+        "circle_coverage_too_low",
+        "answer_center_outside_circle_tolerance",
+        "answer_overflow_exceeded",
+        "question_does_not_contain_answer",
+        "question_does_not_contain_prompt",
+    ]
+
+
+def test_circle_answer_geometry_rejects_tiny_centered_answer_without_dropping_mark():
+    from app.services.vision_recognition import circle_answer_geometry_diagnostic
+
+    diagnostic = circle_answer_geometry_diagnostic(
+        circle_bbox=[0.2, 0.2, 0.6, 0.6],
+        answer_bbox=[0.38, 0.38, 0.42, 0.42],
+        question_bbox=[0.1, 0.1, 0.7, 0.7],
+        prompt_bbox=None,
+        min_circle_overlap_ratio=0.25,
+        min_answer_overlap_ratio=0.5,
+        hard_min_circle_coverage_ratio=0.1,
+        max_center_offset_ratio=0.75,
+        max_overflow_ratio=0.5,
+    )
+
+    assert diagnostic["passed"] is False
+    assert diagnostic["circle_coverage_ratio"] == pytest.approx(0.01)
+    assert diagnostic["answer_overlap_ratio"] == pytest.approx(1.0)
+    assert diagnostic["circle_coverage_tier"] == "rejected"
+    assert diagnostic["failure_reasons"] == ["circle_coverage_too_low"]
+
+
+def test_circle_answer_geometry_marks_gray_coverage_for_retry():
+    from app.services.vision_recognition import circle_answer_geometry_diagnostic
+
+    diagnostic = circle_answer_geometry_diagnostic(
+        circle_bbox=[0.2, 0.2, 0.6, 0.6],
+        answer_bbox=[0.3, 0.3, 0.5, 0.5],
+        question_bbox=[0.1, 0.1, 0.7, 0.7],
+        prompt_bbox=None,
+        min_circle_overlap_ratio=0.3,
+        min_answer_overlap_ratio=0.5,
+        hard_min_circle_coverage_ratio=0.1,
+        max_center_offset_ratio=0.75,
+        max_overflow_ratio=0.5,
+    )
+
+    assert diagnostic["passed"] is False
+    assert diagnostic["circle_coverage_ratio"] == pytest.approx(0.25)
+    assert diagnostic["circle_coverage_tier"] == "retry"
+    assert diagnostic["failure_reasons"] == ["circle_coverage_needs_retry"]
+
+
+def test_question_touches_context_edge_uses_configured_margin():
+    from app.services.vision_recognition import question_touches_context_edge
+
+    assert question_touches_context_edge(
+        [0.01, 0.2, 0.8, 0.9], edge_margin_ratio=0.02
+    )
+    assert not question_touches_context_edge(
+        [0.03, 0.2, 0.8, 0.9], edge_margin_ratio=0.02
+    )
+
+
+def test_question_touching_page_edge_is_not_treated_as_context_clipping():
+    from app.services.vision_recognition import question_touches_context_edge
+
+    assert not question_touches_context_edge(
+        [0.0, 0.2, 0.8, 0.8],
+        edge_margin_ratio=0.02,
+        context_page_bbox=[0.0, 0.1, 0.4, 0.5],
+    )
+    assert question_touches_context_edge(
+        [0.0, 0.2, 0.8, 0.8],
+        edge_margin_ratio=0.02,
+        context_page_bbox=[0.1, 0.1, 0.4, 0.5],
+    )

@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
@@ -15,6 +16,102 @@ class QuestionImageNotFound(QuestionImageError):
 
 class QuestionImageInvalid(QuestionImageError):
     pass
+
+
+@dataclass(frozen=True)
+class MarkContext:
+    image_bytes: bytes
+    page_bbox: list[float]
+
+
+def _validated_normalized_bbox(bbox):
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        raise QuestionImageInvalid("Question crop bbox is invalid")
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in bbox):
+        raise QuestionImageInvalid("Question crop bbox is invalid")
+    if not all(math.isfinite(value) for value in bbox):
+        raise QuestionImageInvalid("Question crop bbox is invalid")
+    left, top, right, bottom = bbox
+    if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+        raise QuestionImageInvalid("Question crop bbox is invalid")
+    return [float(left), float(top), float(right), float(bottom)]
+
+
+def local_bbox_to_page(local_bbox, context_page_bbox):
+    """Convert a normalized context-crop bbox back to normalized page coordinates."""
+    local_left, local_top, local_right, local_bottom = _validated_normalized_bbox(local_bbox)
+    page_left, page_top, page_right, page_bottom = _validated_normalized_bbox(
+        context_page_bbox
+    )
+    page_width = page_right - page_left
+    page_height = page_bottom - page_top
+    return [
+        page_left + local_left * page_width,
+        page_top + local_top * page_height,
+        page_left + local_right * page_width,
+        page_top + local_bottom * page_height,
+    ]
+
+
+def page_bbox_to_local(page_bbox, context_page_bbox):
+    """Convert a normalized page bbox into normalized context-crop coordinates."""
+    left, top, right, bottom = _validated_normalized_bbox(page_bbox)
+    context_left, context_top, context_right, context_bottom = (
+        _validated_normalized_bbox(context_page_bbox)
+    )
+    context_width = context_right - context_left
+    context_height = context_bottom - context_top
+    local_bbox = [
+        (left - context_left) / context_width,
+        (top - context_top) / context_height,
+        (right - context_left) / context_width,
+        (bottom - context_top) / context_height,
+    ]
+    return [min(1.0, max(0.0, value)) for value in local_bbox]
+
+
+def render_mark_context(
+    image_path,
+    anchor_bbox,
+    padding_ratio,
+    max_edge,
+    jpeg_quality,
+    max_pixels,
+):
+    """Render a padded mark context and retain its exact normalized page extent."""
+    left, top, right, bottom = _validated_normalized_bbox(anchor_bbox)
+    width = right - left
+    height = bottom - top
+    page_bbox = [
+        max(0.0, left - width * padding_ratio),
+        max(0.0, top - height * padding_ratio),
+        min(1.0, right + width * padding_ratio),
+        min(1.0, bottom + height * padding_ratio),
+    ]
+    image = _load_rgb_image(image_path, max_pixels)
+    crop_box = _pixel_crop_box(
+        image.size,
+        {"bbox": page_bbox, "bbox_format": "normalized_ltrb"},
+    )
+    if crop_box is None:
+        raise QuestionImageInvalid("Question crop bbox is invalid")
+    pixel_left, pixel_top, pixel_right, pixel_bottom = crop_box
+    image_width, image_height = image.size
+    page_bbox = [
+        pixel_left / image_width,
+        pixel_top / image_height,
+        pixel_right / image_width,
+        pixel_bottom / image_height,
+    ]
+    context_image = image.crop(crop_box)
+    if max(context_image.size) > max_edge:
+        context_image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+    try:
+        output = BytesIO()
+        context_image.save(output, format="JPEG", quality=jpeg_quality)
+        return MarkContext(image_bytes=output.getvalue(), page_bbox=page_bbox)
+    except (OSError, ValueError) as exc:
+        raise QuestionImageInvalid("Question image is invalid") from exc
 
 
 def _pixel_crop_box(image_size, crop_region):

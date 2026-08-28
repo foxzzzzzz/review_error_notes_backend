@@ -50,6 +50,15 @@ class Settings(BaseSettings):
     MARK_RED_PIXEL_EXPANSION_RATIO: float = Field(default=0.08, ge=0, le=1)
     MARK_CORRECTION_GROUP_ENABLED: bool = True
     MARK_PAIR_MAX_DISTANCE_RATIO: float = Field(default=0.04, ge=0, le=1)
+    MARK_PAIR_MAX_RELATIVE_DISTANCE_RATIO: float = Field(default=1.0, ge=0, le=5)
+    MARK_PAIR_MIN_MARGIN_RATIO: float = Field(default=0.2, ge=0, le=1)
+    MARK_CIRCLE_CONTEXT_PADDING_RATIO: float = Field(default=1.0, ge=0, le=3)
+    MARK_ANSWER_MIN_CIRCLE_OVERLAP_RATIO: float = Field(default=0.25, ge=0, le=1)
+    MARK_ANSWER_MIN_ANSWER_OVERLAP_RATIO: float = Field(default=0.5, ge=0, le=1)
+    MARK_ANSWER_HARD_MIN_CIRCLE_COVERAGE_RATIO: float = Field(default=0.1, ge=0, le=1)
+    MARK_ANSWER_MAX_CENTER_OFFSET_RATIO: float = Field(default=0.75, ge=0, le=3)
+    MARK_ANSWER_MAX_OVERFLOW_RATIO: float = Field(default=0.5, ge=0, le=3)
+    MARK_LOCALIZATION_EDGE_MARGIN_RATIO: float = Field(default=0.02, ge=0, le=0.25)
     MARK_ANCHOR_MAX_GAP_RATIO: float = Field(default=0.08, ge=0, le=1)
     MARK_CROSS_ONLY_MAX_GAP_RATIO: float = Field(default=0.08, ge=0, le=1)
     MARK_DEDUP_IOU_THRESHOLD: float = Field(default=0.8, gt=0, le=1)
@@ -78,6 +87,7 @@ class Settings(BaseSettings):
     LOCAL_RED_COMPONENT_MIN_PIXELS: int = Field(default=12, ge=1)
     LOCAL_RED_COMPONENT_MAX_AREA_RATIO: float = Field(default=0.08, gt=0, le=1)
     LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO: float = Field(default=18, ge=1)
+    LOCAL_RED_GROUP_MAX_GAP_RATIO: float = Field(default=0.03, ge=0, le=0.25)
     LOCAL_RED_RESCUE_MIN_PIXELS: int = Field(default=80, ge=1)
     CELERY_WORKER_CONCURRENCY: int = Field(default=2, ge=1, le=16)
     TAG_ALIAS_CONFIG_PATH: str = "./config/tag-aliases.json"

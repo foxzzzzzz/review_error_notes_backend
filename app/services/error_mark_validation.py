@@ -270,11 +270,97 @@ def _bbox_contains(
     )
 
 
+def group_red_evidence_regions(
+    regions: Sequence[RedMarkRegion],
+    *,
+    max_gap_ratio: float,
+    max_group_area_ratio: float,
+) -> tuple[List[RedMarkRegion], dict]:
+    """Fuse nearby red fragments into bounded anti-miss evidence groups."""
+    groups: List[RedMarkRegion] = []
+    for region in regions:
+        matching_indexes = []
+        for index, existing in enumerate(groups):
+            union = _union_bbox(existing.bbox, region.bbox)
+            union_area = (union[2] - union[0]) * (union[3] - union[1])
+            if (
+                _bbox_distance(existing.bbox, region.bbox) <= max_gap_ratio
+                and union_area <= max_group_area_ratio
+            ):
+                matching_indexes.append(index)
+        if not matching_indexes:
+            groups.append(region.model_copy(deep=True))
+            continue
+        target_index = matching_indexes[0]
+        matched_groups = [groups[index] for index in matching_indexes]
+        union = list(region.bbox)
+        for matched_group in matched_groups:
+            union = _union_bbox(union, matched_group.bbox)
+        union_area = (union[2] - union[0]) * (union[3] - union[1])
+        if union_area > max_group_area_ratio:
+            matched_groups = [groups[target_index]]
+            matching_indexes = [target_index]
+            union = _union_bbox(groups[target_index].bbox, region.bbox)
+        width = union[2] - union[0]
+        height = union[3] - union[1]
+        merged = RedMarkRegion(
+            bbox=union,
+            pixel_count=region.pixel_count
+            + sum(group.pixel_count for group in matched_groups),
+            area_ratio=width * height,
+            thinness_ratio=max(width, height) / max(min(width, height), 1e-9),
+        )
+        for index in reversed(matching_indexes):
+            groups.pop(index)
+        groups.insert(target_index, merged)
+    return groups, {
+        "raw_component_count": len(regions),
+        "evidence_group_count": len(groups),
+    }
+
+
+def merge_error_mark_attempts(
+    attempts: Sequence[Sequence["ErrorMark"]],
+    *,
+    dedup_iou_threshold: float,
+) -> tuple[List["ErrorMark"], dict]:
+    """Merge validated primitives from every LLM attempt before pairing."""
+    merged: List["ErrorMark"] = []
+    duplicate_count = 0
+    for attempt in attempts:
+        for mark in attempt:
+            duplicate_index = None
+            for index, existing in enumerate(merged):
+                if existing.mark_type != mark.mark_type:
+                    continue
+                iou, containment = _bbox_overlap_ratios(existing.bbox, mark.bbox)
+                if max(iou, containment) >= dedup_iou_threshold:
+                    duplicate_index = index
+                    break
+            if duplicate_index is None:
+                merged.append(mark)
+                continue
+            duplicate_count += 1
+            if mark.confidence > merged[duplicate_index].confidence:
+                merged[duplicate_index] = mark
+    merged = [
+        mark.model_copy(update={"mark_id": index})
+        for index, mark in enumerate(merged)
+    ]
+    return merged, {
+        "attempt_primitive_counts": [len(attempt) for attempt in attempts],
+        "merged_primitive_count": len(merged),
+        "cross_attempt_deduplicated_count": duplicate_count,
+    }
+
+
 def normalize_error_mark_groups(
     marks: Sequence[ErrorMark],
     *,
     dedup_iou_threshold: float,
     pair_max_distance_ratio: float,
+    pair_max_relative_distance_ratio: float = 1.0,
+    pair_min_margin_ratio: float = 0.2,
 ) -> tuple[List[ErrorMark], dict]:
     """Deduplicate raw marks and uniquely pair neighboring crosses and circles."""
     deduplicated = []
@@ -304,55 +390,135 @@ def normalize_error_mark_groups(
 
     crosses = [mark for mark in deduplicated if mark.mark_type == "cross"]
     circles = [mark for mark in deduplicated if mark.mark_type == "circle"]
-    distances = {
-        (cross.mark_id, circle.mark_id): _bbox_distance(cross.bbox, circle.bbox)
-        for cross in crosses
-        for circle in circles
-    }
+    edges = {}
+    for cross in crosses:
+        for circle in circles:
+            distance = _bbox_distance(cross.bbox, circle.bbox)
+            circle_scale = max(
+                circle.bbox[2] - circle.bbox[0],
+                circle.bbox[3] - circle.bbox[1],
+                1e-9,
+            )
+            relative_distance = distance / circle_scale
+            edges[(cross.mark_id, circle.mark_id)] = {
+                "distance": distance,
+                "relative_distance": relative_distance,
+                "intersects": distance == 0,
+                "eligible": distance <= pair_max_distance_ratio
+                and relative_distance <= pair_max_relative_distance_ratio,
+            }
+
+    def unique_best(candidates):
+        eligible = sorted(
+            candidates,
+            key=lambda candidate: (
+                not candidate[2]["intersects"],
+                candidate[2]["distance"],
+                candidate[2]["relative_distance"],
+                candidate[1],
+            ),
+        )
+        if not eligible:
+            return None, "no_eligible_candidate", None
+        if len(eligible) == 1:
+            return eligible[0], "unique", None
+        first, second = eligible[:2]
+        first_distance = first[2]["distance"]
+        second_distance = second[2]["distance"]
+        margin = (
+            (second_distance - first_distance) / max(second_distance, 1e-9)
+            if second_distance > 0
+            else 0.0
+        )
+        if margin < pair_min_margin_ratio:
+            return None, "ambiguous_margin", margin
+        return first, "clear_margin", margin
+
     pair_by_cross = {}
     paired_circle_ids = set()
+    pair_diagnostics = []
     for cross in crosses:
-        eligible = sorted(
-            (
-                (distance, circle.mark_id)
-                for circle in circles
-                if (distance := distances[(cross.mark_id, circle.mark_id)])
-                <= pair_max_distance_ratio
-            )
-        )
-        if not eligible or (
-            len(eligible) > 1
-            and math.isclose(eligible[0][0], eligible[1][0], abs_tol=1e-9)
-        ):
+        candidates = [
+            (cross.mark_id, circle.mark_id, edges[(cross.mark_id, circle.mark_id)])
+            for circle in circles
+            if edges[(cross.mark_id, circle.mark_id)]["eligible"]
+        ]
+        best, reason, margin = unique_best(candidates)
+        if best is None:
+            if not candidates and circles:
+                nearest_circle = min(
+                    circles,
+                    key=lambda circle: edges[(cross.mark_id, circle.mark_id)]["distance"],
+                )
+                nearest = edges[(cross.mark_id, nearest_circle.mark_id)]
+                reason = (
+                    "relative_distance_exceeded"
+                    if nearest["distance"] <= pair_max_distance_ratio
+                    else "page_distance_exceeded"
+                )
+                circle_id = nearest_circle.mark_id
+            else:
+                circle_id = candidates[0][1] if candidates else None
+                nearest = candidates[0][2] if candidates else None
+            pair_diagnostics.append({
+                "cross_id": cross.mark_id,
+                "circle_id": circle_id,
+                "accepted": False,
+                "reason": reason,
+                "pair_tier": None,
+                "distance_ratio": round(nearest["distance"], 6) if nearest else None,
+                "relative_distance_ratio": round(nearest["relative_distance"], 6) if nearest else None,
+                "margin_ratio": round(margin, 6) if margin is not None else None,
+            })
             continue
-        distance, circle_id = eligible[0]
-        reverse = sorted(
-            (
-                (distances[(candidate.mark_id, circle_id)], candidate.mark_id)
-                for candidate in crosses
-                if distances[(candidate.mark_id, circle_id)]
-                <= pair_max_distance_ratio
-            )
-        )
-        if len(reverse) > 1 and math.isclose(
-            reverse[0][0],
-            reverse[1][0],
-            abs_tol=1e-9,
-        ):
-            continue
-        if reverse[0][1] != cross.mark_id or circle_id in paired_circle_ids:
+        _, circle_id, edge = best
+        reverse_candidates = [
+            (circle_id, candidate.mark_id, edges[(candidate.mark_id, circle_id)])
+            for candidate in crosses
+            if edges[(candidate.mark_id, circle_id)]["eligible"]
+        ]
+        reverse, reverse_reason, _reverse_margin = unique_best(reverse_candidates)
+        if reverse is None or reverse[1] != cross.mark_id or circle_id in paired_circle_ids:
+            pair_diagnostics.append({
+                "cross_id": cross.mark_id,
+                "circle_id": circle_id,
+                "accepted": False,
+                "reason": reverse_reason if reverse is None else "not_mutual_best",
+                "pair_tier": None,
+                "distance_ratio": round(edge["distance"], 6),
+                "relative_distance_ratio": round(edge["relative_distance"], 6),
+                "margin_ratio": round(margin, 6) if margin is not None else None,
+            })
             continue
         pair_by_cross[cross.mark_id] = circle_id
         paired_circle_ids.add(circle_id)
+        pair_diagnostics.append({
+            "cross_id": cross.mark_id,
+            "circle_id": circle_id,
+            "accepted": True,
+            "reason": "mutual_unique_best",
+            "pair_tier": "strong" if edge["intersects"] else "nearby_review",
+            "distance_ratio": round(edge["distance"], 6),
+            "relative_distance_ratio": round(edge["relative_distance"], 6),
+            "margin_ratio": round(margin, 6) if margin is not None else None,
+        })
 
     by_id = {mark.mark_id: mark for mark in deduplicated}
     paired_cross_ids = set(pair_by_cross)
     normalized = []
+    nearby_review_cross_ids = {
+        item["cross_id"]
+        for item in pair_diagnostics
+        if item["accepted"] and item["pair_tier"] == "nearby_review"
+    }
+    review_required_mark_ids = []
     for mark in deduplicated:
         if mark.mark_id in paired_circle_ids:
             continue
         if mark.mark_id in paired_cross_ids:
             circle = by_id[pair_by_cross[mark.mark_id]]
+            if mark.mark_id in nearby_review_cross_ids:
+                review_required_mark_ids.append(len(normalized))
             normalized.append(
                 mark.model_copy(
                     update={
@@ -372,13 +538,17 @@ def normalize_error_mark_groups(
         for index, mark in enumerate(normalized)
     ]
     paired_count = sum(mark.mark_type == "cross_circle" for mark in normalized)
-    return normalized, {
+    diagnostic = {
         "raw_mark_count": len(marks),
         "correction_group_count": len(normalized),
         "paired_group_count": paired_count,
         "single_mark_group_count": len(normalized) - paired_count,
         "deduplicated_mark_count": duplicate_count,
+        "review_required_mark_ids": review_required_mark_ids,
     }
+    if pair_diagnostics:
+        diagnostic["pair_diagnostics"] = pair_diagnostics
+    return normalized, diagnostic
 
 
 def filter_valid_error_marks(

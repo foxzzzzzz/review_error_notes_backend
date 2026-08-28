@@ -347,7 +347,321 @@ def test_three_stage_keeps_successful_items_when_one_mark_is_unmatched(tmp_path)
 
     assert len(result.items) == 1
     assert set(localizations) == {0}
-    assert diagnostic["unlocalized_mark_ids"] == [1]
+    assert diagnostic["unlocalized_mark_ids"] == []
+    assert diagnostic["missing_content_mark_ids"] == [1]
+
+
+def test_three_stage_uses_circle_context_and_preserves_complete_question_bbox(tmp_path):
+    from app.services.vision_recognition import (
+        ContentRecognitionItem,
+        ContentRecognitionResult,
+        MarkDetectionResult,
+        MarkQuestionLocalizationItem,
+        MarkQuestionLocalizationResult,
+        recognize_marked_three_stage,
+    )
+
+    class CircleContextClient:
+        def __init__(self):
+            self.context_calls = 0
+
+        def detect_marks(self, image_path, local_red_regions, correction=None):
+            return MarkDetectionResult(
+                error_marks=[
+                    ErrorMark(
+                        mark_id=0,
+                        mark_type="circle",
+                        bbox=[0.2, 0.23, 0.3, 0.34],
+                        confidence=0.96,
+                    ),
+                    ErrorMark(
+                        mark_id=1,
+                        mark_type="cross",
+                        bbox=[0.22, 0.22, 0.28, 0.3],
+                        confidence=0.95,
+                    ),
+                ]
+            )
+
+        def locate_marked_question_context(self, image_path, error_mark, correction=None):
+            self.context_calls += 1
+            assert error_mark.mark_type == "cross_circle"
+            assert error_mark.circle_bbox[0] == pytest.approx(1 / 3)
+            return MarkQuestionLocalizationResult(
+                items=[
+                    MarkQuestionLocalizationItem(
+                        mark_id=error_mark.mark_id,
+                        matched=True,
+                        answer_bbox=[0.3, 0.3, 0.7, 0.7],
+                        prompt_bbox=[0.2, 0.05, 0.8, 0.25],
+                        question_bbox=[0.1, 0.04, 0.9, 0.9],
+                        confidence=0.94,
+                    )
+                ]
+            )
+
+        def recognize_localized_content(self, crop_sheet_path, mark_ids, subject_hint):
+            return ContentRecognitionResult(
+                items=[
+                    ContentRecognitionItem(
+                        mark_id=0,
+                        **_vision_result().items[0].model_dump(),
+                    )
+                ]
+            )
+
+    client = CircleContextClient()
+    result, localizations, marks, diagnostic = recognize_marked_three_stage(
+        client=client,
+        image_path=_write_source_image(tmp_path),
+        subject_hint="chinese",
+        local_red_regions=[],
+        mark_confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        red_pixel_expansion_ratio=0.05,
+        pair_max_distance_ratio=0.04,
+        dedup_iou_threshold=0.8,
+        crop_context_padding_ratio=0.1,
+        image_max_edge=1200,
+        image_jpeg_quality=90,
+        image_max_pixels=40_000_000,
+    )
+
+    assert len(result.items) == 1
+    assert [mark.mark_type for mark in marks] == ["cross_circle"]
+    assert client.context_calls == 1
+    assert localizations[0].answer_bbox == pytest.approx(
+        [0.19, 0.22, 0.31, 0.3533333333]
+    )
+    assert localizations[0].bbox == pytest.approx(
+        [0.13, 0.1333333333, 0.37, 0.42]
+    )
+    assert localizations[0].observed_prompt_text is None
+    assert localizations[0].observed_raw_text is None
+    assert diagnostic["per_mark_localization"][0]["bbox_source"] == "circle_tolerant_llm"
+
+
+def test_nearby_circle_cross_pair_is_forced_to_pending_review(tmp_path):
+    from app.services.vision_recognition import (
+        ContentRecognitionItem,
+        ContentRecognitionResult,
+        MarkDetectionResult,
+        MarkQuestionLocalizationItem,
+        MarkQuestionLocalizationResult,
+        recognize_marked_three_stage,
+    )
+
+    class NearbyPairClient:
+        def detect_marks(self, image_path, local_red_regions, correction=None):
+            return MarkDetectionResult(
+                error_marks=[
+                    ErrorMark(
+                        mark_id=0,
+                        mark_type="circle",
+                        bbox=[0.20, 0.23, 0.25, 0.34],
+                        confidence=0.96,
+                    ),
+                    ErrorMark(
+                        mark_id=1,
+                        mark_type="cross",
+                        bbox=[0.26, 0.23, 0.30, 0.34],
+                        confidence=0.95,
+                    ),
+                ]
+            )
+
+        def locate_marked_question_context(self, image_path, error_mark, correction=None):
+            return MarkQuestionLocalizationResult(
+                items=[
+                    MarkQuestionLocalizationItem(
+                        mark_id=error_mark.mark_id,
+                        matched=True,
+                        answer_bbox=[0.30, 0.30, 0.70, 0.70],
+                        question_bbox=[0.10, 0.10, 0.90, 0.90],
+                        confidence=0.94,
+                    )
+                ]
+            )
+
+        def recognize_localized_content(self, crop_sheet_path, mark_ids, subject_hint):
+            return ContentRecognitionResult(
+                items=[
+                    ContentRecognitionItem(
+                        mark_id=0,
+                        **_vision_result().items[0].model_dump(),
+                    )
+                ]
+            )
+
+    _result, localizations, marks, diagnostic = recognize_marked_three_stage(
+        client=NearbyPairClient(),
+        image_path=_write_source_image(tmp_path),
+        subject_hint="chinese",
+        local_red_regions=[],
+        mark_confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        red_pixel_expansion_ratio=0.05,
+        pair_max_distance_ratio=0.04,
+        dedup_iou_threshold=0.8,
+        crop_context_padding_ratio=0.1,
+        image_max_edge=1200,
+        image_jpeg_quality=90,
+        image_max_pixels=40_000_000,
+    )
+
+    assert [mark.mark_type for mark in marks] == ["cross_circle"]
+    assert diagnostic["mark_grouping"]["review_required_mark_ids"] == [0]
+    assert localizations[0].localization_status == "needs_review"
+
+
+def test_circle_context_retries_only_the_edge_clipped_mark(tmp_path):
+    from app.services.vision_recognition import (
+        ContentRecognitionItem,
+        ContentRecognitionResult,
+        MarkDetectionResult,
+        MarkQuestionLocalizationItem,
+        MarkQuestionLocalizationResult,
+        recognize_marked_three_stage,
+    )
+
+    class RetryContextClient:
+        def __init__(self):
+            self.context_calls = 0
+
+        def detect_marks(self, image_path, local_red_regions, correction=None):
+            return MarkDetectionResult(
+                error_marks=[
+                    ErrorMark(
+                        mark_id=0,
+                        mark_type="circle",
+                        bbox=[0.2, 0.23, 0.3, 0.34],
+                        confidence=0.96,
+                    )
+                ]
+            )
+
+        def locate_marked_question_context(self, image_path, error_mark, correction=None):
+            self.context_calls += 1
+            question_bbox = (
+                [0.0, 0.05, 0.9, 0.9]
+                if self.context_calls == 1
+                else [0.2, 0.2, 0.8, 0.8]
+            )
+            answer_bbox = (
+                [0.35, 0.35, 0.65, 0.65]
+                if self.context_calls == 1
+                else [0.4, 0.4, 0.6, 0.6]
+            )
+            return MarkQuestionLocalizationResult(
+                items=[
+                    MarkQuestionLocalizationItem(
+                        mark_id=error_mark.mark_id,
+                        matched=True,
+                        answer_bbox=answer_bbox,
+                        prompt_bbox=None,
+                        question_bbox=question_bbox,
+                        confidence=0.94,
+                    )
+                ]
+            )
+
+        def recognize_localized_content(self, crop_sheet_path, mark_ids, subject_hint):
+            return ContentRecognitionResult(
+                items=[
+                    ContentRecognitionItem(
+                        mark_id=0,
+                        **_vision_result().items[0].model_dump(),
+                    )
+                ]
+            )
+
+    client = RetryContextClient()
+    _result, localizations, _marks, diagnostic = recognize_marked_three_stage(
+        client=client,
+        image_path=_write_source_image(tmp_path),
+        subject_hint="chinese",
+        local_red_regions=[],
+        mark_confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        red_pixel_expansion_ratio=0.05,
+        pair_max_distance_ratio=0.04,
+        dedup_iou_threshold=0.8,
+        crop_context_padding_ratio=0.1,
+        image_max_edge=1200,
+        image_jpeg_quality=90,
+        image_max_pixels=40_000_000,
+        localization_stage_retry_count=1,
+    )
+
+    assert client.context_calls == 2
+    assert localizations[0].bbox_source == "circle_tolerant_llm"
+    assert diagnostic["per_mark_localization"][0]["attempts"][0][
+        "failure_reasons"
+    ] == ["question_bbox_touches_context_edge"]
+
+
+def test_circle_context_retry_exhaustion_keeps_pending_fallback_candidate(tmp_path):
+    from app.services.vision_recognition import (
+        ContentRecognitionItem,
+        ContentRecognitionResult,
+        MarkDetectionResult,
+        MarkQuestionLocalizationItem,
+        MarkQuestionLocalizationResult,
+    )
+
+    class FallbackClient:
+        def detect_marks(self, image_path, local_red_regions, correction=None):
+            return MarkDetectionResult(
+                error_marks=[
+                    ErrorMark(
+                        mark_id=0,
+                        mark_type="circle",
+                        bbox=[0.2, 0.23, 0.3, 0.34],
+                        confidence=0.96,
+                    )
+                ]
+            )
+
+        def locate_marked_question_context(self, image_path, error_mark, correction=None):
+            return MarkQuestionLocalizationResult(
+                items=[
+                    MarkQuestionLocalizationItem(
+                        mark_id=error_mark.mark_id,
+                        matched=False,
+                        incomplete_reason="private student text must not be logged",
+                        confidence=0.4,
+                    )
+                ]
+            )
+
+        def recognize_localized_content(self, crop_sheet_path, mark_ids, subject_hint):
+            return ContentRecognitionResult(
+                items=[
+                    ContentRecognitionItem(
+                        mark_id=0,
+                        **_vision_result().items[0].model_dump(),
+                    )
+                ]
+            )
+
+    _result, values = _run_batch(
+        tmp_path,
+        client=FallbackClient(),
+        local_red_scan=_detected_red_scan(),
+        correction_group_enabled=True,
+        three_stage_enabled=True,
+    )
+
+    assert len(values) == 1
+    assert values[0]["collection_status"] == "pending_review"
+    assert values[0]["review_status"] == "needs_review"
+    assert values[0]["crop_region"]["bbox_source"] == "circle_tolerant_fallback"
+    assert values[0]["ocr_raw_json"]["three_stage"]["per_mark_localization"][0][
+        "localization_status"
+    ] == "needs_review"
+    assert values[0]["ocr_raw_json"]["three_stage"]["per_mark_localization"][0][
+        "attempts"
+    ][0]["failure_reasons"] == ["incomplete_localization"]
 
 
 def test_recognition_batch_uses_three_stage_path_without_legacy_calls(tmp_path):
@@ -505,6 +819,78 @@ def test_three_stage_retries_only_missing_localization_and_content_ids(tmp_path)
     assert diagnostic["content_invalid_mark_ids"] == [1]
 
 
+def test_three_stage_keeps_unmatched_cross_as_pending_fallback(tmp_path):
+    from app.services.vision_recognition import (
+        ContentRecognitionItem,
+        ContentRecognitionResult,
+        MarkDetectionResult,
+        MarkQuestionLocalizationItem,
+        MarkQuestionLocalizationResult,
+        recognize_marked_three_stage,
+    )
+
+    class CrossFallbackClient:
+        def detect_marks(self, image_path, local_red_regions, correction=None):
+            return MarkDetectionResult(error_marks=_vision_result().error_marks)
+
+        def locate_marked_question_context(self, image_path, error_mark, correction=None):
+            return MarkQuestionLocalizationResult(
+                items=[
+                    MarkQuestionLocalizationItem(
+                        mark_id=error_mark.mark_id,
+                        matched=True,
+                        answer_bbox=[0.30, 0.30, 0.70, 0.70],
+                        question_bbox=[0.10, 0.10, 0.90, 0.90],
+                        confidence=0.94,
+                    )
+                ]
+            )
+
+        def locate_marked_questions(self, image_path, error_marks, correction=None):
+            return MarkQuestionLocalizationResult(
+                items=[
+                    MarkQuestionLocalizationItem(
+                        mark_id=error_marks[0].mark_id,
+                        matched=False,
+                        confidence=0.4,
+                    )
+                ]
+            )
+
+        def recognize_localized_content(self, crop_sheet_path, mark_ids, subject_hint):
+            return ContentRecognitionResult(
+                items=[
+                    ContentRecognitionItem(
+                        mark_id=mark_id,
+                        **_vision_result().items[mark_id].model_dump(),
+                    )
+                    for mark_id in mark_ids
+                ]
+            )
+
+    result, localizations, _marks, diagnostic = recognize_marked_three_stage(
+        client=CrossFallbackClient(),
+        image_path=_write_source_image(tmp_path),
+        subject_hint="chinese",
+        local_red_regions=[],
+        mark_confidence_threshold=0.85,
+        red_pixel_min_ratio=0.01,
+        red_pixel_expansion_ratio=0.05,
+        pair_max_distance_ratio=0.04,
+        dedup_iou_threshold=0.8,
+        crop_context_padding_ratio=0.1,
+        image_max_edge=1200,
+        image_jpeg_quality=90,
+        image_max_pixels=40_000_000,
+        localization_stage_retry_count=1,
+    )
+
+    assert len(result.items) == 2
+    assert localizations[1].bbox_source == "cross_tolerant_fallback"
+    assert localizations[1].localization_status == "needs_review"
+    assert diagnostic["unlocalized_mark_ids"] == []
+
+
 def test_three_stage_retries_mark_detection_for_uncovered_local_red_regions(tmp_path):
     from app.services.vision_recognition import (
         ContentRecognitionItem,
@@ -629,9 +1015,10 @@ def test_marked_mode_localizes_normalized_error_mark_groups(tmp_path):
         "raw_mark_count": 2,
         "correction_group_count": 1,
         "paired_group_count": 0,
-        "single_mark_group_count": 1,
-        "deduplicated_mark_count": 1,
-    }
+            "single_mark_group_count": 1,
+            "deduplicated_mark_count": 1,
+            "review_required_mark_ids": [],
+        }
 
 
 def test_semantic_localization_retry_is_skipped_when_first_result_is_valid(tmp_path):

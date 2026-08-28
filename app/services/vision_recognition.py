@@ -30,13 +30,21 @@ from pydantic import (
 from app.config import settings
 from app.services.error_mark_validation import (
     ErrorMarkImageInvalid,
+    RedMarkRegion,
     RedMarkScanResult,
     filter_valid_error_marks,
+    group_red_evidence_regions,
+    merge_error_mark_attempts,
     normalize_error_mark_groups,
     validate_localization_red_evidence,
 )
 from app.services.question_collection import collection_reason_for, collection_status_for
-from app.services.question_image import render_numbered_question_sheet
+from app.services.question_image import (
+    local_bbox_to_page,
+    page_bbox_to_local,
+    render_mark_context,
+    render_numbered_question_sheet,
+)
 from app.services.recognition_policy import decide_candidate
 from app.services.tag_normalization import normalize_tags
 
@@ -53,6 +61,13 @@ FORMAT_RETRY_INSTRUCTION = (
     "\n\n格式纠偏：上次返回无法通过结构化解析。只返回严格 JSON，"
     "不要解释，不要 Markdown，不要在 JSON 前后添加任何文字。"
 )
+SAFE_LOCALIZATION_INCOMPLETE_REASONS = {
+    "question_cut_off",
+    "prompt_not_visible",
+    "answer_not_visible",
+    "ambiguous_sibling",
+    "not_visible",
+}
 logger = logging.getLogger(__name__)
 
 
@@ -86,6 +101,21 @@ MARK_QUESTION_LOCALIZATION_PROMPT = """你是小学作业错题范围定位器�
 5. bbox 使用归一化角点格式 [left, top, right, bottom]。
 6. 只返回严格 JSON：{"items":[{"mark_id":0,"matched":true,"bbox":[0.1,0.2,0.4,0.3],"confidence":0.95}]}；示例值只说明结构，必须按原图替换。
 7. 最外层必须是对象，根字段必须是 "items"；即使只有一个 mark_id，也必须放入 items 数组。
+
+输入：__INPUT__
+"""
+
+
+MARK_CONTEXT_LOCALIZATION_PROMPT = """你是小学作业单个错题的几何范围定位器。当前图片是一个红色判错事件附近的局部上下文，只处理输入的一个 mark_id。
+
+要求：
+1. 红圈只是答案区域的近似边界，不是要求完全相等的矩形；允许学生笔迹或格子略超出红圈，也允许红圈略大于实际答案。
+2. answer_bbox 必须覆盖被红圈标出的完整最小作答单元，不得只覆盖红叉、叉线或圈的一部分。
+3. prompt_bbox 覆盖与该答案直接对应的印刷提示；看不见时可为 null。
+4. question_bbox 必须同时完整包含 answer_bbox 和可见的 prompt_bbox，但不得吞入相邻兄弟小题。
+5. 如果题目被裁图边缘截断或无法可靠区分，matched=false，三个 bbox 均为 null，并填写 incomplete_reason。
+6. 所有 bbox 都使用当前局部图片的归一化 [left, top, right, bottom] 坐标。
+7. 只返回严格 JSON：{"items":[{"mark_id":0,"matched":true,"answer_bbox":[0.2,0.3,0.6,0.6],"prompt_bbox":[0.2,0.1,0.6,0.25],"question_bbox":[0.1,0.05,0.7,0.7],"incomplete_reason":null,"confidence":0.95}]}。
 
 输入：__INPUT__
 """
@@ -423,11 +453,16 @@ class LocalizationItem(BaseModel):
     matched: bool
     mark_ids: List[int] = Field(default_factory=list)
     bbox: Optional[List[float]] = None
+    answer_bbox: Optional[List[float]] = None
+    prompt_bbox: Optional[List[float]] = None
+    geometry_diagnostic: Optional[dict] = None
+    bbox_source: Optional[str] = None
+    localization_status: Optional[str] = None
     observed_prompt_text: Optional[str] = None
     observed_raw_text: Optional[str] = None
     confidence: float = Field(ge=0, le=1)
 
-    @field_validator("bbox")
+    @field_validator("bbox", "answer_bbox", "prompt_bbox")
     @classmethod
     def bbox_must_be_normalized(cls, value):
         if value is None:
@@ -459,17 +494,27 @@ class MarkQuestionLocalizationItem(BaseModel):
     mark_id: int = Field(ge=0)
     matched: bool
     bbox: Optional[List[float]] = None
+    answer_bbox: Optional[List[float]] = None
+    prompt_bbox: Optional[List[float]] = None
+    question_bbox: Optional[List[float]] = None
+    incomplete_reason: Optional[str] = None
     confidence: float = Field(ge=0, le=1)
 
-    @field_validator("bbox")
+    @field_validator("bbox", "answer_bbox", "prompt_bbox", "question_bbox")
     @classmethod
     def bbox_must_be_normalized(cls, value):
         return validate_normalized_bbox(value) if value is not None else None
 
     @model_validator(mode="after")
     def matched_result_must_have_bbox(self):
-        if self.matched != (self.bbox is not None):
-            raise ValueError("matched localization must have bbox")
+        geometry_bboxes = (self.answer_bbox, self.prompt_bbox, self.question_bbox)
+        if self.matched:
+            if self.bbox is None and self.question_bbox is None:
+                raise ValueError("matched localization must have a question bbox")
+            if self.question_bbox is not None and self.answer_bbox is None:
+                raise ValueError("context localization must have an answer bbox")
+        elif self.bbox is not None or any(value is not None for value in geometry_bboxes):
+            raise ValueError("unmatched localization cannot contain geometry")
         return self
 
 
@@ -651,6 +696,122 @@ def bboxes_intersect(first: List[float], second: List[float]) -> bool:
         or first[3] < second[1]
         or second[3] < first[1]
     )
+
+
+def _bbox_contains_bbox(container: List[float], candidate: List[float]) -> bool:
+    return (
+        container[0] <= candidate[0]
+        and container[1] <= candidate[1]
+        and container[2] >= candidate[2]
+        and container[3] >= candidate[3]
+    )
+
+
+def question_touches_context_edge(
+    question_bbox: List[float],
+    *,
+    edge_margin_ratio: float,
+    context_page_bbox: Optional[List[float]] = None,
+) -> bool:
+    """Return whether a context-local question bbox may have been clipped."""
+    if context_page_bbox is None:
+        context_left, context_top, context_right, context_bottom = [0.5] * 4
+    else:
+        context_left, context_top, context_right, context_bottom = context_page_bbox
+    return (
+        (question_bbox[0] <= edge_margin_ratio and context_left > 0)
+        or (question_bbox[1] <= edge_margin_ratio and context_top > 0)
+        or (question_bbox[2] >= 1 - edge_margin_ratio and context_right < 1)
+        or (question_bbox[3] >= 1 - edge_margin_ratio and context_bottom < 1)
+    )
+
+
+def circle_answer_geometry_diagnostic(
+    *,
+    circle_bbox: List[float],
+    answer_bbox: List[float],
+    question_bbox: List[float],
+    prompt_bbox: Optional[List[float]],
+    min_circle_overlap_ratio: float,
+    max_center_offset_ratio: float,
+    max_overflow_ratio: float,
+    min_answer_overlap_ratio: float = 0.5,
+    hard_min_circle_coverage_ratio: float = 0.1,
+) -> dict:
+    """Validate a circle as a tolerant prior, never as the exact answer bbox."""
+    intersection_width = max(
+        0.0, min(circle_bbox[2], answer_bbox[2]) - max(circle_bbox[0], answer_bbox[0])
+    )
+    intersection_height = max(
+        0.0, min(circle_bbox[3], answer_bbox[3]) - max(circle_bbox[1], answer_bbox[1])
+    )
+    intersection_area = intersection_width * intersection_height
+    circle_area = bbox_area(circle_bbox)
+    answer_area = bbox_area(answer_bbox)
+    answer_overlap_ratio = intersection_area / answer_area if answer_area > 0 else 0.0
+    circle_coverage_ratio = intersection_area / circle_area if circle_area > 0 else 0.0
+    circle_coverage_tier = (
+        "strong"
+        if circle_coverage_ratio >= min_circle_overlap_ratio
+        else (
+            "retry"
+            if circle_coverage_ratio >= hard_min_circle_coverage_ratio
+            else "rejected"
+        )
+    )
+
+    circle_width = circle_bbox[2] - circle_bbox[0]
+    circle_height = circle_bbox[3] - circle_bbox[1]
+    circle_scale = max(circle_width, circle_height)
+    circle_center = (
+        (circle_bbox[0] + circle_bbox[2]) / 2,
+        (circle_bbox[1] + circle_bbox[3]) / 2,
+    )
+    answer_center = (
+        (answer_bbox[0] + answer_bbox[2]) / 2,
+        (answer_bbox[1] + answer_bbox[3]) / 2,
+    )
+    center_offset_ratio = (
+        math.hypot(
+            answer_center[0] - circle_center[0],
+            answer_center[1] - circle_center[1],
+        )
+        / circle_scale
+        if circle_scale > 0
+        else math.inf
+    )
+    overflow_ratio = max(
+        (circle_bbox[0] - answer_bbox[0]) / circle_width,
+        (answer_bbox[2] - circle_bbox[2]) / circle_width,
+        (circle_bbox[1] - answer_bbox[1]) / circle_height,
+        (answer_bbox[3] - circle_bbox[3]) / circle_height,
+        0.0,
+    )
+
+    failure_reasons = []
+    if answer_overlap_ratio < min_answer_overlap_ratio:
+        failure_reasons.append("answer_overlap_insufficient")
+    if circle_coverage_tier == "retry":
+        failure_reasons.append("circle_coverage_needs_retry")
+    elif circle_coverage_tier == "rejected":
+        failure_reasons.append("circle_coverage_too_low")
+    if center_offset_ratio > max_center_offset_ratio:
+        failure_reasons.append("answer_center_outside_circle_tolerance")
+    if overflow_ratio > max_overflow_ratio:
+        failure_reasons.append("answer_overflow_exceeded")
+    if not _bbox_contains_bbox(question_bbox, answer_bbox):
+        failure_reasons.append("question_does_not_contain_answer")
+    if prompt_bbox is not None and not _bbox_contains_bbox(question_bbox, prompt_bbox):
+        failure_reasons.append("question_does_not_contain_prompt")
+    return {
+        "passed": not failure_reasons,
+        "failure_reasons": failure_reasons,
+        "answer_overlap_ratio": round(answer_overlap_ratio, 6),
+        "circle_coverage_ratio": round(circle_coverage_ratio, 6),
+        "circle_coverage_tier": circle_coverage_tier,
+        "answer_center_offset_ratio": round(center_offset_ratio, 6),
+        "answer_overflow_ratio": round(overflow_ratio, 6),
+    }
 
 
 def mark_distance_diagnostic(
@@ -1205,8 +1366,17 @@ def build_question_values(
     localization_geometry_passed = bool(
         geometry_diagnostic and geometry_diagnostic["passed"]
     )
+    independent_geometry_passed = bool(
+        localization
+        and localization.geometry_diagnostic
+        and localization.geometry_diagnostic.get("passed")
+    )
     localization_text_evidence_passed = bool(
-        localization and localization_matches_evidence(localization, item)
+        localization
+        and (
+            independent_geometry_passed
+            or localization_matches_evidence(localization, item)
+        )
     )
     assigned_marks = [
         marks[mark_id]
@@ -1229,6 +1399,9 @@ def build_question_values(
         or bool(item.uncertain_segments)
         or not localization_verified
         or circle_only_evidence
+        or bool(
+            localization and localization.localization_status == "needs_review"
+        )
     )
     crop_region = {
         "bbox_source": "unverified",
@@ -1236,7 +1409,7 @@ def build_question_values(
         "index": index,
     }
     if localization_verified:
-        bbox_source = (
+        bbox_source = localization.bbox_source or (
             "local_red_verified"
             if localization_red_verified and not localization.mark_ids
             else "minimax_marker_anchored"
@@ -1269,10 +1442,32 @@ def build_question_values(
                     "display_context_padding_ratio": crop_context_padding_ratio,
                 }
             )
+    elif (
+        localization is not None
+        and localization.bbox is not None
+        and localization.bbox_source
+        in {"circle_tolerant_fallback", "cross_tolerant_fallback"}
+    ):
+        crop_region = {
+            "bbox": localization.bbox,
+            "bbox_format": "normalized_ltrb",
+            "bbox_source": localization.bbox_source,
+            "bbox_confidence": localization.confidence,
+            "localization_status": "needs_review",
+            "mark_ids": localization.mark_ids,
+            "index": index,
+        }
     reliable_error_mark = bool(
         localization_verified
         and (localization.mark_ids or localization_red_verified)
     )
+    if (
+        localization is not None
+        and localization.bbox_source
+        in {"circle_tolerant_fallback", "cross_tolerant_fallback"}
+        and localization.mark_ids
+    ):
+        reliable_error_mark = True
     values = {
         "crop_region": crop_region,
         "subject": item.subject,
@@ -1391,6 +1586,167 @@ def localization_semantic_diagnostic(
     }
 
 
+def _mark_in_context(mark: ErrorMark, context_page_bbox: List[float]) -> ErrorMark:
+    updates = {"bbox": page_bbox_to_local(mark.bbox, context_page_bbox)}
+    if mark.cross_bbox is not None:
+        updates["cross_bbox"] = page_bbox_to_local(mark.cross_bbox, context_page_bbox)
+    if mark.circle_bbox is not None:
+        updates["circle_bbox"] = page_bbox_to_local(mark.circle_bbox, context_page_bbox)
+    return mark.model_copy(update=updates)
+
+
+def _localize_circle_mark_context(
+    *,
+    client,
+    image_path: str,
+    mark: ErrorMark,
+    padding_ratio: float,
+    retry_count: int,
+    image_max_edge: int,
+    image_jpeg_quality: int,
+    image_max_pixels: int,
+    min_circle_overlap_ratio: float,
+    min_answer_overlap_ratio: float,
+    hard_min_circle_coverage_ratio: float,
+    max_center_offset_ratio: float,
+    max_overflow_ratio: float,
+    edge_margin_ratio: float,
+) -> tuple[LocalizationItem, List[dict]]:
+    circle_bbox = mark.circle_bbox or mark.bbox
+    attempts = []
+    last_context = None
+    last_confidence = mark.confidence
+    for attempt_index in range(retry_count + 1):
+        context = render_mark_context(
+            image_path,
+            circle_bbox,
+            padding_ratio=padding_ratio * (2**attempt_index),
+            max_edge=image_max_edge,
+            jpeg_quality=image_jpeg_quality,
+            max_pixels=image_max_pixels,
+        )
+        last_context = context
+        temporary_path = None
+        failure_reasons = []
+        item = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temporary:
+                temporary.write(context.image_bytes)
+                temporary_path = temporary.name
+            result = client.locate_marked_question_context(
+                temporary_path,
+                _mark_in_context(mark, context.page_bbox),
+                correction=(
+                    {"previous_failure_reasons": attempts[-1]["failure_reasons"]}
+                    if attempts
+                    else None
+                ),
+            )
+            item = next(
+                (candidate for candidate in result.items if candidate.mark_id == mark.mark_id),
+                None,
+            )
+        except VisionRecognitionError as exc:
+            failure_reasons = [exc.code]
+        finally:
+            if temporary_path is not None:
+                Path(temporary_path).unlink(missing_ok=True)
+
+        geometry = None
+        edge_touched = False
+        if item is None:
+            failure_reasons = failure_reasons or ["missing_mark_result"]
+        elif (
+            not item.matched
+            or item.answer_bbox is None
+            or item.question_bbox is None
+        ):
+            failure_reasons = [
+                item.incomplete_reason
+                if item.incomplete_reason in SAFE_LOCALIZATION_INCOMPLETE_REASONS
+                else "incomplete_localization"
+            ]
+            last_confidence = item.confidence
+        else:
+            last_confidence = item.confidence
+            edge_touched = question_touches_context_edge(
+                item.question_bbox,
+                edge_margin_ratio=edge_margin_ratio,
+                context_page_bbox=context.page_bbox,
+            )
+            answer_bbox = local_bbox_to_page(item.answer_bbox, context.page_bbox)
+            prompt_bbox = (
+                local_bbox_to_page(item.prompt_bbox, context.page_bbox)
+                if item.prompt_bbox is not None
+                else None
+            )
+            question_bbox = local_bbox_to_page(item.question_bbox, context.page_bbox)
+            geometry = circle_answer_geometry_diagnostic(
+                circle_bbox=circle_bbox,
+                answer_bbox=answer_bbox,
+                question_bbox=question_bbox,
+                prompt_bbox=prompt_bbox,
+                min_circle_overlap_ratio=min_circle_overlap_ratio,
+                min_answer_overlap_ratio=min_answer_overlap_ratio,
+                hard_min_circle_coverage_ratio=hard_min_circle_coverage_ratio,
+                max_center_offset_ratio=max_center_offset_ratio,
+                max_overflow_ratio=max_overflow_ratio,
+            )
+            failure_reasons = list(geometry["failure_reasons"])
+            if edge_touched:
+                failure_reasons.append("question_bbox_touches_context_edge")
+            if not failure_reasons:
+                attempts.append(
+                    {
+                        "attempt": attempt_index + 1,
+                        "failure_reasons": [],
+                        "edge_touched": False,
+                    }
+                )
+                return (
+                    LocalizationItem(
+                        index=0,
+                        matched=True,
+                        mark_ids=[mark.mark_id],
+                        bbox=question_bbox,
+                        answer_bbox=answer_bbox,
+                        prompt_bbox=prompt_bbox,
+                        geometry_diagnostic=geometry,
+                        bbox_source="circle_tolerant_llm",
+                        localization_status="verified",
+                        confidence=item.confidence,
+                    ),
+                    attempts,
+                )
+        attempts.append(
+            {
+                "attempt": attempt_index + 1,
+                "failure_reasons": failure_reasons,
+                "edge_touched": edge_touched,
+            }
+        )
+
+    fallback_bbox = last_context.page_bbox if last_context is not None else circle_bbox
+    return (
+        LocalizationItem(
+            index=0,
+            matched=True,
+            mark_ids=[mark.mark_id],
+            bbox=fallback_bbox,
+            answer_bbox=circle_bbox,
+            prompt_bbox=None,
+            geometry_diagnostic={
+                "passed": False,
+                "failure_reasons": ["circle_localization_retry_exhausted"],
+            },
+            bbox_source="circle_tolerant_fallback",
+            localization_status="needs_review",
+            confidence=last_confidence,
+        ),
+        attempts,
+    )
+
+
 def recognize_marked_three_stage(
     *,
     client,
@@ -1410,6 +1766,17 @@ def recognize_marked_three_stage(
     localization_stage_retry_count: int = 1,
     content_stage_retry_count: int = 1,
     content_batch_size: int = 6,
+    pair_max_relative_distance_ratio: float = 1.0,
+    pair_min_margin_ratio: float = 0.2,
+    circle_context_padding_ratio: float = 1.0,
+    answer_min_circle_overlap_ratio: float = 0.25,
+    answer_min_answer_overlap_ratio: float = 0.5,
+    answer_hard_min_circle_coverage_ratio: float = 0.1,
+    answer_max_center_offset_ratio: float = 0.75,
+    answer_max_overflow_ratio: float = 0.5,
+    localization_edge_margin_ratio: float = 0.02,
+    local_red_group_max_gap_ratio: float = 0.03,
+    local_red_group_max_area_ratio: float = 0.08,
 ) -> tuple[VisionResult, dict[int, LocalizationItem], List[ErrorMark], dict]:
     """Run isolated mark, geometry, and content stages for a marked page."""
     diagnostic = {
@@ -1432,11 +1799,28 @@ def recognize_marked_three_stage(
         "missing_content_mark_ids": [],
     }
     started = time.perf_counter()
+    evidence_regions = [
+        RedMarkRegion(
+            bbox=region,
+            pixel_count=1,
+            area_ratio=bbox_area(region),
+            thinness_ratio=max(region[2] - region[0], region[3] - region[1])
+            / max(min(region[2] - region[0], region[3] - region[1]), 1e-9),
+        )
+        for region in local_red_regions
+    ]
+    grouped_evidence, evidence_diagnostic = group_red_evidence_regions(
+        evidence_regions,
+        max_gap_ratio=local_red_group_max_gap_ratio,
+        max_group_area_ratio=local_red_group_max_area_ratio,
+    )
+    local_red_regions = [list(region.bbox) for region in grouped_evidence]
+    diagnostic.update(evidence_diagnostic)
+    valid_attempts = []
     valid_marks = []
     grouping_diagnostic = {}
-    best_valid_marks = []
-    best_grouping_diagnostic = {}
-    best_uncovered_regions = list(local_red_regions)
+    merge_diagnostic = {}
+    uncovered_regions = list(local_red_regions)
     for mark_attempt in range(mark_stage_retry_count + 1):
         diagnostic["mark_llm_attempts"] += 1
         detected = client.detect_marks(
@@ -1444,13 +1828,13 @@ def recognize_marked_three_stage(
             local_red_regions,
             correction=(
                 "上次仍有本地红色候选区域未被覆盖，请重点复查这些区域并只输出独立几何形状："
-                + json.dumps(best_uncovered_regions, separators=(",", ":"))
+                + json.dumps(uncovered_regions, separators=(",", ":"))
                 if mark_attempt
                 else None
             ),
         )
         diagnostic["mark_primitive_count"] = len(detected.error_marks)
-        valid_marks, _rejected_mark_ids, _mark_diagnostics = filter_valid_error_marks(
+        attempt_marks, _rejected_mark_ids, _mark_diagnostics = filter_valid_error_marks(
             image_path,
             detected.error_marks,
             confidence_threshold=mark_confidence_threshold,
@@ -1459,30 +1843,32 @@ def recognize_marked_three_stage(
             component_fallback_enabled=False,
             component_pair_max_distance_ratio=pair_max_distance_ratio,
         )
+        valid_attempts.append(attempt_marks)
+        merged_primitives, merge_diagnostic = merge_error_mark_attempts(
+            valid_attempts,
+            dedup_iou_threshold=dedup_iou_threshold,
+        )
         valid_marks, grouping_diagnostic = normalize_error_mark_groups(
-            valid_marks,
+            merged_primitives,
             dedup_iou_threshold=dedup_iou_threshold,
             pair_max_distance_ratio=pair_max_distance_ratio,
+            pair_max_relative_distance_ratio=pair_max_relative_distance_ratio,
+            pair_min_margin_ratio=pair_min_margin_ratio,
         )
         uncovered_regions = [
             region
             for region in local_red_regions
             if not any(bboxes_intersect(region, mark.bbox) for mark in valid_marks)
         ]
-        current_score = (len(valid_marks), -len(uncovered_regions))
-        best_score = (len(best_valid_marks), -len(best_uncovered_regions))
-        if current_score > best_score:
-            best_valid_marks = list(valid_marks)
-            best_grouping_diagnostic = dict(grouping_diagnostic)
-            best_uncovered_regions = list(uncovered_regions)
         if valid_marks and not uncovered_regions:
             break
-    valid_marks = best_valid_marks
-    grouping_diagnostic = best_grouping_diagnostic
     diagnostic["mark_llm_ms"] = round((time.perf_counter() - started) * 1000, 2)
     diagnostic["mark_event_count"] = len(valid_marks)
-    diagnostic["uncovered_local_red_region_count"] = len(best_uncovered_regions)
-    diagnostic["mark_grouping"] = grouping_diagnostic
+    diagnostic["uncovered_local_red_region_count"] = len(uncovered_regions)
+    diagnostic["mark_grouping"] = {**grouping_diagnostic, **merge_diagnostic}
+    review_required_mark_ids = set(
+        grouping_diagnostic.get("review_required_mark_ids", [])
+    )
     if not valid_marks:
         raise ImageReviewRequired(
             "red_marks_unresolved",
@@ -1493,29 +1879,134 @@ def recognize_marked_three_stage(
     started = time.perf_counter()
     located_by_mark = {}
     marks_by_id = {mark.mark_id: mark for mark in valid_marks}
+    diagnostic["per_mark_localization"] = []
+    context_localization_available = hasattr(
+        client, "locate_marked_question_context"
+    )
+    context_marks = (
+        [
+            mark
+            for mark in valid_marks
+            if mark.mark_type in {"circle", "cross_circle"}
+        ]
+        if context_localization_available
+        else []
+    )
+    for mark in context_marks:
+        localization, attempt_diagnostics = _localize_circle_mark_context(
+            client=client,
+            image_path=image_path,
+            mark=mark,
+            padding_ratio=circle_context_padding_ratio,
+            retry_count=localization_stage_retry_count,
+            image_max_edge=image_max_edge,
+            image_jpeg_quality=image_jpeg_quality,
+            image_max_pixels=image_max_pixels,
+            min_circle_overlap_ratio=answer_min_circle_overlap_ratio,
+            min_answer_overlap_ratio=answer_min_answer_overlap_ratio,
+            hard_min_circle_coverage_ratio=answer_hard_min_circle_coverage_ratio,
+            max_center_offset_ratio=answer_max_center_offset_ratio,
+            max_overflow_ratio=answer_max_overflow_ratio,
+            edge_margin_ratio=localization_edge_margin_ratio,
+        )
+        diagnostic["localization_llm_attempts"] += len(attempt_diagnostics)
+        if mark.mark_id in review_required_mark_ids:
+            localization = localization.model_copy(
+                update={"localization_status": "needs_review"}
+            )
+        diagnostic["per_mark_localization"].append(
+            {
+                "mark_id": mark.mark_id,
+                "attempts": attempt_diagnostics,
+                "bbox_source": localization.bbox_source,
+                "localization_status": localization.localization_status,
+            }
+        )
+        located_by_mark[mark.mark_id] = localization
+
+    legacy_marks = [
+        mark for mark in valid_marks if mark.mark_id not in located_by_mark
+    ]
     for localization_attempt in range(localization_stage_retry_count + 1):
+        if not legacy_marks:
+            break
         diagnostic["localization_llm_attempts"] += 1
-        missing_before = sorted(set(marks_by_id) - set(located_by_mark))
+        missing_before = sorted(
+            mark.mark_id
+            for mark in legacy_marks
+            if mark.mark_id not in located_by_mark
+        )
+        if not missing_before:
+            break
         location_result = client.locate_marked_questions(
             image_path,
-            valid_marks,
+            [marks_by_id[mark_id] for mark_id in missing_before],
             correction=(
                 {"missing_mark_ids": missing_before}
-                if localization_attempt and missing_before
+                if localization_attempt
                 else None
             ),
         )
-        located_by_mark.update(
+        for item in location_result.items:
+            if (
+                item.mark_id not in missing_before
+                or not item.matched
+                or item.bbox is None
+            ):
+                continue
+            mark = marks_by_id[item.mark_id]
+            located_by_mark[item.mark_id] = LocalizationItem(
+                index=0,
+                matched=True,
+                mark_ids=[item.mark_id],
+                bbox=item.bbox,
+                geometry_diagnostic={
+                    "passed": True,
+                    "failure_reasons": [],
+                    "source": "legacy_stage_geometry",
+                },
+                bbox_source=(
+                    "cross_only_llm"
+                    if mark.mark_type == "cross"
+                    else "legacy_mark_localization"
+                ),
+                localization_status=(
+                    "needs_review" if mark.mark_type == "cross" else "verified"
+                ),
+                confidence=item.confidence,
+            )
+    for mark in valid_marks:
+        if mark.mark_type != "cross" or mark.mark_id in located_by_mark:
+            continue
+        context = render_mark_context(
+            image_path,
+            mark.bbox,
+            padding_ratio=circle_context_padding_ratio,
+            max_edge=image_max_edge,
+            jpeg_quality=image_jpeg_quality,
+            max_pixels=image_max_pixels,
+        )
+        located_by_mark[mark.mark_id] = LocalizationItem(
+            index=0,
+            matched=True,
+            mark_ids=[mark.mark_id],
+            bbox=context.page_bbox,
+            geometry_diagnostic={
+                "passed": False,
+                "failure_reasons": ["cross_localization_retry_exhausted"],
+            },
+            bbox_source="cross_tolerant_fallback",
+            localization_status="needs_review",
+            confidence=mark.confidence,
+        )
+        diagnostic["per_mark_localization"].append(
             {
-                item.mark_id: item
-                for item in location_result.items
-                if item.mark_id in marks_by_id
-                and item.matched
-                and item.bbox is not None
+                "mark_id": mark.mark_id,
+                "attempts": [],
+                "bbox_source": "cross_tolerant_fallback",
+                "localization_status": "needs_review",
             }
         )
-        if set(located_by_mark) == set(marks_by_id):
-            break
     diagnostic["localization_llm_ms"] = round(
         (time.perf_counter() - started) * 1000, 2
     )
@@ -1606,15 +2097,7 @@ def recognize_marked_three_stage(
         content_item = content_by_mark[mark_id]
         items.append(VisionItem.model_validate(content_item.model_dump(exclude={"mark_id"})))
         located = located_by_mark[mark_id]
-        localizations[index] = LocalizationItem(
-            index=index,
-            matched=True,
-            mark_ids=[mark_id],
-            bbox=located.bbox,
-            observed_prompt_text=content_item.prompt_text,
-            observed_raw_text=content_item.raw_text,
-            confidence=located.confidence,
-        )
+        localizations[index] = located.model_copy(update={"index": index})
     return (
         VisionResult(items=items, error_marks=valid_marks, ignored_text=[]),
         localizations,
@@ -1644,6 +2127,8 @@ def recognize_question_batch(
     force_mode: Optional[Literal["marked", "unmarked"]] = None,
     correction_group_enabled: bool = True,
     pair_max_distance_ratio: float = 0.12,
+    pair_max_relative_distance_ratio: float = 1.0,
+    pair_min_margin_ratio: float = 0.2,
     dedup_iou_threshold: float = 0.8,
     anchor_max_gap_ratio: float = 0.0,
     cross_only_max_gap_ratio: float = 0.0,
@@ -1658,6 +2143,15 @@ def recognize_question_batch(
     image_max_edge: int = 2048,
     image_jpeg_quality: int = 90,
     image_max_pixels: int = 40_000_000,
+    circle_context_padding_ratio: float = 1.0,
+    answer_min_circle_overlap_ratio: float = 0.25,
+    answer_min_answer_overlap_ratio: float = 0.5,
+    answer_hard_min_circle_coverage_ratio: float = 0.1,
+    answer_max_center_offset_ratio: float = 0.75,
+    answer_max_overflow_ratio: float = 0.5,
+    localization_edge_margin_ratio: float = 0.02,
+    local_red_group_max_gap_ratio: float = 0.03,
+    local_red_group_max_area_ratio: float = 0.08,
 ) -> tuple[VisionResult, List[dict]]:
     """Recognize, localize, and apply adaptive local evidence policy."""
     legacy_mode = local_red_scan is None
@@ -1682,8 +2176,19 @@ def recognize_question_batch(
             red_pixel_min_ratio=red_pixel_min_ratio,
             red_pixel_expansion_ratio=red_pixel_expansion_ratio,
             pair_max_distance_ratio=pair_max_distance_ratio,
+            pair_max_relative_distance_ratio=pair_max_relative_distance_ratio,
+            pair_min_margin_ratio=pair_min_margin_ratio,
             dedup_iou_threshold=dedup_iou_threshold,
             crop_context_padding_ratio=crop_context_padding_ratio,
+            circle_context_padding_ratio=circle_context_padding_ratio,
+            answer_min_circle_overlap_ratio=answer_min_circle_overlap_ratio,
+            answer_min_answer_overlap_ratio=answer_min_answer_overlap_ratio,
+            answer_hard_min_circle_coverage_ratio=answer_hard_min_circle_coverage_ratio,
+            answer_max_center_offset_ratio=answer_max_center_offset_ratio,
+            answer_max_overflow_ratio=answer_max_overflow_ratio,
+            localization_edge_margin_ratio=localization_edge_margin_ratio,
+            local_red_group_max_gap_ratio=local_red_group_max_gap_ratio,
+            local_red_group_max_area_ratio=local_red_group_max_area_ratio,
             image_max_edge=image_max_edge,
             image_jpeg_quality=image_jpeg_quality,
             image_max_pixels=image_max_pixels,
@@ -1726,6 +2231,8 @@ def recognize_question_batch(
             force_mode="marked",
             correction_group_enabled=correction_group_enabled,
             pair_max_distance_ratio=pair_max_distance_ratio,
+            pair_max_relative_distance_ratio=pair_max_relative_distance_ratio,
+            pair_min_margin_ratio=pair_min_margin_ratio,
             dedup_iou_threshold=dedup_iou_threshold,
             anchor_max_gap_ratio=anchor_max_gap_ratio,
             cross_only_max_gap_ratio=cross_only_max_gap_ratio,
@@ -1776,6 +2283,8 @@ def recognize_question_batch(
                 valid_marks,
                 dedup_iou_threshold=dedup_iou_threshold,
                 pair_max_distance_ratio=pair_max_distance_ratio,
+                pair_max_relative_distance_ratio=pair_max_relative_distance_ratio,
+                pair_min_margin_ratio=pair_min_margin_ratio,
             )
         else:
             correction_group_validation = {
@@ -2729,6 +3238,37 @@ class MiniMaxVisionClient:
             "__INPUT__",
             json.dumps(
                 {"error_marks": [mark.model_dump(mode="json") for mark in error_marks]},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        if correction:
+            prompt += "\n\n定位纠偏：" + json.dumps(
+                correction, ensure_ascii=False, separators=(",", ":")
+            )
+        return self._request(
+            {"prompt": prompt, "image_url": image_url},
+            MarkQuestionLocalizationResult,
+            diagnostic,
+        )
+
+    def locate_marked_question_context(
+        self,
+        context_image_path: str,
+        error_mark: ErrorMark,
+        correction: Optional[dict] = None,
+    ) -> MarkQuestionLocalizationResult:
+        diagnostic = {
+            "operation": "mark_context_localization",
+            "mark_id": error_mark.mark_id,
+        }
+        image_url = prepare_image_data_url(
+            context_image_path, self.max_edge, self.jpeg_quality, diagnostic
+        )
+        prompt = MARK_CONTEXT_LOCALIZATION_PROMPT.replace(
+            "__INPUT__",
+            json.dumps(
+                {"error_mark": error_mark.model_dump(mode="json")},
                 ensure_ascii=False,
                 indent=2,
             ),

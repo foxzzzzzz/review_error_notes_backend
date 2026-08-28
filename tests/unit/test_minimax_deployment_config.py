@@ -16,6 +16,15 @@ EXPECTED_ADAPTIVE_EVIDENCE_SETTINGS = {
     "MINIMAX_CONTENT_BATCH_SIZE": "6",
     "MARK_CORRECTION_GROUP_ENABLED": "true",
     "MARK_PAIR_MAX_DISTANCE_RATIO": "0.04",
+    "MARK_PAIR_MAX_RELATIVE_DISTANCE_RATIO": "1.0",
+    "MARK_PAIR_MIN_MARGIN_RATIO": "0.2",
+    "MARK_CIRCLE_CONTEXT_PADDING_RATIO": "1.0",
+    "MARK_ANSWER_MIN_CIRCLE_OVERLAP_RATIO": "0.25",
+    "MARK_ANSWER_MIN_ANSWER_OVERLAP_RATIO": "0.5",
+    "MARK_ANSWER_HARD_MIN_CIRCLE_COVERAGE_RATIO": "0.1",
+    "MARK_ANSWER_MAX_CENTER_OFFSET_RATIO": "0.75",
+    "MARK_ANSWER_MAX_OVERFLOW_RATIO": "0.5",
+    "MARK_LOCALIZATION_EDGE_MARGIN_RATIO": "0.02",
     "MARK_ANCHOR_MAX_GAP_RATIO": "0.08",
     "MARK_CROSS_ONLY_MAX_GAP_RATIO": "0.08",
     "MARK_DEDUP_IOU_THRESHOLD": "0.8",
@@ -28,6 +37,7 @@ EXPECTED_ADAPTIVE_EVIDENCE_SETTINGS = {
     "LOCAL_RED_COMPONENT_MIN_PIXELS": "12",
     "LOCAL_RED_COMPONENT_MAX_AREA_RATIO": "0.08",
     "LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO": "18",
+    "LOCAL_RED_GROUP_MAX_GAP_RATIO": "0.03",
     "LOCAL_RED_RESCUE_MIN_PIXELS": "80",
     "MINIMAX_MARK_MISMATCH_RETRY_COUNT": "1",
     "CELERY_WORKER_CONCURRENCY": "2",
@@ -102,6 +112,16 @@ def test_adaptive_local_evidence_settings_are_bounded():
     assert settings.MINIMAX_CONTENT_BATCH_SIZE == 6
     assert settings.MARK_CORRECTION_GROUP_ENABLED is True
     assert settings.MARK_PAIR_MAX_DISTANCE_RATIO == 0.04
+    assert settings.MARK_PAIR_MAX_RELATIVE_DISTANCE_RATIO == 1.0
+    assert settings.MARK_PAIR_MIN_MARGIN_RATIO == 0.2
+    assert settings.MARK_CIRCLE_CONTEXT_PADDING_RATIO == 1.0
+    assert settings.MARK_ANSWER_MIN_CIRCLE_OVERLAP_RATIO == 0.25
+    assert settings.MARK_ANSWER_MIN_ANSWER_OVERLAP_RATIO == 0.5
+    assert settings.MARK_ANSWER_HARD_MIN_CIRCLE_COVERAGE_RATIO == 0.1
+    assert settings.MARK_ANSWER_MAX_CENTER_OFFSET_RATIO == 0.75
+    assert settings.MARK_ANSWER_MAX_OVERFLOW_RATIO == 0.5
+    assert settings.MARK_LOCALIZATION_EDGE_MARGIN_RATIO == 0.02
+    assert settings.LOCAL_RED_GROUP_MAX_GAP_RATIO == 0.03
     assert settings.MARK_ANCHOR_MAX_GAP_RATIO == 0.08
     assert settings.MARK_CROSS_ONLY_MAX_GAP_RATIO == 0.08
     assert settings.MARK_DEDUP_IOU_THRESHOLD == 0.8
@@ -123,6 +143,10 @@ def test_adaptive_local_evidence_settings_are_bounded():
         Settings(_env_file=None, LOCAL_RED_RESCUE_MIN_PIXELS=0)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, MARK_PAIR_MAX_DISTANCE_RATIO=1.01)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, MARK_PAIR_MIN_MARGIN_RATIO=1.01)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, MARK_LOCALIZATION_EDGE_MARGIN_RATIO=0.26)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, MARK_DEDUP_IOU_THRESHOLD=0)
     with pytest.raises(ValidationError):
@@ -146,6 +170,17 @@ def test_worker_passes_correction_group_settings_to_recognition_batch():
         "content_batch_size": "MINIMAX_CONTENT_BATCH_SIZE",
         "correction_group_enabled": "MARK_CORRECTION_GROUP_ENABLED",
         "pair_max_distance_ratio": "MARK_PAIR_MAX_DISTANCE_RATIO",
+        "pair_max_relative_distance_ratio": "MARK_PAIR_MAX_RELATIVE_DISTANCE_RATIO",
+        "pair_min_margin_ratio": "MARK_PAIR_MIN_MARGIN_RATIO",
+        "circle_context_padding_ratio": "MARK_CIRCLE_CONTEXT_PADDING_RATIO",
+        "answer_min_circle_overlap_ratio": "MARK_ANSWER_MIN_CIRCLE_OVERLAP_RATIO",
+        "answer_min_answer_overlap_ratio": "MARK_ANSWER_MIN_ANSWER_OVERLAP_RATIO",
+        "answer_hard_min_circle_coverage_ratio": "MARK_ANSWER_HARD_MIN_CIRCLE_COVERAGE_RATIO",
+        "answer_max_center_offset_ratio": "MARK_ANSWER_MAX_CENTER_OFFSET_RATIO",
+        "answer_max_overflow_ratio": "MARK_ANSWER_MAX_OVERFLOW_RATIO",
+        "localization_edge_margin_ratio": "MARK_LOCALIZATION_EDGE_MARGIN_RATIO",
+        "local_red_group_max_gap_ratio": "LOCAL_RED_GROUP_MAX_GAP_RATIO",
+        "local_red_group_max_area_ratio": "LOCAL_RED_COMPONENT_MAX_AREA_RATIO",
         "dedup_iou_threshold": "MARK_DEDUP_IOU_THRESHOLD",
         "anchor_max_gap_ratio": "MARK_ANCHOR_MAX_GAP_RATIO",
         "cross_only_max_gap_ratio": "MARK_CROSS_ONLY_MAX_GAP_RATIO",
