@@ -552,8 +552,11 @@ sudo docker compose run --rm --no-deps \
   --expected page34=1 \
   --expected page35=5 \
   --subject chinese \
+  --compare-stable-events \
   --output "/diagnostic-output/$(basename "$diagnostic_run")"
 ```
+
+`--compare-stable-events` 会在现有生产三阶段链路之后额外执行两次视觉调用：第一次不接收任何本地 CV 坐标，只从原始整页识别完整红圈/红叉 primitive；第二次读取带 P 编号的整页叠加图，将 primitive 一对一归并为稳定 event ID。本地 CV 只在归并完成后审计红色像素支持和未覆盖组件，不允许创建、删除、合并或重编号事件。该模式仅用于 page33～35 对比实验，不会改变线上识别行为。
 
 脚本即使某一阶段失败，也会保留此前已生成的证据，并以非零状态退出。重点查看：
 
@@ -562,6 +565,11 @@ sudo docker compose run --rm --no-deps \
 - `pageXX/llm-calls/call-NNN-*/input.jpg`：该次 LLM 实际收到的整图、编号红区图或题目裁图。
 - 每个调用目录下的 `event-*-request.json`、`http_response.json`、`parsed_response.json`、`validated_response.json`：Prompt、原始 HTTP 响应、规范化前后 JSON 和最终结构化结果。
 - `pageXX/pipeline-diagnostic.json`、`pipeline-overlay.jpg`：合并/配对/定位/内容阶段的后端决策及最终坐标叠加图。
+- `pageXX/stable-event-experiment/independent-primitives.json`、`numbered-primitives.jpg`：不接收 CV 坐标的独立整页几何检测结果及 P 编号叠加图。
+- `pageXX/stable-event-experiment/stable-events.json`、`assignment-audit.json`、`duplicate-event-candidates.json`、`stable-events-overlay.jpg`：一对一归并结果、primitive 完整性校验、仍可能重复的高度包含事件对及稳定事件叠加图。
+- `pageXX/stable-event-experiment/cv-post-validation.json`：CV 后验支持度和未覆盖组件；其中 `event_count_before` 必须等于 `event_count_after`。
+
+对比实验每张图固定增加 2 个 MiniMax 逻辑阶段，因此三张图共增加 6 个逻辑调用；若遇到 JSON/结构重试，实际 HTTP 请求数会更多。完整命令仍会先跑当前生产三阶段流程，执行数分钟属于正常现象。只比较新第一阶段、跳过当前生产流程的开关尚未提供，避免两组测试条件不一致。
 
 若只验证本地 CV、不调用 MiniMax，在命令末尾增加 `--cv-only`。完整诊断后可压缩回传：
 

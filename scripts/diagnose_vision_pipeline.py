@@ -10,12 +10,14 @@ import argparse
 import json
 import shutil
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from PIL import Image, ImageDraw, ImageOps
 import numpy as np
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -28,9 +30,115 @@ from app.services.error_mark_validation import (
     scan_red_mark_regions,
 )
 from app.services.vision_recognition import (
+    ErrorMark,
+    MarkDetectionResult,
     MiniMaxVisionClient,
+    prepare_image_data_url,
     recognize_marked_three_stage,
+    validate_normalized_bbox,
 )
+
+
+STABLE_EVENT_CONSOLIDATION_PROMPT = """你是小学作业红色批改事件归并器。图片是在原始整页作业上叠加了 P0、P1... 编号框的红色几何标记候选；输入 JSON 同时给出每个 primitive 的类型和整页坐标。
+
+目标：把属于同一次判错的邻近红圈和红叉归并为一个稳定事件，确保一个真实圈叉组合只产生一个 event_id。
+
+要求：
+1. 每个 primitive_id 必须且只能出现一次：要么属于某个 event 的 primitive_ids，要么放入 unassigned_primitive_ids。
+2. 同一作答单元附近、几何距离相近的 circle 与 cross 应归并为 cross_circle；不得因框大小不同或局部重叠而重复建立事件。
+3. 不同作答单元的标记不得合并；无法确定归属的 primitive 放入 unassigned_primitive_ids，不得猜测。
+4. bbox、cross_bbox、circle_bbox 均使用原始整页归一化坐标，并覆盖图片中可见的完整几何形状，不得只复制输入中的红线碎片框。
+5. event_id 从 0 开始连续且唯一。只返回严格 JSON，不要解释或 Markdown。
+
+返回格式：{"events":[{"event_id":0,"primitive_ids":[0,1],"event_type":"cross_circle","bbox":[0.1,0.2,0.4,0.5],"cross_bbox":[0.3,0.2,0.4,0.35],"circle_bbox":[0.1,0.25,0.35,0.5],"confidence":0.95}],"unassigned_primitive_ids":[]}。
+
+输入 primitives：__PRIMITIVES__
+"""
+
+
+INDEPENDENT_COMPLETE_MARK_PROMPT = """你是小学作业红色批改几何标记检测器。请只根据当前原始整页图片，独立识别老师手写的完整红圈、红叉、删除线、下划线、批注或其他明确错误标记。
+
+要求：
+1. 不接收也不得推测任何外部候选坐标；逐个观察原图中的完整几何形状。
+2. circle 的 bbox 必须覆盖完整闭合或近似闭合红圈；cross 的 bbox 必须覆盖两条相交笔画。不得把圆弧、叉的一条笔画或孤立红线作为独立标记。
+3. 此阶段只输出独立 primitive，不配对圈叉，不识别题目内容。
+4. 不要把印刷红色方格、页眉线、装饰色或单独红色对勾当作错误标记。
+5. bbox 使用整页归一化 [left, top, right, bottom]；mark_id 从 0 开始连续且唯一。
+6. 只返回严格 JSON：{"error_marks":[{"mark_id":0,"mark_type":"circle","bbox":[0.1,0.2,0.3,0.4],"cross_bbox":null,"circle_bbox":null,"confidence":0.95}]}。
+"""
+
+
+class StableMarkEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    event_id: int = Field(ge=0)
+    primitive_ids: list[int] = Field(min_length=1)
+    event_type: Literal[
+        "cross_circle",
+        "circle",
+        "cross",
+        "deletion",
+        "underline",
+        "annotation",
+        "mixed",
+    ]
+    bbox: list[float]
+    cross_bbox: list[float] | None = None
+    circle_bbox: list[float] | None = None
+    confidence: float = Field(ge=0, le=1)
+
+    @field_validator("bbox", "cross_bbox", "circle_bbox")
+    @classmethod
+    def bbox_must_be_normalized(cls, value):
+        return validate_normalized_bbox(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def component_boxes_must_match_event_type(self):
+        if self.event_type == "cross_circle" and not (
+            self.cross_bbox and self.circle_bbox
+        ):
+            raise ValueError("cross_circle requires cross_bbox and circle_bbox")
+        if self.event_type == "circle" and self.circle_bbox is None:
+            raise ValueError("circle requires circle_bbox")
+        if self.event_type == "cross" and self.cross_bbox is None:
+            raise ValueError("cross requires cross_bbox")
+        return self
+
+
+class StableEventResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    events: list[StableMarkEvent] = Field(default_factory=list)
+    unassigned_primitive_ids: list[int] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def assignments_must_be_unique(self):
+        event_ids = [event.event_id for event in self.events]
+        if event_ids != list(range(len(event_ids))):
+            raise ValueError("stable event ids must be unique and sequential")
+        assigned = [
+            primitive_id
+            for event in self.events
+            for primitive_id in event.primitive_ids
+        ]
+        duplicates = sorted(
+            primitive_id
+            for primitive_id in set(assigned)
+            if assigned.count(primitive_id) > 1
+        )
+        if duplicates:
+            raise ValueError(f"primitive ids assigned more than once: {duplicates}")
+        if len(self.unassigned_primitive_ids) != len(
+            set(self.unassigned_primitive_ids)
+        ):
+            raise ValueError("unassigned primitive ids must be unique")
+        overlap = sorted(set(assigned) & set(self.unassigned_primitive_ids))
+        if overlap:
+            raise ValueError(f"primitive ids both assigned and unassigned: {overlap}")
+        return self
+
+
+StableEventResult.model_rebuild(_types_namespace=globals())
 
 
 def _json_value(value: Any) -> Any:
@@ -86,6 +194,24 @@ def _draw_boxes(
     image.save(output_path, format="JPEG", quality=92)
 
 
+def _red_mask_for_image(image_path: Path, max_edge: int) -> np.ndarray:
+    with Image.open(image_path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        if max(image.size) > max_edge:
+            image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+    pixels = np.asarray(image, dtype=np.int16)
+    red = pixels[:, :, 0]
+    green = pixels[:, :, 1]
+    blue = pixels[:, :, 2]
+    return (
+        (red >= 120)
+        & (red - green >= 45)
+        & (red - blue >= 45)
+        & (red >= green * 1.35)
+        & (red >= blue * 1.35)
+    )
+
+
 def write_cv_artifacts(
     image_path: Path,
     output_dir: Path,
@@ -124,21 +250,7 @@ def write_cv_artifacts(
         **grouping,
     }
     _write_json(output_dir / "cv" / "evidence.json", payload)
-    with Image.open(image_path) as source:
-        mask_source = ImageOps.exif_transpose(source).convert("RGB")
-        if max(mask_source.size) > max_edge:
-            mask_source.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
-    pixels = np.asarray(mask_source, dtype=np.int16)
-    red = pixels[:, :, 0]
-    green = pixels[:, :, 1]
-    blue = pixels[:, :, 2]
-    red_mask = (
-        (red >= 120)
-        & (red - green >= 45)
-        & (red - blue >= 45)
-        & (red >= green * 1.35)
-        & (red >= blue * 1.35)
-    )
+    red_mask = _red_mask_for_image(image_path, max_edge)
     Image.fromarray((red_mask * 255).astype(np.uint8), mode="L").save(
         output_dir / "cv" / "red-mask.png"
     )
@@ -147,7 +259,131 @@ def write_cv_artifacts(
         output_dir / "cv" / "components-and-groups.jpg",
         [("C", components, "red"), ("G", grouped, "blue")],
     )
-    return {**payload, "scan_result": scan}
+    return {**payload, "scan_result": scan, "red_mask": red_mask}
+
+
+def validate_stable_event_assignment(
+    result: StableEventResult,
+    *,
+    primitive_count: int,
+) -> dict:
+    assigned = [
+        primitive_id
+        for event in result.events
+        for primitive_id in event.primitive_ids
+    ]
+    duplicates = sorted(
+        primitive_id
+        for primitive_id in set(assigned)
+        if assigned.count(primitive_id) > 1
+    )
+    if duplicates:
+        raise ValueError(f"primitive ids assigned more than once: {duplicates}")
+
+    known = set(range(primitive_count))
+    assigned_set = set(assigned)
+    unassigned = result.unassigned_primitive_ids
+    unassigned_set = set(unassigned)
+    if len(unassigned) != len(unassigned_set):
+        raise ValueError("unassigned primitive ids must be unique")
+    unknown = sorted((assigned_set | unassigned_set) - known)
+    if unknown:
+        raise ValueError(f"unknown primitive ids: {unknown}")
+    overlap = sorted(assigned_set & unassigned_set)
+    if overlap:
+        raise ValueError(f"primitive ids both assigned and unassigned: {overlap}")
+    missing = sorted(known - assigned_set - unassigned_set)
+    if missing:
+        raise ValueError(f"primitive ids missing from assignment: {missing}")
+    return {
+        "duplicate_primitive_ids": duplicates,
+        "assigned_primitive_ids": sorted(assigned_set),
+        "unassigned_primitive_ids": sorted(unassigned_set),
+    }
+
+
+def _bbox_intersection_area(first: list[float], second: list[float]) -> float:
+    width = max(0.0, min(first[2], second[2]) - max(first[0], second[0]))
+    height = max(0.0, min(first[3], second[3]) - max(first[1], second[1]))
+    return width * height
+
+
+def _bbox_area(bbox: list[float]) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def find_duplicate_event_candidates(
+    result: StableEventResult,
+    *,
+    containment_threshold: float,
+) -> list[dict]:
+    candidates = []
+    for index, first in enumerate(result.events):
+        for second in result.events[index + 1 :]:
+            intersection = _bbox_intersection_area(first.bbox, second.bbox)
+            smaller_area = min(_bbox_area(first.bbox), _bbox_area(second.bbox))
+            containment = intersection / smaller_area if smaller_area else 0.0
+            if containment >= containment_threshold:
+                candidates.append(
+                    {
+                        "event_ids": [first.event_id, second.event_id],
+                        "intersection_over_smaller_area": round(containment, 6),
+                    }
+                )
+    return candidates
+
+
+def audit_stable_events_against_cv(
+    result: StableEventResult,
+    red_mask: np.ndarray,
+    components: list[dict],
+    *,
+    min_red_pixels: int,
+    min_red_ratio: float,
+) -> dict:
+    height, width = red_mask.shape
+    event_audits = []
+    covered_component_ids: set[int] = set()
+    event_count = len(result.events)
+    for event in result.events:
+        left, top, right, bottom = _pixel_bbox(event.bbox, width, height)
+        left = max(0, min(left, width - 1))
+        top = max(0, min(top, height - 1))
+        right = max(left + 1, min(right, width))
+        bottom = max(top + 1, min(bottom, height))
+        crop = red_mask[top:bottom, left:right]
+        red_pixel_count = int(crop.sum())
+        red_pixel_ratio = red_pixel_count / max(1, crop.size)
+        matched_component_ids = sorted(
+            component["region_id"]
+            for component in components
+            if _bbox_intersection_area(event.bbox, component["bbox"]) > 0
+        )
+        covered_component_ids.update(matched_component_ids)
+        if red_pixel_count >= min_red_pixels and red_pixel_ratio >= min_red_ratio:
+            status = "supported"
+        elif red_pixel_count > 0:
+            status = "weak"
+        else:
+            status = "rejected"
+        event_audits.append(
+            {
+                "event_id": event.event_id,
+                "status": status,
+                "red_pixel_count": red_pixel_count,
+                "red_pixel_ratio": round(red_pixel_ratio, 6),
+                "matched_component_ids": matched_component_ids,
+            }
+        )
+    all_component_ids = {component["region_id"] for component in components}
+    return {
+        "event_count_before": event_count,
+        "event_count_after": len(result.events),
+        "events": event_audits,
+        "covered_component_ids": sorted(covered_component_ids),
+        "uncovered_component_ids": sorted(all_component_ids - covered_component_ids),
+        "policy": "CV is audit-only and cannot create, remove, merge, or renumber events.",
+    }
 
 
 class ExchangeRecorder:
@@ -229,6 +465,31 @@ class RecordingVisionClient:
             lambda: self.client.detect_marks(image_path, local_red_regions, correction),
         )
 
+    def detect_independent_complete_marks(self, image_path: str) -> MarkDetectionResult:
+        diagnostic = {
+            "operation": "independent_complete_mark_detection",
+            "local_red_region_count": 0,
+        }
+        image_url = prepare_image_data_url(
+            image_path,
+            self.client.max_edge,
+            self.client.jpeg_quality,
+            diagnostic,
+        )
+        return self._call(
+            "independent_complete_mark_detection",
+            image_path,
+            {"local_red_regions": []},
+            lambda: self.client._request(
+                {
+                    "prompt": INDEPENDENT_COMPLETE_MARK_PROMPT,
+                    "image_url": image_url,
+                },
+                MarkDetectionResult,
+                diagnostic,
+            ),
+        )
+
     def detect_marks_in_regions(self, image_path, region_ids, correction=None):
         return self._call(
             "regional_mark_detection",
@@ -267,6 +528,116 @@ class RecordingVisionClient:
             ),
         )
 
+    def consolidate_stable_events(
+        self,
+        image_path: str,
+        primitives: list[ErrorMark],
+    ) -> StableEventResult:
+        primitive_payload = [
+            {
+                "primitive_id": mark.mark_id,
+                "mark_type": mark.mark_type,
+                "bbox": mark.bbox,
+                "confidence": mark.confidence,
+            }
+            for mark in primitives
+        ]
+        prompt = STABLE_EVENT_CONSOLIDATION_PROMPT.replace(
+            "__PRIMITIVES__",
+            json.dumps(primitive_payload, ensure_ascii=False, indent=2),
+        )
+        diagnostic = {
+            "operation": "stable_event_consolidation",
+            "primitive_count": len(primitives),
+        }
+        image_url = prepare_image_data_url(
+            image_path,
+            self.client.max_edge,
+            self.client.jpeg_quality,
+            diagnostic,
+        )
+        return self._call(
+            "stable_event_consolidation",
+            image_path,
+            {"primitive_count": len(primitives)},
+            lambda: self.client._request(
+                {"prompt": prompt, "image_url": image_url},
+                StableEventResult,
+                diagnostic,
+            ),
+        )
+
+
+def run_stable_event_experiment(
+    *,
+    image_path: Path,
+    case_dir: Path,
+    client: RecordingVisionClient,
+    cv: dict,
+) -> dict:
+    experiment_dir = case_dir / "stable-event-experiment"
+    experiment_dir.mkdir(parents=True, exist_ok=False)
+
+    started = time.perf_counter()
+    primitive_result = client.detect_independent_complete_marks(str(image_path))
+    mark_detection_ms = round((time.perf_counter() - started) * 1000, 2)
+    primitives = primitive_result.error_marks
+    _write_json(experiment_dir / "independent-primitives.json", primitive_result)
+    primitive_entries = [mark.model_dump(mode="json") for mark in primitives]
+    primitive_overlay = experiment_dir / "numbered-primitives.jpg"
+    _draw_boxes(image_path, primitive_overlay, [("P", primitive_entries, "blue")])
+
+    started = time.perf_counter()
+    stable_result = client.consolidate_stable_events(
+        str(primitive_overlay),
+        primitives,
+    )
+    event_consolidation_ms = round((time.perf_counter() - started) * 1000, 2)
+    _write_json(experiment_dir / "stable-events.json", stable_result)
+    assignment = validate_stable_event_assignment(
+        stable_result,
+        primitive_count=len(primitives),
+    )
+    _write_json(experiment_dir / "assignment-audit.json", assignment)
+    duplicate_event_candidates = find_duplicate_event_candidates(
+        stable_result,
+        containment_threshold=settings.MARK_DEDUP_IOU_THRESHOLD,
+    )
+    _write_json(
+        experiment_dir / "duplicate-event-candidates.json",
+        duplicate_event_candidates,
+    )
+
+    cv_audit = audit_stable_events_against_cv(
+        stable_result,
+        cv["red_mask"],
+        cv["components"],
+        min_red_pixels=settings.LOCAL_RED_COMPONENT_MIN_PIXELS,
+        min_red_ratio=settings.MARK_RED_PIXEL_MIN_RATIO,
+    )
+    _write_json(experiment_dir / "cv-post-validation.json", cv_audit)
+    stable_entries = [
+        {"mark_id": event.event_id, "bbox": event.bbox}
+        for event in stable_result.events
+    ]
+    _draw_boxes(
+        image_path,
+        experiment_dir / "stable-events-overlay.jpg",
+        [("E", stable_entries, "blue")],
+    )
+    result = {
+        "primitive_count": len(primitives),
+        "event_count": len(stable_result.events),
+        **assignment,
+        "duplicate_event_candidates": duplicate_event_candidates,
+        "uncovered_component_ids": cv_audit["uncovered_component_ids"],
+        "cv_event_support": cv_audit["events"],
+        "mark_detection_ms": mark_detection_ms,
+        "event_consolidation_ms": event_consolidation_ms,
+    }
+    _write_json(experiment_dir / "summary.json", result)
+    return result
+
 
 def build_summary(
     *,
@@ -274,8 +645,10 @@ def build_summary(
     expected_count: int | None,
     cv: dict,
     pipeline: dict | None,
+    stable_experiment: dict | None = None,
 ) -> dict:
     pipeline_ran = pipeline is not None
+    stable_experiment_ran = stable_experiment is not None
     pipeline = pipeline or {}
     checkpoints = {
         "expected_error_count": expected_count,
@@ -285,6 +658,34 @@ def build_summary(
         "normalized_mark_event_count": pipeline.get("mark_event_count"),
         "localized_mark_count": pipeline.get("localized_mark_count"),
         "content_item_count": pipeline.get("content_item_count"),
+        "stable_primitive_count": (stable_experiment or {}).get("primitive_count"),
+        "stable_event_count": (stable_experiment or {}).get("event_count"),
+        "stable_duplicate_primitive_count": (
+            len(stable_experiment.get("duplicate_primitive_ids", []))
+            if stable_experiment_ran
+            else None
+        ),
+        "stable_duplicate_event_candidate_count": (
+            len(stable_experiment.get("duplicate_event_candidates", []))
+            if stable_experiment_ran
+            else None
+        ),
+        "stable_unassigned_primitive_count": (
+            len(stable_experiment.get("unassigned_primitive_ids", []))
+            if stable_experiment_ran
+            else None
+        ),
+        "stable_uncovered_component_count": (
+            len(stable_experiment.get("uncovered_component_ids", []))
+            if stable_experiment_ran
+            else None
+        ),
+        "stable_mark_detection_ms": (stable_experiment or {}).get(
+            "mark_detection_ms"
+        ),
+        "stable_event_consolidation_ms": (stable_experiment or {}).get(
+            "event_consolidation_ms"
+        ),
     }
     first_divergence = None
     if expected_count is not None and pipeline_ran:
@@ -297,6 +698,9 @@ def build_summary(
     return {
         "label": label,
         "pipeline_status": "completed_or_failed" if pipeline_ran else "not_run",
+        "stable_experiment_status": (
+            "completed" if stable_experiment_ran else "not_run"
+        ),
         "checkpoints": checkpoints,
         "first_count_divergence": first_divergence,
         "note": (
@@ -346,6 +750,7 @@ def run_case(
     expected_count: int | None,
     subject_hint: str | None,
     cv_only: bool,
+    compare_stable_events: bool = False,
 ) -> dict:
     case_dir = output_dir / label
     case_dir.mkdir(parents=True, exist_ok=False)
@@ -361,6 +766,8 @@ def run_case(
         group_max_area_ratio=settings.LOCAL_RED_COMPONENT_MAX_AREA_RATIO,
     )
     pipeline_diagnostic = None
+    stable_experiment = None
+    stable_experiment_error = None
     error = None
     if not cv_only:
         recorder = ExchangeRecorder(case_dir)
@@ -401,13 +808,34 @@ def run_case(
             }
             pipeline_diagnostic = getattr(exc, "diagnostic", None)
             _write_json(case_dir / "pipeline-error.json", error)
+        if compare_stable_events:
+            try:
+                stable_experiment = run_stable_event_experiment(
+                    image_path=image_path,
+                    case_dir=case_dir,
+                    client=recording_client,
+                    cv=cv,
+                )
+            except Exception as exc:
+                stable_experiment_error = {
+                    "type": type(exc).__name__,
+                    "code": getattr(exc, "code", None),
+                    "message": str(exc),
+                    "diagnostic": getattr(exc, "diagnostic", None),
+                }
+                _write_json(
+                    case_dir / "stable-event-experiment-error.json",
+                    stable_experiment_error,
+                )
     summary = build_summary(
         label=label,
         expected_count=expected_count,
         cv=cv,
         pipeline=pipeline_diagnostic,
+        stable_experiment=stable_experiment,
     )
     summary["error"] = error
+    summary["stable_experiment_error"] = stable_experiment_error
     _write_json(case_dir / "summary.json", summary)
     return summary
 
@@ -441,26 +869,40 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
         "",
         "> CV 组件/证据组数量不等于错题数量；本表只用于定位首次数量偏差。",
         "",
-        "| 图片 | 人工错题 | CV组件 | CV证据组 | 标准化红标事件 | 定位 | 内容 | 首次数量偏差 |",
-        "|---|---:|---:|---:|---:|---:|---:|---|",
+        "| 图片 | 人工错题 | CV组件 | CV证据组 | 当前primitive | 当前事件 | 当前定位 | 当前内容 | 当前首次偏差 | 实验primitive | 稳定事件 | 重复event候选 | 未分配primitive | 未覆盖CV组件 | LLM实验耗时(ms) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|",
     ]
     for summary in summaries:
         item = summary["checkpoints"]
+        experiment_ms = None
+        if item["stable_mark_detection_ms"] is not None:
+            experiment_ms = round(
+                item["stable_mark_detection_ms"]
+                + (item["stable_event_consolidation_ms"] or 0),
+                2,
+            )
         divergence = (
             "未运行"
             if summary["pipeline_status"] == "not_run"
             else summary["first_count_divergence"] or "无数量偏差"
         )
         lines.append(
-            "| {label} | {expected} | {components} | {groups} | {marks} | {located} | {content} | {divergence} |".format(
+            "| {label} | {expected} | {components} | {groups} | {current_primitives} | {marks} | {located} | {content} | {divergence} | {primitives} | {stable} | {duplicate_events} | {unassigned} | {uncovered} | {experiment_ms} |".format(
                 label=summary["label"],
                 expected=item["expected_error_count"],
                 components=item["cv_raw_component_count"],
                 groups=item["cv_evidence_group_count"],
+                current_primitives=item["llm_mark_primitive_count"],
                 marks=item["normalized_mark_event_count"],
                 located=item["localized_mark_count"],
                 content=item["content_item_count"],
                 divergence=divergence,
+                primitives=item["stable_primitive_count"],
+                stable=item["stable_event_count"],
+                duplicate_events=item["stable_duplicate_event_candidate_count"],
+                unassigned=item["stable_unassigned_primitive_count"],
+                uncovered=item["stable_uncovered_component_count"],
+                experiment_ms=experiment_ms,
             )
         )
     (output_dir / "comparison-report.md").write_text(
@@ -477,6 +919,14 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--subject", default="chinese")
     parser.add_argument("--cv-only", action="store_true")
+    parser.add_argument(
+        "--compare-stable-events",
+        action="store_true",
+        help=(
+            "also run independent full-page mark detection, stable event consolidation, "
+            "and audit-only CV validation"
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -492,6 +942,7 @@ def main() -> int:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "warning": "Contains worksheet images, prompts, and model responses; delete after analysis.",
             "cv_only": args.cv_only,
+            "compare_stable_events": args.compare_stable_events,
             "labels": [label for label, _path in images],
         },
     )
@@ -503,13 +954,21 @@ def main() -> int:
             expected_count=expected.get(label),
             subject_hint=args.subject,
             cv_only=args.cv_only,
+            compare_stable_events=args.compare_stable_events,
         )
         for label, path in images
     ]
     _write_json(output_dir / "summary.json", summaries)
     _write_report(output_dir, summaries)
     print(json.dumps(summaries, ensure_ascii=False, indent=2))
-    return 1 if any(summary["error"] for summary in summaries) else 0
+    return (
+        1
+        if any(
+            summary["error"] or summary["stable_experiment_error"]
+            for summary in summaries
+        )
+        else 0
+    )
 
 
 if __name__ == "__main__":
