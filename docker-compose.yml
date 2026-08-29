@@ -150,6 +150,7 @@ services:
     volumes:
       - ./app:/app/app
       - ./config:/app/config:ro
+      - ./scripts:/app/scripts:ro
       - uploads:/app/uploads
       - pdfs:/app/pdfs
       - avatars:/app/avatars

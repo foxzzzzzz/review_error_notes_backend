@@ -3373,6 +3373,7 @@ class MiniMaxVisionClient:
         retry_delay_seconds: float = 1,
         transport=None,
         sleep: Callable[[float], None] = time.sleep,
+        diagnostic_event_sink: Optional[Callable[[dict], None]] = None,
     ):
         self.api_key = api_key
         self.api_host = api_host.rstrip("/")
@@ -3383,6 +3384,12 @@ class MiniMaxVisionClient:
         self.retry_delay_seconds = retry_delay_seconds
         self.transport = transport
         self.sleep = sleep
+        self.diagnostic_event_sink = diagnostic_event_sink
+
+    def _emit_diagnostic_event(self, kind: str, **values) -> None:
+        if self.diagnostic_event_sink is None:
+            return
+        self.diagnostic_event_sink({"kind": kind, **values})
 
     @classmethod
     def from_settings(cls):
@@ -3624,7 +3631,21 @@ class MiniMaxVisionClient:
         request_payload = dict(payload)
         for attempt in range(self.max_retries + 1):
             try:
+                self._emit_diagnostic_event(
+                    "request",
+                    operation=diagnostic.get("operation", "unknown"),
+                    attempt=attempt + 1,
+                    result_model=result_model.__name__,
+                    prompt=request_payload.get("prompt"),
+                )
                 response = self._post(request_payload)
+                self._emit_diagnostic_event(
+                    "http_response",
+                    operation=diagnostic.get("operation", "unknown"),
+                    attempt=attempt + 1,
+                    status_code=response.status_code,
+                    response_body=response.text,
+                )
                 is_transient = response.status_code == 429 or 500 <= response.status_code < 600
                 if is_transient and attempt < self.max_retries:
                     self.sleep(self.retry_delay_seconds)
@@ -3647,9 +3668,26 @@ class MiniMaxVisionClient:
                 response_shape_diagnostic = _stage_response_shape_diagnostic(
                     raw, result_model
                 )
-                raw = _normalize_stage_response_shape(raw, result_model)
+                normalized = _normalize_stage_response_shape(raw, result_model)
+                self._emit_diagnostic_event(
+                    "parsed_response",
+                    operation=diagnostic.get("operation", "unknown"),
+                    attempt=attempt + 1,
+                    raw=raw,
+                    normalized=normalized,
+                    response_shape_diagnostic=response_shape_diagnostic,
+                )
                 try:
-                    return _validate_response_result(raw, result_model, diagnostic)
+                    result = _validate_response_result(
+                        normalized, result_model, diagnostic
+                    )
+                    self._emit_diagnostic_event(
+                        "validated_response",
+                        operation=diagnostic.get("operation", "unknown"),
+                        attempt=attempt + 1,
+                        result=result.model_dump(mode="json"),
+                    )
+                    return result
                 except ValidationError as exc:
                     raise VisionRecognitionError(
                         "vision_response_schema_invalid",
@@ -3669,6 +3707,13 @@ class MiniMaxVisionClient:
                     "response_attempt": attempt + 1,
                     "response_max_attempts": self.max_retries + 1,
                 }
+                self._emit_diagnostic_event(
+                    "request_error",
+                    operation=diagnostic.get("operation", "unknown"),
+                    attempt=attempt + 1,
+                    error_code=exc.code,
+                    diagnostic=exc.diagnostic,
+                )
                 if (
                     exc.code in FORMAT_RETRYABLE_ERROR_CODES
                     and attempt < self.max_retries

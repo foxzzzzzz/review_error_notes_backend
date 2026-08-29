@@ -530,3 +530,41 @@ RUN_LIVE_API_TESTS=true bash scripts/verify_adaptive_ocr_server.sh /path/to/imag
 Worker 默认通过 `MINIMAX_THREE_STAGE_RECOGNITION_ENABLED` 启用准确率优先的三阶段视觉链路。`MINIMAX_MARK_STAGE_RETRY_COUNT`、`MINIMAX_LOCALIZATION_STAGE_RETRY_COUNT`、`MINIMAX_CONTENT_STAGE_RETRY_COUNT` 分别限制红标、定位和内容阶段的额外重试，`MINIMAX_CONTENT_BATCH_SIZE` 限制单次内容识别题数。紧急回滚时可设置 `MINIMAX_THREE_STAGE_RECOGNITION_ENABLED=false`，同一图片不会混用两种流程。
 
 答案区域同时校验答案框自身交叠率与红圈覆盖率；灰区定位只重试当前标记，重试耗尽以及非相交近邻圈×、单叉保底定位均只进入待确认。上下文边缘判断会排除整页真实边缘，红色碎片按有界传递关系合并，局部坐标使用实际像素裁切边界回映整页。
+
+### 三阶段识别诊断包
+
+当需要区分本地红色扫描、红标检测/合并、题目定位和内容识别中哪一层首先出现偏差时，使用独立诊断脚本。它不会写数据库，也不会改变线上识别策略；但会把原图、调用 Prompt、每次 MiniMax 原始响应、解析后响应和中间裁图写入输出目录，因此输出包含学生作业内容，只能用于受控测试并应在分析后删除。
+
+先将 33、34、35 页测试图放到服务器 `backend/test-images/`，再执行：
+
+```bash
+mkdir -p vision-diagnostics
+diagnostic_run="vision-diagnostics/$(date +%Y%m%d-%H%M%S)"
+
+sudo docker compose run --rm --no-deps \
+  -v "$PWD/test-images:/diagnostic-input:ro" \
+  -v "$PWD/vision-diagnostics:/diagnostic-output" \
+  worker python scripts/diagnose_vision_pipeline.py \
+  page33=/diagnostic-input/page33.jpg \
+  page34=/diagnostic-input/page34.jpg \
+  page35=/diagnostic-input/page35.jpg \
+  --expected page33=6 \
+  --expected page34=1 \
+  --expected page35=5 \
+  --subject chinese \
+  --output "/diagnostic-output/$(basename "$diagnostic_run")"
+```
+
+脚本即使某一阶段失败，也会保留此前已生成的证据，并以非零状态退出。重点查看：
+
+- `comparison-report.md`：三图各阶段数量对比，只标记首次数量偏差；CV 组件数不会被误当成错题数。
+- `pageXX/cv/red-mask.png`、`components-and-groups.jpg`、`evidence.json`：当前红色阈值、连通组件和合并组的完整证据。
+- `pageXX/llm-calls/call-NNN-*/input.jpg`：该次 LLM 实际收到的整图、编号红区图或题目裁图。
+- 每个调用目录下的 `event-*-request.json`、`http_response.json`、`parsed_response.json`、`validated_response.json`：Prompt、原始 HTTP 响应、规范化前后 JSON 和最终结构化结果。
+- `pageXX/pipeline-diagnostic.json`、`pipeline-overlay.jpg`：合并/配对/定位/内容阶段的后端决策及最终坐标叠加图。
+
+若只验证本地 CV、不调用 MiniMax，在命令末尾增加 `--cv-only`。完整诊断后可压缩回传：
+
+```bash
+tar -czf "${diagnostic_run}.tar.gz" -C vision-diagnostics "$(basename "$diagnostic_run")"
+```

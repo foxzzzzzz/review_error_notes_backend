@@ -81,6 +81,97 @@ def _mock_stage_client(tmp_path, responses, max_retries=0):
     return client, source, requests
 
 
+def test_stage_client_emits_raw_and_validated_diagnostic_events(tmp_path):
+    from app.services.vision_recognition import MiniMaxVisionClient
+
+    source = tmp_path / "question.jpg"
+    _write_image(source, (400, 300))
+    events = []
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json={"content": json.dumps({"error_marks": []})},
+        )
+
+    client = MiniMaxVisionClient(
+        api_key="secret-token",
+        api_host="https://api.minimaxi.com",
+        timeout_seconds=5,
+        max_retries=0,
+        max_edge=1200,
+        jpeg_quality=90,
+        retry_delay_seconds=0,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+        diagnostic_event_sink=events.append,
+    )
+
+    result = client.detect_marks(str(source))
+
+    assert result.error_marks == []
+    assert [event["kind"] for event in events] == [
+        "request",
+        "http_response",
+        "parsed_response",
+        "validated_response",
+    ]
+    assert events[0]["operation"] == "mark_detection"
+    assert "image_url" not in events[0]
+    assert "secret-token" not in json.dumps(events)
+    assert json.loads(events[1]["response_body"]) == {
+        "content": '{"error_marks": []}'
+    }
+    assert events[2]["raw"] == {"error_marks": []}
+    assert events[3]["result"] == {"error_marks": []}
+
+
+def test_stage_client_emits_retry_error_before_next_attempt(tmp_path):
+    from app.services.vision_recognition import MiniMaxVisionClient
+
+    source = tmp_path / "question.jpg"
+    _write_image(source, (400, 300))
+    events = []
+    response_count = 0
+
+    def handler(_request):
+        nonlocal response_count
+        response_count += 1
+        content = "not-json" if response_count == 1 else '{"error_marks":[]}'
+        return httpx.Response(200, json={"content": content})
+
+    client = MiniMaxVisionClient(
+        api_key="secret-token",
+        api_host="https://api.minimaxi.com",
+        timeout_seconds=5,
+        max_retries=1,
+        max_edge=1200,
+        jpeg_quality=90,
+        retry_delay_seconds=0,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+        diagnostic_event_sink=events.append,
+    )
+
+    client.detect_marks(str(source))
+
+    retry_errors = [event for event in events if event["kind"] == "request_error"]
+    assert retry_errors == [
+        {
+            "kind": "request_error",
+            "operation": "mark_detection",
+            "attempt": 1,
+            "error_code": "vision_response_json_invalid",
+            "diagnostic": retry_errors[0]["diagnostic"],
+        }
+    ]
+    assert retry_errors[0]["diagnostic"]["response_attempt"] == 1
+    assert any(
+        event["kind"] == "validated_response" and event["attempt"] == 2
+        for event in events
+    )
+
+
 def test_prompt_prioritizes_red_error_marks_without_full_page_fallback():
     from app.services.vision_recognition import RECOGNITION_PROMPT
 
