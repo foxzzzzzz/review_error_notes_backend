@@ -117,9 +117,10 @@ def test_report_labels_unrun_pipeline_instead_of_claiming_no_divergence(tmp_path
     diagnostic._write_report(tmp_path, [summary])
 
     report = (tmp_path / "comparison-report.md").read_text("utf-8")
+    assert "圈叉归属异常" in report
     assert (
         "| page34 | 1 | 12 | 4 | None | None | None | None | 未运行 | "
-        "None | None | None | None | None | None |"
+        "None | None | None | None | None | None | None |"
     ) in report
 
 
@@ -158,6 +159,110 @@ def test_stable_event_assignment_rejects_duplicate_primitive_membership():
                 "unassigned_primitive_ids": [],
             }
         )
+
+
+def test_stable_event_normalizes_empty_component_bbox_and_cross_alias():
+    diagnostic = _load_script_module()
+
+    result = diagnostic.StableEventResult.model_validate(
+        {
+            "events": [
+                {
+                    "event_id": 0,
+                    "primitive_ids": [0],
+                    "event_type": "cross_only",
+                    "bbox": [0.2, 0.2, 0.4, 0.4],
+                    "cross_bbox": [0.2, 0.2, 0.4, 0.4],
+                    "circle_bbox": [0, 0, 0, 0],
+                    "confidence": 0.9,
+                }
+            ],
+            "unassigned_primitive_ids": [],
+        }
+    )
+
+    assert result.events[0].event_type == "cross"
+    assert result.events[0].circle_bbox is None
+
+
+def test_stable_event_keeps_multi_primitive_response_for_diagnostic_audit():
+    diagnostic = _load_script_module()
+
+    result = diagnostic.StableEventResult.model_validate(
+        {
+            "events": [
+                {
+                    "event_id": 0,
+                    "primitive_ids": [0, 1, 2],
+                    "event_type": "cross_circle",
+                    "bbox": [0.1, 0.1, 0.5, 0.5],
+                    "cross_bbox": [0.3, 0.1, 0.5, 0.3],
+                    "circle_bbox": [0.1, 0.2, 0.4, 0.5],
+                    "confidence": 0.9,
+                }
+            ],
+            "unassigned_primitive_ids": [],
+        }
+    )
+
+    assert result.events[0].primitive_ids == [0, 1, 2]
+
+
+def test_primitive_membership_audit_reports_wrong_cross_circle_types():
+    diagnostic = _load_script_module()
+    primitives = diagnostic.MarkDetectionResult.model_validate(
+        {
+            "error_marks": [
+                {
+                    "mark_id": 0,
+                    "mark_type": "cross",
+                    "bbox": [0.1, 0.1, 0.2, 0.2],
+                    "cross_bbox": None,
+                    "circle_bbox": None,
+                    "confidence": 0.9,
+                },
+                {
+                    "mark_id": 1,
+                    "mark_type": "cross",
+                    "bbox": [0.2, 0.1, 0.3, 0.2],
+                    "cross_bbox": None,
+                    "circle_bbox": None,
+                    "confidence": 0.9,
+                },
+            ]
+        }
+    ).error_marks
+    result = diagnostic.StableEventResult.model_validate(
+        {
+            "events": [
+                {
+                    "event_id": 0,
+                    "primitive_ids": [0, 1],
+                    "event_type": "cross_circle",
+                    "bbox": [0.1, 0.1, 0.3, 0.2],
+                    "cross_bbox": [0.2, 0.1, 0.3, 0.2],
+                    "circle_bbox": [0.1, 0.1, 0.2, 0.2],
+                    "confidence": 0.9,
+                }
+            ],
+            "unassigned_primitive_ids": [],
+        }
+    )
+
+    violations = diagnostic.audit_stable_event_primitive_membership(
+        result,
+        primitives,
+    )
+
+    assert violations == [
+        {
+            "event_id": 0,
+            "event_type": "cross_circle",
+            "primitive_ids": [0, 1],
+            "primitive_types": ["cross", "cross"],
+            "expected_primitive_types": ["circle", "cross"],
+        }
+    ]
 
 
 def test_independent_mark_prompt_forbids_external_cv_coordinates_and_fragments():
@@ -269,6 +374,7 @@ def test_comparison_summary_keeps_baseline_and_stable_event_counts_separate():
             "primitive_count": 2,
             "event_count": 1,
             "duplicate_primitive_ids": [],
+            "primitive_membership_violations": [],
             "unassigned_primitive_ids": [],
             "uncovered_component_ids": [2],
             "mark_detection_ms": 1000.0,
@@ -280,6 +386,7 @@ def test_comparison_summary_keeps_baseline_and_stable_event_counts_separate():
     assert checkpoints["normalized_mark_event_count"] == 3
     assert checkpoints["stable_event_count"] == 1
     assert checkpoints["stable_duplicate_primitive_count"] == 0
+    assert checkpoints["stable_primitive_membership_violation_count"] == 0
     assert checkpoints["stable_duplicate_event_candidate_count"] == 0
     assert checkpoints["stable_uncovered_component_count"] == 1
 
@@ -349,6 +456,7 @@ def test_stable_event_experiment_runs_independent_detection_before_cv_audit(tmp_
 
     assert [call[0] for call in calls] == ["detect", "consolidate"]
     assert result["event_count"] == 1
+    assert result["primitive_membership_violations"] == []
     assert result["cv_event_support"][0]["status"] == "supported"
     assert (case_dir / "stable-event-experiment" / "stable-events.json").is_file()
     assert (

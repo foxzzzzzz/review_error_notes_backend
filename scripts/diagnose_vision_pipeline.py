@@ -46,9 +46,11 @@ STABLE_EVENT_CONSOLIDATION_PROMPT = """你是小学作业红色批改事件归�
 要求：
 1. 每个 primitive_id 必须且只能出现一次：要么属于某个 event 的 primitive_ids，要么放入 unassigned_primitive_ids。
 2. 同一作答单元附近、几何距离相近的 circle 与 cross 应归并为 cross_circle；不得因框大小不同或局部重叠而重复建立事件。
-3. 不同作答单元的标记不得合并；无法确定归属的 primitive 放入 unassigned_primitive_ids，不得猜测。
-4. bbox、cross_bbox、circle_bbox 均使用原始整页归一化坐标，并覆盖图片中可见的完整几何形状，不得只复制输入中的红线碎片框。
-5. event_id 从 0 开始连续且唯一。只返回严格 JSON，不要解释或 Markdown。
+3. 一个 cross_circle 必须且只能包含一个 circle primitive 和一个 cross primitive。任何 event 都不得包含两个 circle 或两个 cross；相邻但属于不同作答单元的标记必须拆成不同 event。
+4. 单独 circle、cross、deletion、underline、annotation 或 mixed event 只能包含一个 primitive；无法确定归属的 primitive 放入 unassigned_primitive_ids，不得猜测。
+5. bbox、cross_bbox、circle_bbox 均使用原始整页归一化坐标，并覆盖图片中可见的完整几何形状，不得只复制输入中的红线碎片框。无对应图形时必须返回 null，不得返回 [0,0,0,0]。
+6. event_type 只能使用 cross_circle、circle、cross、deletion、underline、annotation、mixed；不得使用 cross_only 或 circle_only。
+7. event_id 从 0 开始连续且唯一。只返回严格 JSON，不要解释或 Markdown。
 
 返回格式：{"events":[{"event_id":0,"primitive_ids":[0,1],"event_type":"cross_circle","bbox":[0.1,0.2,0.4,0.5],"cross_bbox":[0.3,0.2,0.4,0.35],"circle_bbox":[0.1,0.25,0.35,0.5],"confidence":0.95}],"unassigned_primitive_ids":[]}。
 
@@ -86,6 +88,16 @@ class StableMarkEvent(BaseModel):
     cross_bbox: list[float] | None = None
     circle_bbox: list[float] | None = None
     confidence: float = Field(ge=0, le=1)
+
+    @field_validator("event_type", mode="before")
+    @classmethod
+    def normalize_event_type_alias(cls, value):
+        return "cross" if value == "cross_only" else value
+
+    @field_validator("cross_bbox", "circle_bbox", mode="before")
+    @classmethod
+    def normalize_empty_component_bbox(cls, value):
+        return None if value == [0, 0, 0, 0] else value
 
     @field_validator("bbox", "cross_bbox", "circle_bbox")
     @classmethod
@@ -300,6 +312,37 @@ def validate_stable_event_assignment(
         "assigned_primitive_ids": sorted(assigned_set),
         "unassigned_primitive_ids": sorted(unassigned_set),
     }
+
+
+def audit_stable_event_primitive_membership(
+    result: StableEventResult,
+    primitives: list[ErrorMark],
+) -> list[dict]:
+    primitive_types = {
+        primitive.mark_id: primitive.mark_type for primitive in primitives
+    }
+    violations = []
+    for event in result.events:
+        actual_types = sorted(
+            primitive_types.get(primitive_id, "unknown")
+            for primitive_id in event.primitive_ids
+        )
+        expected_types = (
+            ["circle", "cross"]
+            if event.event_type == "cross_circle"
+            else [event.event_type]
+        )
+        if actual_types != expected_types:
+            violations.append(
+                {
+                    "event_id": event.event_id,
+                    "event_type": event.event_type,
+                    "primitive_ids": list(event.primitive_ids),
+                    "primitive_types": actual_types,
+                    "expected_primitive_types": expected_types,
+                }
+            )
+    return violations
 
 
 def _bbox_intersection_area(first: list[float], second: list[float]) -> float:
@@ -599,6 +642,14 @@ def run_stable_event_experiment(
         primitive_count=len(primitives),
     )
     _write_json(experiment_dir / "assignment-audit.json", assignment)
+    primitive_membership_violations = audit_stable_event_primitive_membership(
+        stable_result,
+        primitives,
+    )
+    _write_json(
+        experiment_dir / "primitive-membership-audit.json",
+        primitive_membership_violations,
+    )
     duplicate_event_candidates = find_duplicate_event_candidates(
         stable_result,
         containment_threshold=settings.MARK_DEDUP_IOU_THRESHOLD,
@@ -629,6 +680,7 @@ def run_stable_event_experiment(
         "primitive_count": len(primitives),
         "event_count": len(stable_result.events),
         **assignment,
+        "primitive_membership_violations": primitive_membership_violations,
         "duplicate_event_candidates": duplicate_event_candidates,
         "uncovered_component_ids": cv_audit["uncovered_component_ids"],
         "cv_event_support": cv_audit["events"],
@@ -667,6 +719,11 @@ def build_summary(
         ),
         "stable_duplicate_event_candidate_count": (
             len(stable_experiment.get("duplicate_event_candidates", []))
+            if stable_experiment_ran
+            else None
+        ),
+        "stable_primitive_membership_violation_count": (
+            len(stable_experiment.get("primitive_membership_violations", []))
             if stable_experiment_ran
             else None
         ),
@@ -869,8 +926,8 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
         "",
         "> CV 组件/证据组数量不等于错题数量；本表只用于定位首次数量偏差。",
         "",
-        "| 图片 | 人工错题 | CV组件 | CV证据组 | 当前primitive | 当前事件 | 当前定位 | 当前内容 | 当前首次偏差 | 实验primitive | 稳定事件 | 重复event候选 | 未分配primitive | 未覆盖CV组件 | LLM实验耗时(ms) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 人工错题 | CV组件 | CV证据组 | 当前primitive | 当前事件 | 当前定位 | 当前内容 | 当前首次偏差 | 实验primitive | 稳定事件 | 重复event候选 | 圈叉归属异常 | 未分配primitive | 未覆盖CV组件 | LLM实验耗时(ms) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for summary in summaries:
         item = summary["checkpoints"]
@@ -887,7 +944,7 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
             else summary["first_count_divergence"] or "无数量偏差"
         )
         lines.append(
-            "| {label} | {expected} | {components} | {groups} | {current_primitives} | {marks} | {located} | {content} | {divergence} | {primitives} | {stable} | {duplicate_events} | {unassigned} | {uncovered} | {experiment_ms} |".format(
+            "| {label} | {expected} | {components} | {groups} | {current_primitives} | {marks} | {located} | {content} | {divergence} | {primitives} | {stable} | {duplicate_events} | {membership_violations} | {unassigned} | {uncovered} | {experiment_ms} |".format(
                 label=summary["label"],
                 expected=item["expected_error_count"],
                 components=item["cv_raw_component_count"],
@@ -900,6 +957,9 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
                 primitives=item["stable_primitive_count"],
                 stable=item["stable_event_count"],
                 duplicate_events=item["stable_duplicate_event_candidate_count"],
+                membership_violations=item[
+                    "stable_primitive_membership_violation_count"
+                ],
                 unassigned=item["stable_unassigned_primitive_count"],
                 uncovered=item["stable_uncovered_component_count"],
                 experiment_ms=experiment_ms,
