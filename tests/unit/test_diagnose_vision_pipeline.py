@@ -118,9 +118,11 @@ def test_report_labels_unrun_pipeline_instead_of_claiming_no_divergence(tmp_path
 
     report = (tmp_path / "comparison-report.md").read_text("utf-8")
     assert "圈叉归属异常" in report
+    assert "重复primitive候选" in report
+    assert "跨单元圈叉候选" in report
     assert (
         "| page34 | 1 | 12 | 4 | None | None | None | None | 未运行 | "
-        "None | None | None | None | None | None | None |"
+        "None | None | None | None | None | None | None | None | None |"
     ) in report
 
 
@@ -272,7 +274,108 @@ def test_independent_mark_prompt_forbids_external_cv_coordinates_and_fragments()
 
     assert "不接收也不得推测任何外部候选坐标" in prompt
     assert "不得把圆弧、叉的一条笔画或孤立红线作为独立标记" in prompt
+    assert "教师文字批注必须标为 annotation" in prompt
     assert "local_red_regions" not in prompt
+
+
+def test_stable_event_prompt_unassigns_teacher_annotations_and_forbids_distant_pairs():
+    diagnostic = _load_script_module()
+
+    prompt = diagnostic.STABLE_EVENT_CONSOLIDATION_PROMPT
+
+    assert "教师文字批注" in prompt
+    assert "unassigned_primitive_ids" in prompt
+    assert "空间明显分离" in prompt
+
+
+def test_duplicate_primitive_audit_only_reports_overlapping_same_type_marks():
+    diagnostic = _load_script_module()
+    primitives = diagnostic.MarkDetectionResult.model_validate(
+        {
+            "error_marks": [
+                {
+                    "mark_id": 0,
+                    "mark_type": "circle",
+                    "bbox": [0.1, 0.1, 0.5, 0.5],
+                    "cross_bbox": None,
+                    "circle_bbox": None,
+                    "confidence": 0.9,
+                },
+                {
+                    "mark_id": 1,
+                    "mark_type": "circle",
+                    "bbox": [0.2, 0.2, 0.45, 0.45],
+                    "cross_bbox": None,
+                    "circle_bbox": None,
+                    "confidence": 0.8,
+                },
+                {
+                    "mark_id": 2,
+                    "mark_type": "cross",
+                    "bbox": [0.2, 0.2, 0.45, 0.45],
+                    "cross_bbox": None,
+                    "circle_bbox": None,
+                    "confidence": 0.8,
+                },
+            ]
+        }
+    ).error_marks
+
+    candidates = diagnostic.find_duplicate_primitive_candidates(
+        primitives,
+        containment_threshold=0.8,
+    )
+
+    assert candidates == [
+        {
+            "primitive_ids": [0, 1],
+            "mark_type": "circle",
+            "intersection_over_smaller_area": 1.0,
+        }
+    ]
+
+
+def test_cross_circle_geometry_audit_reports_spatially_distant_pair():
+    diagnostic = _load_script_module()
+    result = diagnostic.StableEventResult.model_validate(
+        {
+            "events": [
+                {
+                    "event_id": 0,
+                    "primitive_ids": [4, 7],
+                    "event_type": "cross_circle",
+                    "bbox": [0.4, 0.2, 0.7, 0.7],
+                    "cross_bbox": [0.4, 0.2, 0.5, 0.3],
+                    "circle_bbox": [0.5, 0.6, 0.7, 0.7],
+                    "confidence": 0.9,
+                },
+                {
+                    "event_id": 1,
+                    "primitive_ids": [8],
+                    "event_type": "cross",
+                    "bbox": [0.1, 0.1, 0.2, 0.2],
+                    "cross_bbox": [0.1, 0.1, 0.2, 0.2],
+                    "circle_bbox": None,
+                    "confidence": 0.9,
+                },
+            ],
+            "unassigned_primitive_ids": [],
+        }
+    )
+
+    candidates = diagnostic.audit_cross_circle_geometry(
+        result,
+        max_center_distance=0.2,
+    )
+
+    assert candidates == [
+        {
+            "event_id": 0,
+            "primitive_ids": [4, 7],
+            "center_distance": 0.4272,
+            "max_center_distance": 0.2,
+        }
+    ]
 
 
 def test_cv_audit_does_not_create_or_remove_stable_events():
@@ -374,6 +477,8 @@ def test_comparison_summary_keeps_baseline_and_stable_event_counts_separate():
             "primitive_count": 2,
             "event_count": 1,
             "duplicate_primitive_ids": [],
+            "duplicate_primitive_candidates": [{"primitive_ids": [0, 1]}],
+            "cross_circle_geometry_candidates": [{"event_id": 0}],
             "primitive_membership_violations": [],
             "unassigned_primitive_ids": [],
             "uncovered_component_ids": [2],
@@ -386,6 +491,8 @@ def test_comparison_summary_keeps_baseline_and_stable_event_counts_separate():
     assert checkpoints["normalized_mark_event_count"] == 3
     assert checkpoints["stable_event_count"] == 1
     assert checkpoints["stable_duplicate_primitive_count"] == 0
+    assert checkpoints["stable_duplicate_primitive_candidate_count"] == 1
+    assert checkpoints["stable_cross_circle_geometry_candidate_count"] == 1
     assert checkpoints["stable_primitive_membership_violation_count"] == 0
     assert checkpoints["stable_duplicate_event_candidate_count"] == 0
     assert checkpoints["stable_uncovered_component_count"] == 1
@@ -452,13 +559,25 @@ def test_stable_event_experiment_runs_independent_detection_before_cv_audit(tmp_
                 }
             ],
         },
+        primitive_duplicate_containment_threshold=0.8,
+        cross_circle_max_center_distance=0.2,
     )
 
     assert [call[0] for call in calls] == ["detect", "consolidate"]
     assert result["event_count"] == 1
     assert result["primitive_membership_violations"] == []
+    assert result["duplicate_primitive_candidates"] == []
+    assert result["cross_circle_geometry_candidates"] == []
     assert result["cv_event_support"][0]["status"] == "supported"
     assert (case_dir / "stable-event-experiment" / "stable-events.json").is_file()
     assert (
         case_dir / "stable-event-experiment" / "cv-post-validation.json"
+    ).is_file()
+    assert (
+        case_dir
+        / "stable-event-experiment"
+        / "duplicate-primitive-candidates.json"
+    ).is_file()
+    assert (
+        case_dir / "stable-event-experiment" / "cross-circle-geometry-audit.json"
     ).is_file()

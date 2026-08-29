@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import sys
 import time
@@ -48,9 +49,11 @@ STABLE_EVENT_CONSOLIDATION_PROMPT = """你是小学作业红色批改事件归�
 2. 同一作答单元附近、几何距离相近的 circle 与 cross 应归并为 cross_circle；不得因框大小不同或局部重叠而重复建立事件。
 3. 一个 cross_circle 必须且只能包含一个 circle primitive 和一个 cross primitive。任何 event 都不得包含两个 circle 或两个 cross；相邻但属于不同作答单元的标记必须拆成不同 event。
 4. 单独 circle、cross、deletion、underline、annotation 或 mixed event 只能包含一个 primitive；无法确定归属的 primitive 放入 unassigned_primitive_ids，不得猜测。
-5. bbox、cross_bbox、circle_bbox 均使用原始整页归一化坐标，并覆盖图片中可见的完整几何形状，不得只复制输入中的红线碎片框。无对应图形时必须返回 null，不得返回 [0,0,0,0]。
-6. event_type 只能使用 cross_circle、circle、cross、deletion、underline、annotation、mixed；不得使用 cross_only 或 circle_only。
-7. event_id 从 0 开始连续且唯一。只返回严格 JSON，不要解释或 Markdown。
+5. 教师文字批注、评语或提示如果不直接标记某个具体作答单元，必须放入 unassigned_primitive_ids，不得建立错误事件。
+6. 空间明显分离、跨行或跨作答单元的 circle 与 cross 禁止配对；无法确认同属一个作答单元时保持单标记或放入 unassigned_primitive_ids。
+7. bbox、cross_bbox、circle_bbox 均使用原始整页归一化坐标，并覆盖图片中可见的完整几何形状，不得只复制输入中的红线碎片框。无对应图形时必须返回 null，不得返回 [0,0,0,0]。
+8. event_type 只能使用 cross_circle、circle、cross、deletion、underline、annotation、mixed；不得使用 cross_only 或 circle_only。
+9. event_id 从 0 开始连续且唯一。只返回严格 JSON，不要解释或 Markdown。
 
 返回格式：{"events":[{"event_id":0,"primitive_ids":[0,1],"event_type":"cross_circle","bbox":[0.1,0.2,0.4,0.5],"cross_bbox":[0.3,0.2,0.4,0.35],"circle_bbox":[0.1,0.25,0.35,0.5],"confidence":0.95}],"unassigned_primitive_ids":[]}。
 
@@ -65,8 +68,9 @@ INDEPENDENT_COMPLETE_MARK_PROMPT = """你是小学作业红色批改几何标记
 2. circle 的 bbox 必须覆盖完整闭合或近似闭合红圈；cross 的 bbox 必须覆盖两条相交笔画。不得把圆弧、叉的一条笔画或孤立红线作为独立标记。
 3. 此阶段只输出独立 primitive，不配对圈叉，不识别题目内容。
 4. 不要把印刷红色方格、页眉线、装饰色或单独红色对勾当作错误标记。
-5. bbox 使用整页归一化 [left, top, right, bottom]；mark_id 从 0 开始连续且唯一。
-6. 只返回严格 JSON：{"error_marks":[{"mark_id":0,"mark_type":"circle","bbox":[0.1,0.2,0.3,0.4],"cross_bbox":null,"circle_bbox":null,"confidence":0.95}]}。
+5. 教师文字批注必须标为 annotation，不得因为包含相交笔画而标为 cross；此类批注仍作为 primitive 输出供后续归属审计。
+6. bbox 使用整页归一化 [left, top, right, bottom]；mark_id 从 0 开始连续且唯一。
+7. 只返回严格 JSON：{"error_marks":[{"mark_id":0,"mark_type":"circle","bbox":[0.1,0.2,0.3,0.4],"cross_bbox":null,"circle_bbox":null,"confidence":0.95}]}。
 """
 
 
@@ -355,6 +359,30 @@ def _bbox_area(bbox: list[float]) -> float:
     return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
 
 
+def find_duplicate_primitive_candidates(
+    primitives: list[ErrorMark],
+    *,
+    containment_threshold: float,
+) -> list[dict]:
+    candidates = []
+    for index, first in enumerate(primitives):
+        for second in primitives[index + 1 :]:
+            if first.mark_type != second.mark_type:
+                continue
+            intersection = _bbox_intersection_area(first.bbox, second.bbox)
+            smaller_area = min(_bbox_area(first.bbox), _bbox_area(second.bbox))
+            containment = intersection / smaller_area if smaller_area else 0.0
+            if containment >= containment_threshold:
+                candidates.append(
+                    {
+                        "primitive_ids": [first.mark_id, second.mark_id],
+                        "mark_type": first.mark_type,
+                        "intersection_over_smaller_area": round(containment, 6),
+                    }
+                )
+    return candidates
+
+
 def find_duplicate_event_candidates(
     result: StableEventResult,
     *,
@@ -373,6 +401,39 @@ def find_duplicate_event_candidates(
                         "intersection_over_smaller_area": round(containment, 6),
                     }
                 )
+    return candidates
+
+
+def audit_cross_circle_geometry(
+    result: StableEventResult,
+    *,
+    max_center_distance: float,
+) -> list[dict]:
+    candidates = []
+    for event in result.events:
+        if event.event_type != "cross_circle":
+            continue
+        cross_center = (
+            (event.cross_bbox[0] + event.cross_bbox[2]) / 2,
+            (event.cross_bbox[1] + event.cross_bbox[3]) / 2,
+        )
+        circle_center = (
+            (event.circle_bbox[0] + event.circle_bbox[2]) / 2,
+            (event.circle_bbox[1] + event.circle_bbox[3]) / 2,
+        )
+        center_distance = math.hypot(
+            cross_center[0] - circle_center[0],
+            cross_center[1] - circle_center[1],
+        )
+        if center_distance > max_center_distance:
+            candidates.append(
+                {
+                    "event_id": event.event_id,
+                    "primitive_ids": list(event.primitive_ids),
+                    "center_distance": round(center_distance, 6),
+                    "max_center_distance": max_center_distance,
+                }
+            )
     return candidates
 
 
@@ -617,6 +678,8 @@ def run_stable_event_experiment(
     case_dir: Path,
     client: RecordingVisionClient,
     cv: dict,
+    primitive_duplicate_containment_threshold: float,
+    cross_circle_max_center_distance: float,
 ) -> dict:
     experiment_dir = case_dir / "stable-event-experiment"
     experiment_dir.mkdir(parents=True, exist_ok=False)
@@ -626,6 +689,14 @@ def run_stable_event_experiment(
     mark_detection_ms = round((time.perf_counter() - started) * 1000, 2)
     primitives = primitive_result.error_marks
     _write_json(experiment_dir / "independent-primitives.json", primitive_result)
+    duplicate_primitive_candidates = find_duplicate_primitive_candidates(
+        primitives,
+        containment_threshold=primitive_duplicate_containment_threshold,
+    )
+    _write_json(
+        experiment_dir / "duplicate-primitive-candidates.json",
+        duplicate_primitive_candidates,
+    )
     primitive_entries = [mark.model_dump(mode="json") for mark in primitives]
     primitive_overlay = experiment_dir / "numbered-primitives.jpg"
     _draw_boxes(image_path, primitive_overlay, [("P", primitive_entries, "blue")])
@@ -658,6 +729,14 @@ def run_stable_event_experiment(
         experiment_dir / "duplicate-event-candidates.json",
         duplicate_event_candidates,
     )
+    cross_circle_geometry_candidates = audit_cross_circle_geometry(
+        stable_result,
+        max_center_distance=cross_circle_max_center_distance,
+    )
+    _write_json(
+        experiment_dir / "cross-circle-geometry-audit.json",
+        cross_circle_geometry_candidates,
+    )
 
     cv_audit = audit_stable_events_against_cv(
         stable_result,
@@ -680,8 +759,10 @@ def run_stable_event_experiment(
         "primitive_count": len(primitives),
         "event_count": len(stable_result.events),
         **assignment,
+        "duplicate_primitive_candidates": duplicate_primitive_candidates,
         "primitive_membership_violations": primitive_membership_violations,
         "duplicate_event_candidates": duplicate_event_candidates,
+        "cross_circle_geometry_candidates": cross_circle_geometry_candidates,
         "uncovered_component_ids": cv_audit["uncovered_component_ids"],
         "cv_event_support": cv_audit["events"],
         "mark_detection_ms": mark_detection_ms,
@@ -719,6 +800,16 @@ def build_summary(
         ),
         "stable_duplicate_event_candidate_count": (
             len(stable_experiment.get("duplicate_event_candidates", []))
+            if stable_experiment_ran
+            else None
+        ),
+        "stable_duplicate_primitive_candidate_count": (
+            len(stable_experiment.get("duplicate_primitive_candidates", []))
+            if stable_experiment_ran
+            else None
+        ),
+        "stable_cross_circle_geometry_candidate_count": (
+            len(stable_experiment.get("cross_circle_geometry_candidates", []))
             if stable_experiment_ran
             else None
         ),
@@ -808,6 +899,8 @@ def run_case(
     subject_hint: str | None,
     cv_only: bool,
     compare_stable_events: bool = False,
+    primitive_duplicate_containment_threshold: float | None = None,
+    cross_circle_max_center_distance: float | None = None,
 ) -> dict:
     case_dir = output_dir / label
     case_dir.mkdir(parents=True, exist_ok=False)
@@ -867,11 +960,23 @@ def run_case(
             _write_json(case_dir / "pipeline-error.json", error)
         if compare_stable_events:
             try:
+                if primitive_duplicate_containment_threshold is None:
+                    raise ValueError(
+                        "primitive duplicate containment threshold is required"
+                    )
+                if cross_circle_max_center_distance is None:
+                    raise ValueError("cross-circle max center distance is required")
                 stable_experiment = run_stable_event_experiment(
                     image_path=image_path,
                     case_dir=case_dir,
                     client=recording_client,
                     cv=cv,
+                    primitive_duplicate_containment_threshold=(
+                        primitive_duplicate_containment_threshold
+                    ),
+                    cross_circle_max_center_distance=(
+                        cross_circle_max_center_distance
+                    ),
                 )
             except Exception as exc:
                 stable_experiment_error = {
@@ -926,8 +1031,8 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
         "",
         "> CV 组件/证据组数量不等于错题数量；本表只用于定位首次数量偏差。",
         "",
-        "| 图片 | 人工错题 | CV组件 | CV证据组 | 当前primitive | 当前事件 | 当前定位 | 当前内容 | 当前首次偏差 | 实验primitive | 稳定事件 | 重复event候选 | 圈叉归属异常 | 未分配primitive | 未覆盖CV组件 | LLM实验耗时(ms) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 人工错题 | CV组件 | CV证据组 | 当前primitive | 当前事件 | 当前定位 | 当前内容 | 当前首次偏差 | 实验primitive | 稳定事件 | 重复event候选 | 重复primitive候选 | 跨单元圈叉候选 | 圈叉归属异常 | 未分配primitive | 未覆盖CV组件 | LLM实验耗时(ms) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for summary in summaries:
         item = summary["checkpoints"]
@@ -944,7 +1049,7 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
             else summary["first_count_divergence"] or "无数量偏差"
         )
         lines.append(
-            "| {label} | {expected} | {components} | {groups} | {current_primitives} | {marks} | {located} | {content} | {divergence} | {primitives} | {stable} | {duplicate_events} | {membership_violations} | {unassigned} | {uncovered} | {experiment_ms} |".format(
+            "| {label} | {expected} | {components} | {groups} | {current_primitives} | {marks} | {located} | {content} | {divergence} | {primitives} | {stable} | {duplicate_events} | {duplicate_primitives} | {geometry_candidates} | {membership_violations} | {unassigned} | {uncovered} | {experiment_ms} |".format(
                 label=summary["label"],
                 expected=item["expected_error_count"],
                 components=item["cv_raw_component_count"],
@@ -957,6 +1062,12 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
                 primitives=item["stable_primitive_count"],
                 stable=item["stable_event_count"],
                 duplicate_events=item["stable_duplicate_event_candidate_count"],
+                duplicate_primitives=item[
+                    "stable_duplicate_primitive_candidate_count"
+                ],
+                geometry_candidates=item[
+                    "stable_cross_circle_geometry_candidate_count"
+                ],
                 membership_violations=item[
                     "stable_primitive_membership_violation_count"
                 ],
@@ -987,7 +1098,35 @@ def main() -> int:
             "and audit-only CV validation"
         ),
     )
+    parser.add_argument(
+        "--stable-primitive-duplicate-containment-threshold",
+        type=float,
+        help="same-type primitive containment ratio used by diagnostic audit",
+    )
+    parser.add_argument(
+        "--stable-cross-circle-max-center-distance",
+        type=float,
+        help="maximum normalized circle/cross center distance used by diagnostic audit",
+    )
     args = parser.parse_args()
+
+    if args.compare_stable_events:
+        if args.stable_primitive_duplicate_containment_threshold is None:
+            parser.error(
+                "--compare-stable-events requires "
+                "--stable-primitive-duplicate-containment-threshold"
+            )
+        if not 0 <= args.stable_primitive_duplicate_containment_threshold <= 1:
+            parser.error(
+                "--stable-primitive-duplicate-containment-threshold must be between 0 and 1"
+            )
+        if args.stable_cross_circle_max_center_distance is None:
+            parser.error(
+                "--compare-stable-events requires "
+                "--stable-cross-circle-max-center-distance"
+            )
+        if args.stable_cross_circle_max_center_distance <= 0:
+            parser.error("--stable-cross-circle-max-center-distance must be positive")
 
     try:
         images = _parse_labeled_paths(args.images)
@@ -1003,6 +1142,12 @@ def main() -> int:
             "warning": "Contains worksheet images, prompts, and model responses; delete after analysis.",
             "cv_only": args.cv_only,
             "compare_stable_events": args.compare_stable_events,
+            "stable_primitive_duplicate_containment_threshold": (
+                args.stable_primitive_duplicate_containment_threshold
+            ),
+            "stable_cross_circle_max_center_distance": (
+                args.stable_cross_circle_max_center_distance
+            ),
             "labels": [label for label, _path in images],
         },
     )
@@ -1015,6 +1160,12 @@ def main() -> int:
             subject_hint=args.subject,
             cv_only=args.cv_only,
             compare_stable_events=args.compare_stable_events,
+            primitive_duplicate_containment_threshold=(
+                args.stable_primitive_duplicate_containment_threshold
+            ),
+            cross_circle_max_center_distance=(
+                args.stable_cross_circle_max_center_distance
+            ),
         )
         for label, path in images
     ]
