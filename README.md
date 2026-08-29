@@ -461,6 +461,8 @@ student (学生)
 | `MARK_PAIR_MAX_RELATIVE_DISTANCE_RATIO` | 圈叉距离相对红圈最长边的上限 | `1.0` |
 | `MARK_PAIR_MIN_MARGIN_RATIO` | 最佳配对相对第二候选的最小领先比例 | `0.2` |
 | `MARK_CIRCLE_CONTEXT_PADDING_RATIO` | 红圈局部定位上下文扩展比例 | `1.0` |
+| `MARK_EVIDENCE_CONTEXT_MIN_WIDTH_RATIO` | 红区定向识别及定位失败保底裁图的最小整页宽度比例 | `0.22` |
+| `MARK_EVIDENCE_CONTEXT_MIN_HEIGHT_RATIO` | 红区定向识别及定位失败保底裁图的最小整页高度比例 | `0.14` |
 | `MARK_ANSWER_MIN_CIRCLE_OVERLAP_RATIO` | 答案框至少覆盖的红圈面积比例；不足时重试或待确认 | `0.25` |
 | `MARK_ANSWER_MIN_ANSWER_OVERLAP_RATIO` | 答案框自身至少位于红圈内的面积比例 | `0.5` |
 | `MARK_ANSWER_HARD_MIN_CIRCLE_COVERAGE_RATIO` | 红圈覆盖明显错位的硬下限；低于时仍保留待确认候选 | `0.1` |

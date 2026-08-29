@@ -201,6 +201,8 @@ def process_image(self, image_id: str, filepath: str):
             pair_max_relative_distance_ratio=settings.MARK_PAIR_MAX_RELATIVE_DISTANCE_RATIO,
             pair_min_margin_ratio=settings.MARK_PAIR_MIN_MARGIN_RATIO,
             circle_context_padding_ratio=settings.MARK_CIRCLE_CONTEXT_PADDING_RATIO,
+            evidence_context_min_width_ratio=settings.MARK_EVIDENCE_CONTEXT_MIN_WIDTH_RATIO,
+            evidence_context_min_height_ratio=settings.MARK_EVIDENCE_CONTEXT_MIN_HEIGHT_RATIO,
             answer_min_circle_overlap_ratio=settings.MARK_ANSWER_MIN_CIRCLE_OVERLAP_RATIO,
             answer_min_answer_overlap_ratio=settings.MARK_ANSWER_MIN_ANSWER_OVERLAP_RATIO,
             answer_hard_min_circle_coverage_ratio=settings.MARK_ANSWER_HARD_MIN_CIRCLE_COVERAGE_RATIO,

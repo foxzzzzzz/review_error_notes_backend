@@ -40,9 +40,11 @@ from app.services.error_mark_validation import (
 )
 from app.services.question_collection import collection_reason_for, collection_status_for
 from app.services.question_image import (
+    expand_bbox_to_minimum_context,
     local_bbox_to_page,
     page_bbox_to_local,
     render_mark_context,
+    render_numbered_region_sheet,
     render_numbered_question_sheet,
 )
 from app.services.recognition_policy import decide_candidate
@@ -88,6 +90,19 @@ MARK_DETECTION_PROMPT = """你是小学作业红色批改几何标记检测器�
 3. 不要把印刷红色方格、页眉线、装饰色或单独红色对勾当作错误标记。
 4. bbox 使用归一化角点格式 [left, top, right, bottom]；mark_id 从 0 开始连续且唯一。
 5. 只返回严格 JSON：{"error_marks":[{"mark_id":0,"mark_type":"circle","bbox":[0.1,0.2,0.3,0.4],"cross_bbox":null,"circle_bbox":null,"confidence":0.95}]}。
+"""
+
+
+REGIONAL_MARK_DETECTION_PROMPT = """你是小学作业红色批改几何标记检测器。图片由多个带 region_id 标题的高清局部照片组成，请逐区域识别老师手写的红圈、红叉及其他明确错误标记。
+
+要求：
+1. bbox 必须覆盖完整几何形状：circle 覆盖完整闭合或近似闭合红圈，cross 覆盖两条相交笔画；不得把一小段孤立红线当作完整圈或叉。
+2. 每个标记必须填写所在标题的 region_id；bbox 使用该 region_id 标题下方照片区域自身的归一化 [left, top, right, bottom] 坐标，不是整张拼图坐标。
+3. 一个 region_id 中可能同时出现多个相邻红圈或红叉，必须把每个完整几何形状分别输出，不能只返回最显眼的一个，也不能把相邻两个叉合成一个大叉。
+4. 同一几何形状在相邻区域重复出现时允许分别输出，后端会映射整页后去重；不得合并红圈与红叉，不得输出 cross_circle。
+5. 不要识别题目内容，也不要把印刷红框、页眉线、装饰色或单独红色对勾当作错误标记。
+6. mark_id 从 0 开始连续且唯一。
+7. 只返回严格 JSON：{"error_marks":[{"region_id":0,"mark_id":0,"mark_type":"circle","bbox":[0.1,0.2,0.8,0.9],"cross_bbox":null,"circle_bbox":null,"confidence":0.95}]}。
 """
 
 
@@ -404,6 +419,25 @@ class MarkDetectionResult(BaseModel):
             raise ValueError("mark primitive ids must be unique and sequential")
         if any(mark.mark_type == "cross_circle" for mark in self.error_marks):
             raise ValueError("mark detection must not pre-combine cross and circle")
+        return self
+
+
+class RegionalErrorMark(ErrorMark):
+    region_id: int = Field(ge=0)
+
+
+class RegionalMarkDetectionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    error_marks: List[RegionalErrorMark] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def primitives_must_be_sequential_and_uncombined(self):
+        mark_ids = [mark.mark_id for mark in self.error_marks]
+        if mark_ids != list(range(len(mark_ids))):
+            raise ValueError("regional mark primitive ids must be unique and sequential")
+        if any(mark.mark_type == "cross_circle" for mark in self.error_marks):
+            raise ValueError("regional mark detection must not pre-combine marks")
         return self
 
 
@@ -1595,6 +1629,23 @@ def _mark_in_context(mark: ErrorMark, context_page_bbox: List[float]) -> ErrorMa
     return mark.model_copy(update=updates)
 
 
+def _regional_mark_to_page(
+    mark: RegionalErrorMark,
+    context_page_bbox: List[float],
+) -> ErrorMark:
+    payload = mark.model_dump(exclude={"region_id"})
+    payload["bbox"] = local_bbox_to_page(mark.bbox, context_page_bbox)
+    if mark.cross_bbox is not None:
+        payload["cross_bbox"] = local_bbox_to_page(
+            mark.cross_bbox, context_page_bbox
+        )
+    if mark.circle_bbox is not None:
+        payload["circle_bbox"] = local_bbox_to_page(
+            mark.circle_bbox, context_page_bbox
+        )
+    return ErrorMark.model_validate(payload)
+
+
 def _localize_circle_mark_context(
     *,
     client,
@@ -1611,6 +1662,8 @@ def _localize_circle_mark_context(
     max_center_offset_ratio: float,
     max_overflow_ratio: float,
     edge_margin_ratio: float,
+    fallback_min_width_ratio: float,
+    fallback_min_height_ratio: float,
 ) -> tuple[LocalizationItem, List[dict]]:
     circle_bbox = mark.circle_bbox or mark.bbox
     attempts = []
@@ -1726,7 +1779,11 @@ def _localize_circle_mark_context(
             }
         )
 
-    fallback_bbox = last_context.page_bbox if last_context is not None else circle_bbox
+    fallback_bbox = expand_bbox_to_minimum_context(
+        last_context.page_bbox if last_context is not None else circle_bbox,
+        min_width_ratio=fallback_min_width_ratio,
+        min_height_ratio=fallback_min_height_ratio,
+    )
     return (
         LocalizationItem(
             index=0,
@@ -1777,6 +1834,10 @@ def recognize_marked_three_stage(
     localization_edge_margin_ratio: float = 0.02,
     local_red_group_max_gap_ratio: float = 0.03,
     local_red_group_max_area_ratio: float = 0.08,
+    evidence_context_min_width_ratio: float = 0.22,
+    evidence_context_min_height_ratio: float = 0.14,
+    local_red_evidence_regions: Optional[List[RedMarkRegion]] = None,
+    local_red_rescue_min_pixels: int = 80,
 ) -> tuple[VisionResult, dict[int, LocalizationItem], List[ErrorMark], dict]:
     """Run isolated mark, geometry, and content stages for a marked page."""
     diagnostic = {
@@ -1784,6 +1845,8 @@ def recognize_marked_three_stage(
         "mark_llm_ms": 0.0,
         "mark_primitive_count": 0,
         "mark_llm_attempts": 0,
+        "targeted_mark_llm_attempts": 0,
+        "targeted_region_count": 0,
         "mark_event_count": 0,
         "uncovered_local_red_region_count": 0,
         "localization_llm_ms": 0.0,
@@ -1799,16 +1862,20 @@ def recognize_marked_three_stage(
         "missing_content_mark_ids": [],
     }
     started = time.perf_counter()
-    evidence_regions = [
-        RedMarkRegion(
-            bbox=region,
-            pixel_count=1,
-            area_ratio=bbox_area(region),
-            thinness_ratio=max(region[2] - region[0], region[3] - region[1])
-            / max(min(region[2] - region[0], region[3] - region[1]), 1e-9),
-        )
-        for region in local_red_regions
-    ]
+    evidence_regions = (
+        [region.model_copy(deep=True) for region in local_red_evidence_regions]
+        if local_red_evidence_regions is not None
+        else [
+            RedMarkRegion(
+                bbox=region,
+                pixel_count=1,
+                area_ratio=bbox_area(region),
+                thinness_ratio=max(region[2] - region[0], region[3] - region[1])
+                / max(min(region[2] - region[0], region[3] - region[1]), 1e-9),
+            )
+            for region in local_red_regions
+        ]
+    )
     grouped_evidence, evidence_diagnostic = group_red_evidence_regions(
         evidence_regions,
         max_gap_ratio=local_red_group_max_gap_ratio,
@@ -1816,23 +1883,79 @@ def recognize_marked_three_stage(
     )
     local_red_regions = [list(region.bbox) for region in grouped_evidence]
     diagnostic.update(evidence_diagnostic)
+    diagnostic["evidence_groups"] = [
+        {
+            "region_id": index,
+            "bbox": [round(value, 6) for value in region.bbox],
+            "pixel_count": region.pixel_count,
+        }
+        for index, region in enumerate(grouped_evidence)
+    ]
     valid_attempts = []
     valid_marks = []
     grouping_diagnostic = {}
     merge_diagnostic = {}
     uncovered_regions = list(local_red_regions)
+    targeted_detection_available = bool(grouped_evidence) and hasattr(
+        client, "detect_marks_in_regions"
+    )
     for mark_attempt in range(mark_stage_retry_count + 1):
         diagnostic["mark_llm_attempts"] += 1
-        detected = client.detect_marks(
-            image_path,
-            local_red_regions,
-            correction=(
-                "上次仍有本地红色候选区域未被覆盖，请重点复查这些区域并只输出独立几何形状："
-                + json.dumps(uncovered_regions, separators=(",", ":"))
-                if mark_attempt
-                else None
-            ),
-        )
+        if mark_attempt and targeted_detection_available:
+            region_sheet = render_numbered_region_sheet(
+                image_path,
+                [
+                    (region_id, region.bbox)
+                    for region_id, region in enumerate(grouped_evidence)
+                ],
+                min_width_ratio=evidence_context_min_width_ratio,
+                min_height_ratio=evidence_context_min_height_ratio,
+                max_edge=image_max_edge,
+                jpeg_quality=image_jpeg_quality,
+                max_pixels=image_max_pixels,
+            )
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temporary:
+                    temporary.write(region_sheet.image_bytes)
+                    temporary_path = temporary.name
+                regional_result = client.detect_marks_in_regions(
+                    temporary_path,
+                    sorted(region_sheet.page_bboxes),
+                    correction=(
+                        "上次整页检测不完整；必须逐个检查全部编号区域，并输出完整红圈和完整红叉。"
+                    ),
+                )
+            finally:
+                if temporary_path is not None:
+                    Path(temporary_path).unlink(missing_ok=True)
+            mapped_marks = [
+                _regional_mark_to_page(
+                    mark,
+                    region_sheet.page_bboxes[mark.region_id],
+                )
+                for mark in regional_result.error_marks
+                if mark.region_id in region_sheet.page_bboxes
+            ]
+            detected = MarkDetectionResult(
+                error_marks=[
+                    mark.model_copy(update={"mark_id": index})
+                    for index, mark in enumerate(mapped_marks)
+                ]
+            )
+            diagnostic["targeted_mark_llm_attempts"] += 1
+            diagnostic["targeted_region_count"] = len(region_sheet.page_bboxes)
+        else:
+            detected = client.detect_marks(
+                image_path,
+                local_red_regions,
+                correction=(
+                    "上次仍有本地红色候选区域未被覆盖，请重点复查这些区域并只输出独立几何形状："
+                    + json.dumps(uncovered_regions, separators=(",", ":"))
+                    if mark_attempt
+                    else None
+                ),
+            )
         diagnostic["mark_primitive_count"] = len(detected.error_marks)
         attempt_marks, _rejected_mark_ids, _mark_diagnostics = filter_valid_error_marks(
             image_path,
@@ -1860,15 +1983,61 @@ def recognize_marked_three_stage(
             for region in local_red_regions
             if not any(bboxes_intersect(region, mark.bbox) for mark in valid_marks)
         ]
-        if valid_marks and not uncovered_regions:
+        if valid_marks and not uncovered_regions and not (
+            mark_attempt == 0
+            and mark_stage_retry_count > 0
+            and targeted_detection_available
+        ):
             break
     diagnostic["mark_llm_ms"] = round((time.perf_counter() - started) * 1000, 2)
-    diagnostic["mark_event_count"] = len(valid_marks)
-    diagnostic["uncovered_local_red_region_count"] = len(uncovered_regions)
     diagnostic["mark_grouping"] = {**grouping_diagnostic, **merge_diagnostic}
     review_required_mark_ids = set(
         grouping_diagnostic.get("review_required_mark_ids", [])
     )
+    rescued_uncovered_region_ids = []
+    unresolved_uncovered_region_ids = []
+    next_mark_id = max((mark.mark_id for mark in valid_marks), default=-1) + 1
+    for region_id, region in enumerate(grouped_evidence):
+        if list(region.bbox) not in uncovered_regions:
+            continue
+        if region.pixel_count < local_red_rescue_min_pixels:
+            unresolved_uncovered_region_ids.append(region_id)
+            continue
+        valid_marks.append(
+            ErrorMark(
+                mark_id=next_mark_id,
+                mark_type="mixed",
+                bbox=list(region.bbox),
+                confidence=mark_confidence_threshold,
+            )
+        )
+        review_required_mark_ids.add(next_mark_id)
+        rescued_uncovered_region_ids.append(region_id)
+        next_mark_id += 1
+    diagnostic["rescued_uncovered_region_ids"] = rescued_uncovered_region_ids
+    diagnostic["unresolved_uncovered_region_ids"] = unresolved_uncovered_region_ids
+    diagnostic["uncovered_local_red_region_count"] = len(
+        unresolved_uncovered_region_ids
+    )
+    diagnostic["mark_event_count"] = len(valid_marks)
+    diagnostic["detected_mark_geometry"] = [
+        {
+            "mark_id": mark.mark_id,
+            "mark_type": mark.mark_type,
+            "bbox": [round(value, 6) for value in mark.bbox],
+            "cross_bbox": (
+                [round(value, 6) for value in mark.cross_bbox]
+                if mark.cross_bbox is not None
+                else None
+            ),
+            "circle_bbox": (
+                [round(value, 6) for value in mark.circle_bbox]
+                if mark.circle_bbox is not None
+                else None
+            ),
+        }
+        for mark in valid_marks
+    ]
     if not valid_marks:
         raise ImageReviewRequired(
             "red_marks_unresolved",
@@ -1908,6 +2077,8 @@ def recognize_marked_three_stage(
             max_center_offset_ratio=answer_max_center_offset_ratio,
             max_overflow_ratio=answer_max_overflow_ratio,
             edge_margin_ratio=localization_edge_margin_ratio,
+            fallback_min_width_ratio=evidence_context_min_width_ratio,
+            fallback_min_height_ratio=evidence_context_min_height_ratio,
         )
         diagnostic["localization_llm_attempts"] += len(attempt_diagnostics)
         if mark.mark_id in review_required_mark_ids:
@@ -1955,6 +2126,10 @@ def recognize_marked_three_stage(
             ):
                 continue
             mark = marks_by_id[item.mark_id]
+            needs_review = (
+                mark.mark_type == "cross"
+                or mark.mark_id in review_required_mark_ids
+            )
             located_by_mark[item.mark_id] = LocalizationItem(
                 index=0,
                 matched=True,
@@ -1971,7 +2146,7 @@ def recognize_marked_three_stage(
                     else "legacy_mark_localization"
                 ),
                 localization_status=(
-                    "needs_review" if mark.mark_type == "cross" else "verified"
+                    "needs_review" if needs_review else "verified"
                 ),
                 confidence=item.confidence,
             )
@@ -1986,11 +2161,16 @@ def recognize_marked_three_stage(
             jpeg_quality=image_jpeg_quality,
             max_pixels=image_max_pixels,
         )
+        fallback_bbox = expand_bbox_to_minimum_context(
+            context.page_bbox,
+            min_width_ratio=evidence_context_min_width_ratio,
+            min_height_ratio=evidence_context_min_height_ratio,
+        )
         located_by_mark[mark.mark_id] = LocalizationItem(
             index=0,
             matched=True,
             mark_ids=[mark.mark_id],
-            bbox=context.page_bbox,
+            bbox=fallback_bbox,
             geometry_diagnostic={
                 "passed": False,
                 "failure_reasons": ["cross_localization_retry_exhausted"],
@@ -2014,6 +2194,20 @@ def recognize_marked_three_stage(
     diagnostic["unlocalized_mark_ids"] = sorted(
         set(marks_by_id) - set(located_by_mark)
     )
+    diagnostic["localized_question_geometry"] = [
+        {
+            "mark_id": mark_id,
+            "bbox": [round(value, 6) for value in localization.bbox],
+            "answer_bbox": (
+                [round(value, 6) for value in localization.answer_bbox]
+                if localization.answer_bbox is not None
+                else None
+            ),
+            "bbox_source": localization.bbox_source,
+            "localization_status": localization.localization_status,
+        }
+        for mark_id, localization in sorted(located_by_mark.items())
+    ]
     if not located_by_mark:
         raise ImageReviewRequired(
             "red_marks_unresolved",
@@ -2144,6 +2338,8 @@ def recognize_question_batch(
     image_jpeg_quality: int = 90,
     image_max_pixels: int = 40_000_000,
     circle_context_padding_ratio: float = 1.0,
+    evidence_context_min_width_ratio: float = 0.22,
+    evidence_context_min_height_ratio: float = 0.14,
     answer_min_circle_overlap_ratio: float = 0.25,
     answer_min_answer_overlap_ratio: float = 0.5,
     answer_hard_min_circle_coverage_ratio: float = 0.1,
@@ -2181,6 +2377,8 @@ def recognize_question_batch(
             dedup_iou_threshold=dedup_iou_threshold,
             crop_context_padding_ratio=crop_context_padding_ratio,
             circle_context_padding_ratio=circle_context_padding_ratio,
+            evidence_context_min_width_ratio=evidence_context_min_width_ratio,
+            evidence_context_min_height_ratio=evidence_context_min_height_ratio,
             answer_min_circle_overlap_ratio=answer_min_circle_overlap_ratio,
             answer_min_answer_overlap_ratio=answer_min_answer_overlap_ratio,
             answer_hard_min_circle_coverage_ratio=answer_hard_min_circle_coverage_ratio,
@@ -2196,6 +2394,10 @@ def recognize_question_batch(
             localization_stage_retry_count=localization_stage_retry_count,
             content_stage_retry_count=content_stage_retry_count,
             content_batch_size=content_batch_size,
+            local_red_evidence_regions=(
+                list(local_red_scan.regions) if local_red_scan is not None else None
+            ),
+            local_red_rescue_min_pixels=local_red_rescue_min_pixels,
         )
 
         class PrecomputedThreeStageClient:
@@ -3218,6 +3420,29 @@ class MiniMaxVisionClient:
         return self._request(
             {"prompt": prompt, "image_url": image_url},
             MarkDetectionResult,
+            diagnostic,
+        )
+
+    def detect_marks_in_regions(
+        self,
+        image_path: str,
+        region_ids: List[int],
+        correction: Optional[str] = None,
+    ) -> RegionalMarkDetectionResult:
+        diagnostic = {
+            "operation": "regional_mark_detection",
+            "region_count": len(region_ids),
+        }
+        image_url = prepare_image_data_url(
+            image_path, self.max_edge, self.jpeg_quality, diagnostic
+        )
+        prompt = REGIONAL_MARK_DETECTION_PROMPT
+        prompt += "\n\n必须处理的 region_id：" + json.dumps(region_ids)
+        if correction:
+            prompt += "\n\n红标检测纠偏：" + correction
+        return self._request(
+            {"prompt": prompt, "image_url": image_url},
+            RegionalMarkDetectionResult,
             diagnostic,
         )
 

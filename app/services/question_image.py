@@ -24,6 +24,12 @@ class MarkContext:
     page_bbox: list[float]
 
 
+@dataclass(frozen=True)
+class NumberedRegionSheet:
+    image_bytes: bytes
+    page_bboxes: dict[int, list[float]]
+
+
 def _validated_normalized_bbox(bbox):
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         raise QuestionImageInvalid("Question crop bbox is invalid")
@@ -68,6 +74,28 @@ def page_bbox_to_local(page_bbox, context_page_bbox):
         (bottom - context_top) / context_height,
     ]
     return [min(1.0, max(0.0, value)) for value in local_bbox]
+
+
+def expand_bbox_to_minimum_context(
+    bbox,
+    *,
+    min_width_ratio,
+    min_height_ratio,
+):
+    """Expand a normalized bbox around its center while staying on the page."""
+    left, top, right, bottom = _validated_normalized_bbox(bbox)
+    width = max(right - left, min_width_ratio)
+    height = max(bottom - top, min_height_ratio)
+    center_x = (left + right) / 2
+    center_y = (top + bottom) / 2
+    expanded_left = max(0.0, min(1.0 - width, center_x - width / 2))
+    expanded_top = max(0.0, min(1.0 - height, center_y - height / 2))
+    return [
+        expanded_left,
+        expanded_top,
+        expanded_left + width,
+        expanded_top + height,
+    ]
 
 
 def render_mark_context(
@@ -240,6 +268,77 @@ def render_numbered_question_sheet(
         output = BytesIO()
         sheet.save(output, format="JPEG", quality=jpeg_quality)
         return output.getvalue()
+    except (OSError, ValueError) as exc:
+        raise QuestionImageInvalid("Question image is invalid") from exc
+
+
+def render_numbered_region_sheet(
+    image_path,
+    regions,
+    min_width_ratio,
+    min_height_ratio,
+    max_edge,
+    jpeg_quality,
+    max_pixels,
+):
+    """Render numbered high-resolution red-evidence contexts for targeted VLM detection."""
+    if not regions:
+        raise QuestionImageInvalid("Region sheet evidence is empty")
+    image = _load_rgb_image(image_path, max_pixels)
+    panels = []
+    page_bboxes = {}
+    for region_id, bbox in regions:
+        context_bbox = expand_bbox_to_minimum_context(
+            bbox,
+            min_width_ratio=min_width_ratio,
+            min_height_ratio=min_height_ratio,
+        )
+        crop_box = _pixel_crop_box(
+            image.size,
+            {"bbox": context_bbox, "bbox_format": "normalized_ltrb"},
+        )
+        if crop_box is None:
+            raise QuestionImageInvalid("Region sheet evidence is invalid")
+        pixel_left, pixel_top, pixel_right, pixel_bottom = crop_box
+        page_bboxes[region_id] = [
+            pixel_left / image.width,
+            pixel_top / image.height,
+            pixel_right / image.width,
+            pixel_bottom / image.height,
+        ]
+        crop = image.crop(crop_box)
+        label_height = 28
+        panel = Image.new("RGB", (crop.width, crop.height + label_height), "white")
+        ImageDraw.Draw(panel).text((8, 7), f"region_id={region_id}", fill="black")
+        panel.paste(crop, (0, label_height))
+        panels.append(panel)
+
+    columns = 1 if len(panels) == 1 else 2
+    rows = math.ceil(len(panels) / columns)
+    cell_width = max(panel.width for panel in panels)
+    cell_height = max(panel.height for panel in panels)
+    gap = 8
+    sheet = Image.new(
+        "RGB",
+        (
+            columns * cell_width + (columns - 1) * gap,
+            rows * cell_height + (rows - 1) * gap,
+        ),
+        "white",
+    )
+    for index, panel in enumerate(panels):
+        column = index % columns
+        row = index // columns
+        sheet.paste(panel, (column * (cell_width + gap), row * (cell_height + gap)))
+    if max(sheet.size) > max_edge:
+        sheet.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+    try:
+        output = BytesIO()
+        sheet.save(output, format="JPEG", quality=jpeg_quality)
+        return NumberedRegionSheet(
+            image_bytes=output.getvalue(),
+            page_bboxes=page_bboxes,
+        )
     except (OSError, ValueError) as exc:
         raise QuestionImageInvalid("Question image is invalid") from exc
 

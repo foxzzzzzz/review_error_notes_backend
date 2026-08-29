@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     MARK_PAIR_MAX_RELATIVE_DISTANCE_RATIO: float = Field(default=1.0, ge=0, le=5)
     MARK_PAIR_MIN_MARGIN_RATIO: float = Field(default=0.2, ge=0, le=1)
     MARK_CIRCLE_CONTEXT_PADDING_RATIO: float = Field(default=1.0, ge=0, le=3)
+    MARK_EVIDENCE_CONTEXT_MIN_WIDTH_RATIO: float = Field(default=0.22, gt=0, le=1)
+    MARK_EVIDENCE_CONTEXT_MIN_HEIGHT_RATIO: float = Field(default=0.14, gt=0, le=1)
     MARK_ANSWER_MIN_CIRCLE_OVERLAP_RATIO: float = Field(default=0.25, ge=0, le=1)
     MARK_ANSWER_MIN_ANSWER_OVERLAP_RATIO: float = Field(default=0.5, ge=0, le=1)
     MARK_ANSWER_HARD_MIN_CIRCLE_COVERAGE_RATIO: float = Field(default=0.1, ge=0, le=1)

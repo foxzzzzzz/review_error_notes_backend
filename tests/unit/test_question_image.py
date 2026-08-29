@@ -102,6 +102,18 @@ def test_mark_context_reports_actual_pixel_aligned_page_bbox(tmp_path):
     assert context.page_bbox == pytest.approx([0.2, 0.2, 0.6, 0.6])
 
 
+def test_expand_bbox_to_minimum_context_prevents_tiny_mark_crop():
+    from app.services.question_image import expand_bbox_to_minimum_context
+
+    expanded = expand_bbox_to_minimum_context(
+        [0.48, 0.48, 0.52, 0.52],
+        min_width_ratio=0.22,
+        min_height_ratio=0.14,
+    )
+
+    assert expanded == pytest.approx([0.39, 0.43, 0.61, 0.57])
+
+
 def test_in_memory_crop_uses_the_same_normalized_coordinates(tmp_path):
     source = tmp_path / "source.jpg"
     _save_image(source)

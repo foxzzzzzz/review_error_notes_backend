@@ -19,6 +19,8 @@ EXPECTED_ADAPTIVE_EVIDENCE_SETTINGS = {
     "MARK_PAIR_MAX_RELATIVE_DISTANCE_RATIO": "1.0",
     "MARK_PAIR_MIN_MARGIN_RATIO": "0.2",
     "MARK_CIRCLE_CONTEXT_PADDING_RATIO": "1.0",
+    "MARK_EVIDENCE_CONTEXT_MIN_WIDTH_RATIO": "0.22",
+    "MARK_EVIDENCE_CONTEXT_MIN_HEIGHT_RATIO": "0.14",
     "MARK_ANSWER_MIN_CIRCLE_OVERLAP_RATIO": "0.25",
     "MARK_ANSWER_MIN_ANSWER_OVERLAP_RATIO": "0.5",
     "MARK_ANSWER_HARD_MIN_CIRCLE_COVERAGE_RATIO": "0.1",
@@ -115,6 +117,8 @@ def test_adaptive_local_evidence_settings_are_bounded():
     assert settings.MARK_PAIR_MAX_RELATIVE_DISTANCE_RATIO == 1.0
     assert settings.MARK_PAIR_MIN_MARGIN_RATIO == 0.2
     assert settings.MARK_CIRCLE_CONTEXT_PADDING_RATIO == 1.0
+    assert settings.MARK_EVIDENCE_CONTEXT_MIN_WIDTH_RATIO == 0.22
+    assert settings.MARK_EVIDENCE_CONTEXT_MIN_HEIGHT_RATIO == 0.14
     assert settings.MARK_ANSWER_MIN_CIRCLE_OVERLAP_RATIO == 0.25
     assert settings.MARK_ANSWER_MIN_ANSWER_OVERLAP_RATIO == 0.5
     assert settings.MARK_ANSWER_HARD_MIN_CIRCLE_COVERAGE_RATIO == 0.1
@@ -148,6 +152,8 @@ def test_adaptive_local_evidence_settings_are_bounded():
     with pytest.raises(ValidationError):
         Settings(_env_file=None, MARK_LOCALIZATION_EDGE_MARGIN_RATIO=0.26)
     with pytest.raises(ValidationError):
+        Settings(_env_file=None, MARK_EVIDENCE_CONTEXT_MIN_WIDTH_RATIO=1.01)
+    with pytest.raises(ValidationError):
         Settings(_env_file=None, MARK_DEDUP_IOU_THRESHOLD=0)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, MINIMAX_LOCALIZATION_SEMANTIC_RETRY_COUNT=3)
@@ -173,6 +179,8 @@ def test_worker_passes_correction_group_settings_to_recognition_batch():
         "pair_max_relative_distance_ratio": "MARK_PAIR_MAX_RELATIVE_DISTANCE_RATIO",
         "pair_min_margin_ratio": "MARK_PAIR_MIN_MARGIN_RATIO",
         "circle_context_padding_ratio": "MARK_CIRCLE_CONTEXT_PADDING_RATIO",
+        "evidence_context_min_width_ratio": "MARK_EVIDENCE_CONTEXT_MIN_WIDTH_RATIO",
+        "evidence_context_min_height_ratio": "MARK_EVIDENCE_CONTEXT_MIN_HEIGHT_RATIO",
         "answer_min_circle_overlap_ratio": "MARK_ANSWER_MIN_CIRCLE_OVERLAP_RATIO",
         "answer_min_answer_overlap_ratio": "MARK_ANSWER_MIN_ANSWER_OVERLAP_RATIO",
         "answer_hard_min_circle_coverage_ratio": "MARK_ANSWER_HARD_MIN_CIRCLE_COVERAGE_RATIO",
