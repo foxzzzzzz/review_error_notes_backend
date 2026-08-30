@@ -30,10 +30,12 @@ from app.services.error_mark_validation import (
     group_red_evidence_regions,
     scan_red_mark_regions,
 )
+from app.services.local_ocr_verification import RapidOCRVerifier
 from app.services.vision_recognition import (
     ErrorMark,
     MarkDetectionResult,
     MiniMaxVisionClient,
+    VisionItem,
     prepare_image_data_url,
     recognize_marked_three_stage,
     validate_normalized_bbox,
@@ -71,6 +73,47 @@ INDEPENDENT_COMPLETE_MARK_PROMPT = """你是小学作业红色批改几何标记
 5. 教师文字批注必须标为 annotation，不得因为包含相交笔画而标为 cross；此类批注仍作为 primitive 输出供后续归属审计。
 6. bbox 使用整页归一化 [left, top, right, bottom]；mark_id 从 0 开始连续且唯一。
 7. 只返回严格 JSON：{"error_marks":[{"mark_id":0,"mark_type":"circle","bbox":[0.1,0.2,0.3,0.4],"cross_bbox":null,"circle_bbox":null,"confidence":0.95}]}。
+"""
+
+
+CV_CROSS_VERIFICATION_PROMPT = """你是小学作业红叉候选核验器。图片是在原始整页作业上叠加了蓝色 X0、X1... 编号框的本地 CV 红叉候选。
+
+本地 CV 以召回优先，候选中可能包含印刷文字、红色方格、页码、边缘或老师批注造成的误报，也可能漏掉真实红叉。
+
+要求：
+1. 逐个处置输入 candidate_id；每个 candidate_id 必须且只能出现一次：属于 confirmed_crosses 的 source_candidate_ids，或 rejected_candidate_ids，或 uncertain_candidate_ids。
+2. confirmed_crosses 只保留能看到两条红色相交笔画的老师判错红叉；同一真实红叉的多个候选必须合并到一个 confirmed_cross，并列出全部 source_candidate_ids。
+3. 印刷文字、红色方格、页码、装饰线、图片边缘、红圈弧线、单条红线及教师文字批注不得确认为红叉。
+4. 在核验编号候选后，再检查整页；若存在明显真实红叉却没有任何候选覆盖，放入 additional_crosses。不得把不确定形状作为漏检补充。
+5. bbox 使用原始整页归一化 [left, top, right, bottom]，覆盖完整红叉。蓝色编号框只是提示，不是图片原有内容。
+6. 此阶段不识别题目内容，不匹配红圈，不决定错题区域。
+7. 只返回严格 JSON，不要解释或 Markdown。
+
+返回格式：{"confirmed_crosses":[{"source_candidate_ids":[0,1],"bbox":[0.1,0.2,0.3,0.4],"confidence":0.95}],"rejected_candidate_ids":[2],"uncertain_candidate_ids":[],"additional_crosses":[{"bbox":[0.5,0.6,0.6,0.7],"confidence":0.9}]}。
+
+输入 CV candidates：__CANDIDATES__
+"""
+
+
+CROSS_ANCHORED_QUESTION_PROMPT = """你是小学作业红叉锚定错题定位器。图片是在原始整页作业上叠加了蓝色 C0、C1... 编号框的已确认红叉；输入 JSON 给出每个 cross_id 的完整红叉坐标。
+
+目标：逐个判断每个确认红叉标记的是哪个最小独立作答单元，并返回完整错题区域和可见内容。
+
+要求：
+1. 每个输入 cross_id 必须且只能返回一次，不得新增、删除、合并或重排红叉。无法唯一定位时返回 matched=false，保留该 cross_id。
+2. matched=true 时，question_bbox 必须包含对应红叉中心，并覆盖与该红叉直接相关的完整最小作答单元：印刷提示、学生实际作答以及相关批改痕迹；不得吞入相邻兄弟小题或整页区域。
+3. answer_bbox 覆盖学生实际作答区域；prompt_bbox 覆盖直接对应的印刷提示，看不清时可为 null。
+4. 红圈、纠正文字、箭头和教师批注只作为辅助证据，可填写 auxiliary_circle_bboxes 和 teacher_annotation；它们不能新增、删除错题，也不能取代红叉锚点。
+5. raw_text 忠实抄录学生实际书写，answer 是建议正确答案；不得把老师红笔内容写入 raw_text。
+6. subject 只能是 math、chinese、english；question_type 只能是 write_pinyin、write_word、fill_blank、calculation、other。
+7. matched=false 时所有 bbox、文字内容、subject、question_type、difficulty 都必须为 null，数组字段返回空数组。
+8. 所有 bbox 使用原始整页归一化 [left, top, right, bottom]。蓝色编号框只是提示，不是图片原有内容。
+9. 只返回严格 JSON，不要解释或 Markdown。
+
+返回格式：{"items":[{"cross_id":0,"matched":true,"question_bbox":[0.1,0.2,0.4,0.5],"answer_bbox":[0.2,0.3,0.35,0.45],"prompt_bbox":[0.1,0.2,0.35,0.3],"raw_text":"学生作答","instruction":"题目要求","prompt_text":"印刷提示","normalized_text":null,"answer":"建议答案","subject":"chinese","question_type":"other","tags":[],"difficulty":2,"uncertain_segments":[],"auxiliary_circle_bboxes":[],"teacher_annotation":null,"confidence":0.95}]}。
+
+输入 confirmed crosses：__CROSSES__
+科目提示：__SUBJECT__
 """
 
 
@@ -157,6 +200,115 @@ class StableEventResult(BaseModel):
 StableEventResult.model_rebuild(_types_namespace=globals())
 
 
+class VerifiedCrossGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    source_candidate_ids: list[int] = Field(min_length=1)
+    bbox: list[float]
+    confidence: float = Field(ge=0, le=1)
+
+    @field_validator("bbox")
+    @classmethod
+    def bbox_must_be_normalized(cls, value):
+        return validate_normalized_bbox(value)
+
+
+class FallbackCross(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    bbox: list[float]
+    confidence: float = Field(ge=0, le=1)
+
+    @field_validator("bbox")
+    @classmethod
+    def bbox_must_be_normalized(cls, value):
+        return validate_normalized_bbox(value)
+
+
+class CrossCandidateVerificationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    confirmed_crosses: list[VerifiedCrossGroup] = Field(default_factory=list)
+    rejected_candidate_ids: list[int] = Field(default_factory=list)
+    uncertain_candidate_ids: list[int] = Field(default_factory=list)
+    additional_crosses: list[FallbackCross] = Field(default_factory=list)
+
+
+class CrossAnchoredQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    cross_id: int = Field(ge=0)
+    matched: bool
+    question_bbox: list[float] | None = None
+    answer_bbox: list[float] | None = None
+    prompt_bbox: list[float] | None = None
+    raw_text: str | None = None
+    instruction: str | None = None
+    prompt_text: str | None = None
+    normalized_text: str | None = None
+    answer: str | None = None
+    subject: Literal["math", "chinese", "english"] | None = None
+    question_type: Literal[
+        "write_pinyin", "write_word", "fill_blank", "calculation", "other"
+    ] | None = None
+    tags: list[str] = Field(default_factory=list)
+    difficulty: int | None = Field(default=None, ge=1, le=5)
+    uncertain_segments: list[str] = Field(default_factory=list)
+    auxiliary_circle_bboxes: list[list[float]] = Field(default_factory=list)
+    teacher_annotation: str | None = None
+    confidence: float = Field(ge=0, le=1)
+
+    @field_validator("question_bbox", "answer_bbox", "prompt_bbox")
+    @classmethod
+    def bbox_must_be_normalized(cls, value):
+        return validate_normalized_bbox(value) if value is not None else None
+
+    @field_validator("auxiliary_circle_bboxes")
+    @classmethod
+    def auxiliary_bboxes_must_be_normalized(cls, value):
+        return [validate_normalized_bbox(bbox) for bbox in value]
+
+    @model_validator(mode="after")
+    def matched_fields_must_be_consistent(self):
+        required_content = (
+            self.raw_text,
+            self.instruction,
+            self.prompt_text,
+            self.subject,
+            self.question_type,
+            self.difficulty,
+        )
+        if self.matched:
+            if self.question_bbox is None or self.answer_bbox is None:
+                raise ValueError("matched cross anchor requires question and answer bboxes")
+            if any(value is None for value in required_content):
+                raise ValueError("matched cross anchor requires question content")
+        elif any(
+            value is not None
+            for value in (
+                self.question_bbox,
+                self.answer_bbox,
+                self.prompt_bbox,
+                *required_content,
+                self.normalized_text,
+                self.answer,
+                self.teacher_annotation,
+            )
+        ) or self.tags or self.uncertain_segments or self.auxiliary_circle_bboxes:
+            raise ValueError("unmatched cross anchor cannot contain question data")
+        return self
+
+
+class CrossAnchoredQuestionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    items: list[CrossAnchoredQuestion] = Field(default_factory=list)
+
+
+CrossCandidateVerificationResult.model_rebuild(_types_namespace=globals())
+CrossAnchoredQuestionResult.model_rebuild(_types_namespace=globals())
+
+
 def _json_value(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
@@ -226,6 +378,325 @@ def _red_mask_for_image(image_path: Path, max_edge: int) -> np.ndarray:
         & (red >= green * 1.35)
         & (red >= blue * 1.35)
     )
+
+
+def _cross_arm_offsets(
+    inner_radius: int,
+    outer_radius: int,
+    diagonal_band_ratio: float,
+) -> dict[tuple[int, int], np.ndarray]:
+    offsets: dict[tuple[int, int], list[tuple[int, int]]] = {
+        (-1, -1): [],
+        (-1, 1): [],
+        (1, -1): [],
+        (1, 1): [],
+    }
+    for delta_y in range(-outer_radius, outer_radius + 1):
+        for delta_x in range(-outer_radius, outer_radius + 1):
+            distance = max(abs(delta_x), abs(delta_y))
+            if not inner_radius <= distance <= outer_radius:
+                continue
+            diagonal_gap = abs(abs(delta_x) - abs(delta_y))
+            if diagonal_gap > max(1, round(distance * diagonal_band_ratio)):
+                continue
+            quadrant = (
+                -1 if delta_y < 0 else 1,
+                -1 if delta_x < 0 else 1,
+            )
+            offsets[quadrant].append((delta_y, delta_x))
+    return {
+        quadrant: np.asarray(values, dtype=np.int32)
+        for quadrant, values in offsets.items()
+    }
+
+
+def detect_red_cross_candidates(image_path: Path, config: dict) -> dict:
+    with Image.open(image_path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        analysis_max_edge = int(config["analysis_max_edge"])
+        if max(image.size) > analysis_max_edge:
+            image.thumbnail(
+                (analysis_max_edge, analysis_max_edge),
+                Image.Resampling.LANCZOS,
+            )
+
+    pixels = np.asarray(image, dtype=np.int16)
+    red = pixels[:, :, 0]
+    green = pixels[:, :, 1]
+    blue = pixels[:, :, 2]
+    red_excess = red - np.maximum(green, blue)
+    red_mask = (red >= int(config["red_min_channel"])) & (
+        red_excess >= int(config["red_min_excess"])
+    )
+
+    height, width = red_mask.shape
+    scale = max(width, height)
+    inner_radius = max(1, round(scale * float(config["arm_inner_radius_ratio"])))
+    outer_radius = max(
+        inner_radius + 1,
+        round(scale * float(config["arm_outer_radius_ratio"])),
+    )
+    center_radius = max(1, round(scale * float(config["center_radius_ratio"])))
+    merge_radius = max(
+        1,
+        round(scale * float(config["candidate_merge_radius_ratio"])),
+    )
+    padding = max(0, round(scale * float(config["bbox_padding_ratio"])))
+    axis_offsets = range(-outer_radius, outer_radius + 1)
+    horizontal_support = np.zeros(red_mask.shape, dtype=np.uint16)
+    vertical_support = np.zeros(red_mask.shape, dtype=np.uint16)
+    for offset in axis_offsets:
+        if offset < 0:
+            horizontal_support[:, :offset] += red_mask[:, -offset:]
+            vertical_support[:offset, :] += red_mask[-offset:, :]
+        elif offset > 0:
+            horizontal_support[:, offset:] += red_mask[:, :-offset]
+            vertical_support[offset:, :] += red_mask[:-offset, :]
+        else:
+            horizontal_support += red_mask
+            vertical_support += red_mask
+    axis_sample_count = outer_radius * 2 + 1
+    axis_line_min_density = float(config["axis_line_min_density"])
+    geometry_mask = red_mask & (
+        (horizontal_support / axis_sample_count < axis_line_min_density)
+        & (vertical_support / axis_sample_count < axis_line_min_density)
+    )
+    arm_offsets = _cross_arm_offsets(
+        inner_radius,
+        outer_radius,
+        float(config["diagonal_band_ratio"]),
+    )
+    arm_min_density = float(config["arm_min_density"])
+    center_min_density = float(config["center_min_density"])
+
+    scored_centers = []
+    for center_y, center_x in np.argwhere(red_mask):
+        left = max(0, center_x - center_radius)
+        top = max(0, center_y - center_radius)
+        right = min(width, center_x + center_radius + 1)
+        bottom = min(height, center_y + center_radius + 1)
+        center_density = float(red_mask[top:bottom, left:right].mean())
+        if center_density < center_min_density:
+            continue
+
+        arm_densities = []
+        for offsets in arm_offsets.values():
+            sample_y = center_y + offsets[:, 0]
+            sample_x = center_x + offsets[:, 1]
+            valid = (
+                (sample_x >= 0)
+                & (sample_x < width)
+                & (sample_y >= 0)
+                & (sample_y < height)
+            )
+            density = (
+                float(geometry_mask[sample_y[valid], sample_x[valid]].mean())
+                if valid.any()
+                else 0.0
+            )
+            arm_densities.append(density)
+        minimum_density = min(arm_densities)
+        if minimum_density >= arm_min_density:
+            scored_centers.append(
+                {
+                    "x": int(center_x),
+                    "y": int(center_y),
+                    "min_arm_density": minimum_density,
+                    "arm_densities": arm_densities,
+                    "center_density": center_density,
+                }
+            )
+
+    clusters: list[list[dict]] = []
+    for center in scored_centers:
+        matching_cluster = next(
+            (
+                cluster
+                for cluster in clusters
+                if min(
+                    math.hypot(center["x"] - item["x"], center["y"] - item["y"])
+                    for item in cluster
+                )
+                <= merge_radius
+            ),
+            None,
+        )
+        if matching_cluster is None:
+            clusters.append([center])
+        else:
+            matching_cluster.append(center)
+
+    candidates = []
+    candidate_center_mask = np.zeros_like(red_mask)
+    for cluster in clusters:
+        best = max(
+            cluster,
+            key=lambda item: (
+                item["min_arm_density"],
+                item["center_density"],
+                -item["y"],
+                -item["x"],
+            ),
+        )
+        for item in cluster:
+            candidate_center_mask[item["y"], item["x"]] = True
+        radius = outer_radius + padding
+        left = max(0, best["x"] - radius)
+        top = max(0, best["y"] - radius)
+        right = min(width, best["x"] + radius + 1)
+        bottom = min(height, best["y"] + radius + 1)
+        candidates.append(
+            {
+                "candidate_id": 0,
+                "bbox": [
+                    round(left / width, 6),
+                    round(top / height, 6),
+                    round(right / width, 6),
+                    round(bottom / height, 6),
+                ],
+                "center": [
+                    round(best["x"] / width, 6),
+                    round(best["y"] / height, 6),
+                ],
+                "min_arm_density": round(best["min_arm_density"], 6),
+                "arm_densities": [round(value, 6) for value in best["arm_densities"]],
+                "center_density": round(best["center_density"], 6),
+            }
+        )
+
+    candidates.sort(key=lambda item: (item["center"][1], item["center"][0]))
+    for candidate_id, candidate in enumerate(candidates):
+        candidate["candidate_id"] = candidate_id
+    return {
+        "analysis_width": width,
+        "analysis_height": height,
+        "red_pixel_count": int(red_mask.sum()),
+        "candidates": candidates,
+        "red_mask": red_mask,
+        "geometry_mask": geometry_mask,
+        "candidate_center_mask": candidate_center_mask,
+    }
+
+
+def compare_cross_candidates_to_truth(
+    candidates: list[dict],
+    truth_regions: list[dict],
+    *,
+    margin_ratio: float = 0.0,
+) -> dict:
+    assignments = []
+    matched_truth_ids = set()
+    false_candidate_ids = []
+    for candidate in candidates:
+        center_x, center_y = candidate["center"]
+        containing = [
+            truth
+            for truth in truth_regions
+            if truth["source_bbox_normalized"][0]
+            - margin_ratio
+            <= center_x
+            <= truth["source_bbox_normalized"][2] + margin_ratio
+            and truth["source_bbox_normalized"][1]
+            - margin_ratio
+            <= center_y
+            <= truth["source_bbox_normalized"][3] + margin_ratio
+        ]
+        if containing:
+            truth = min(
+                containing,
+                key=lambda item: (
+                    (item["source_bbox_normalized"][2] - item["source_bbox_normalized"][0])
+                    * (item["source_bbox_normalized"][3] - item["source_bbox_normalized"][1]),
+                    item["truth_id"],
+                ),
+            )
+            truth_id = truth["truth_id"]
+            matched_truth_ids.add(truth_id)
+        else:
+            truth_id = None
+            false_candidate_ids.append(candidate["candidate_id"])
+        assignments.append(
+            {"candidate_id": candidate["candidate_id"], "truth_id": truth_id}
+        )
+
+    ordered_truth_ids = [truth["truth_id"] for truth in truth_regions]
+    matched = [truth_id for truth_id in ordered_truth_ids if truth_id in matched_truth_ids]
+    missed = [truth_id for truth_id in ordered_truth_ids if truth_id not in matched_truth_ids]
+    truth_count = len(truth_regions)
+    return {
+        "truth_count": truth_count,
+        "candidate_count": len(candidates),
+        "matched_truth_count": len(matched),
+        "truth_recall": round(len(matched) / truth_count, 6) if truth_count else None,
+        "matched_truth_ids": matched,
+        "missed_truth_ids": missed,
+        "false_candidate_ids": false_candidate_ids,
+        "assignments": assignments,
+    }
+
+
+def write_cross_cv_artifacts(
+    image_path: Path,
+    case_dir: Path,
+    config: dict,
+    truth_regions: list[dict] | None = None,
+) -> dict:
+    experiment_dir = case_dir / "cv-cross-experiment"
+    experiment_dir.mkdir(parents=True, exist_ok=False)
+    _write_json(experiment_dir / "effective-config.json", config)
+    detected = detect_red_cross_candidates(image_path, config)
+    candidates = detected["candidates"]
+    Image.fromarray((detected["red_mask"] * 255).astype(np.uint8), mode="L").save(
+        experiment_dir / "red-mask.png"
+    )
+    Image.fromarray(
+        (detected["geometry_mask"] * 255).astype(np.uint8), mode="L"
+    ).save(experiment_dir / "geometry-mask.png")
+    Image.fromarray(
+        (detected["candidate_center_mask"] * 255).astype(np.uint8), mode="L"
+    ).save(experiment_dir / "candidate-centers.png")
+    _write_json(experiment_dir / "candidates.json", candidates)
+    candidate_entries = [
+        {"mark_id": candidate["candidate_id"], "bbox": candidate["bbox"]}
+        for candidate in candidates
+    ]
+    _draw_boxes(
+        image_path,
+        experiment_dir / "candidates-overlay.jpg",
+        [("X", candidate_entries, "blue")],
+    )
+
+    truth_comparison = None
+    if truth_regions is not None:
+        truth_comparison = compare_cross_candidates_to_truth(
+            candidates,
+            truth_regions,
+            margin_ratio=float(config.get("truth_match_margin_ratio", 0.0)),
+        )
+        _write_json(
+            experiment_dir / "truth-comparison.json",
+            truth_comparison,
+        )
+        truth_entries = [
+            {
+                "mark_id": truth["truth_id"],
+                "bbox": truth["source_bbox_normalized"],
+            }
+            for truth in truth_regions
+        ]
+        _draw_boxes(
+            image_path,
+            experiment_dir / "truth-candidates-overlay.jpg",
+            [("", truth_entries, "green"), ("X", candidate_entries, "blue")],
+        )
+
+    return {
+        "analysis_width": detected["analysis_width"],
+        "analysis_height": detected["analysis_height"],
+        "red_pixel_count": detected["red_pixel_count"],
+        "candidate_count": len(candidates),
+        "truth_comparison": truth_comparison,
+    }
 
 
 def write_cv_artifacts(
@@ -357,6 +828,249 @@ def _bbox_intersection_area(first: list[float], second: list[float]) -> float:
 
 def _bbox_area(bbox: list[float]) -> float:
     return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _bbox_iou(first: list[float], second: list[float]) -> float:
+    intersection = _bbox_intersection_area(first, second)
+    union = _bbox_area(first) + _bbox_area(second) - intersection
+    return intersection / union if union else 0.0
+
+
+def audit_cross_candidate_dispositions(
+    result: CrossCandidateVerificationResult,
+    candidate_ids: list[int],
+) -> dict:
+    dispositions = [
+        candidate_id
+        for group in result.confirmed_crosses
+        for candidate_id in group.source_candidate_ids
+    ]
+    dispositions.extend(result.rejected_candidate_ids)
+    dispositions.extend(result.uncertain_candidate_ids)
+    input_ids = sorted(candidate_ids)
+    input_set = set(input_ids)
+    disposition_set = set(dispositions)
+    duplicate_ids = sorted(
+        candidate_id
+        for candidate_id in disposition_set
+        if dispositions.count(candidate_id) > 1
+    )
+    missing_ids = sorted(input_set - disposition_set)
+    unknown_ids = sorted(disposition_set - input_set)
+    return {
+        "valid": not (missing_ids or unknown_ids or duplicate_ids),
+        "input_candidate_ids": input_ids,
+        "missing_candidate_ids": missing_ids,
+        "unknown_candidate_ids": unknown_ids,
+        "duplicate_candidate_ids": duplicate_ids,
+        "policy": "Every CV candidate must be dispositioned exactly once.",
+    }
+
+
+def build_confirmed_cross_anchors(
+    result: CrossCandidateVerificationResult,
+) -> list[dict]:
+    anchors = [
+        {
+            "source": "cv_confirmed",
+            "source_candidate_ids": sorted(group.source_candidate_ids),
+            "bbox": list(group.bbox),
+            "confidence": group.confidence,
+        }
+        for group in result.confirmed_crosses
+    ]
+    anchors.extend(
+        {
+            "source": "llm_fallback",
+            "source_candidate_ids": [],
+            "bbox": list(cross.bbox),
+            "confidence": cross.confidence,
+        }
+        for cross in result.additional_crosses
+    )
+    anchors.sort(
+        key=lambda item: (
+            (item["bbox"][1] + item["bbox"][3]) / 2,
+            (item["bbox"][0] + item["bbox"][2]) / 2,
+            item["source"],
+        )
+    )
+    for cross_id, anchor in enumerate(anchors):
+        anchor["cross_id"] = cross_id
+    return [
+        {
+            "cross_id": anchor["cross_id"],
+            "source": anchor["source"],
+            "source_candidate_ids": anchor["source_candidate_ids"],
+            "bbox": anchor["bbox"],
+            "confidence": anchor["confidence"],
+        }
+        for anchor in anchors
+    ]
+
+
+def audit_cross_anchor_assignments(
+    result: CrossAnchoredQuestionResult,
+    cross_ids: list[int],
+) -> dict:
+    returned_ids = [item.cross_id for item in result.items]
+    expected_ids = sorted(cross_ids)
+    expected_set = set(expected_ids)
+    returned_set = set(returned_ids)
+    duplicate_ids = sorted(
+        cross_id for cross_id in returned_set if returned_ids.count(cross_id) > 1
+    )
+    missing_ids = sorted(expected_set - returned_set)
+    unknown_ids = sorted(returned_set - expected_set)
+    return {
+        "valid": not (missing_ids or unknown_ids or duplicate_ids),
+        "input_cross_ids": expected_ids,
+        "missing_cross_ids": missing_ids,
+        "unknown_cross_ids": unknown_ids,
+        "duplicate_cross_ids": duplicate_ids,
+        "policy": "Every confirmed cross must be returned exactly once.",
+    }
+
+
+def audit_anchored_question_geometry(
+    result: CrossAnchoredQuestionResult,
+    anchors: list[dict],
+    *,
+    max_area_ratio: float,
+) -> dict:
+    anchor_by_id = {anchor["cross_id"]: anchor for anchor in anchors}
+    violations = []
+    for item in result.items:
+        if not item.matched or item.question_bbox is None:
+            continue
+        reasons = []
+        area_ratio = _bbox_area(item.question_bbox)
+        anchor = anchor_by_id.get(item.cross_id)
+        if anchor is None:
+            reasons.append("unknown_cross_id")
+        else:
+            cross_bbox = anchor["bbox"]
+            center_x = (cross_bbox[0] + cross_bbox[2]) / 2
+            center_y = (cross_bbox[1] + cross_bbox[3]) / 2
+            if not (
+                item.question_bbox[0] <= center_x <= item.question_bbox[2]
+                and item.question_bbox[1] <= center_y <= item.question_bbox[3]
+            ):
+                reasons.append("question_bbox_does_not_contain_cross_center")
+        if area_ratio > max_area_ratio:
+            reasons.append("question_bbox_exceeds_max_area_ratio")
+        if reasons:
+            violations.append(
+                {
+                    "cross_id": item.cross_id,
+                    "reasons": reasons,
+                    "question_area_ratio": round(area_ratio, 6),
+                }
+            )
+    return {
+        "valid": not violations,
+        "max_area_ratio": max_area_ratio,
+        "violations": violations,
+        "policy": "Geometry audit records violations and never rewrites LLM output.",
+    }
+
+
+def compare_anchored_questions_to_truth(
+    result: CrossAnchoredQuestionResult,
+    truth_regions: list[dict],
+    *,
+    min_iou: float,
+) -> dict:
+    items = []
+    matched_truth_ids = set()
+    for item in result.items:
+        if not item.matched or item.question_bbox is None:
+            continue
+        scored_truths = [
+            (
+                _bbox_iou(item.question_bbox, truth["source_bbox_normalized"]),
+                truth,
+            )
+            for truth in truth_regions
+        ]
+        best_iou, best_truth = max(
+            scored_truths,
+            key=lambda pair: (pair[0], pair[1]["truth_id"]),
+            default=(0.0, None),
+        )
+        meets_threshold = best_truth is not None and best_iou >= min_iou
+        truth_id = best_truth["truth_id"] if meets_threshold else None
+        if truth_id is not None:
+            matched_truth_ids.add(truth_id)
+        items.append(
+            {
+                "cross_id": item.cross_id,
+                "truth_id": truth_id,
+                "best_iou": round(best_iou, 6),
+                "meets_threshold": meets_threshold,
+            }
+        )
+    ordered_truth_ids = [truth["truth_id"] for truth in truth_regions]
+    matched = [truth_id for truth_id in ordered_truth_ids if truth_id in matched_truth_ids]
+    missed = [truth_id for truth_id in ordered_truth_ids if truth_id not in matched_truth_ids]
+    truth_count = len(truth_regions)
+    return {
+        "truth_count": truth_count,
+        "matched_truth_count": len(matched),
+        "truth_recall": round(len(matched) / truth_count, 6) if truth_count else None,
+        "min_iou": min_iou,
+        "matched_truth_ids": matched,
+        "missed_truth_ids": missed,
+        "items": items,
+    }
+
+
+def compare_localized_questions_to_truth(
+    localized_questions: list[dict],
+    truth_regions: list[dict],
+    *,
+    min_iou: float,
+) -> dict:
+    items = []
+    matched_truth_ids = set()
+    for localized in localized_questions:
+        scored_truths = [
+            (
+                _bbox_iou(localized["bbox"], truth["source_bbox_normalized"]),
+                truth,
+            )
+            for truth in truth_regions
+        ]
+        best_iou, best_truth = max(
+            scored_truths,
+            key=lambda pair: (pair[0], pair[1]["truth_id"]),
+            default=(0.0, None),
+        )
+        meets_threshold = best_truth is not None and best_iou >= min_iou
+        truth_id = best_truth["truth_id"] if meets_threshold else None
+        if truth_id is not None:
+            matched_truth_ids.add(truth_id)
+        items.append(
+            {
+                "mark_id": localized["mark_id"],
+                "truth_id": truth_id,
+                "best_iou": round(best_iou, 6),
+                "meets_threshold": meets_threshold,
+            }
+        )
+    ordered_truth_ids = [truth["truth_id"] for truth in truth_regions]
+    matched = [truth_id for truth_id in ordered_truth_ids if truth_id in matched_truth_ids]
+    missed = [truth_id for truth_id in ordered_truth_ids if truth_id not in matched_truth_ids]
+    truth_count = len(truth_regions)
+    return {
+        "truth_count": truth_count,
+        "matched_truth_count": len(matched),
+        "truth_recall": round(len(matched) / truth_count, 6) if truth_count else None,
+        "min_iou": min_iou,
+        "matched_truth_ids": matched,
+        "missed_truth_ids": missed,
+        "items": items,
+    }
 
 
 def find_duplicate_primitive_candidates(
@@ -580,6 +1294,70 @@ class RecordingVisionClient:
             self.client.jpeg_quality,
             diagnostic,
         )
+
+    def verify_cross_candidates(
+        self,
+        image_path: str,
+        candidates: list[dict],
+    ) -> CrossCandidateVerificationResult:
+        prompt = CV_CROSS_VERIFICATION_PROMPT.replace(
+            "__CANDIDATES__",
+            json.dumps(candidates, ensure_ascii=False, indent=2),
+        )
+        diagnostic = {
+            "operation": "cv_cross_candidate_verification",
+            "candidate_count": len(candidates),
+        }
+        image_url = prepare_image_data_url(
+            image_path,
+            self.client.max_edge,
+            self.client.jpeg_quality,
+            diagnostic,
+        )
+        return self._call(
+            "cv_cross_candidate_verification",
+            image_path,
+            {"candidate_ids": [item["candidate_id"] for item in candidates]},
+            lambda: self.client._request(
+                {"prompt": prompt, "image_url": image_url},
+                CrossCandidateVerificationResult,
+                diagnostic,
+            ),
+        )
+
+    def locate_cross_anchored_questions(
+        self,
+        image_path: str,
+        anchors: list[dict],
+        subject_hint: str | None,
+    ) -> CrossAnchoredQuestionResult:
+        prompt = CROSS_ANCHORED_QUESTION_PROMPT.replace(
+            "__CROSSES__",
+            json.dumps(anchors, ensure_ascii=False, indent=2),
+        ).replace("__SUBJECT__", subject_hint or "unknown")
+        diagnostic = {
+            "operation": "cross_anchored_question_localization",
+            "cross_count": len(anchors),
+        }
+        image_url = prepare_image_data_url(
+            image_path,
+            self.client.max_edge,
+            self.client.jpeg_quality,
+            diagnostic,
+        )
+        return self._call(
+            "cross_anchored_question_localization",
+            image_path,
+            {
+                "cross_ids": [anchor["cross_id"] for anchor in anchors],
+                "subject_hint": subject_hint,
+            },
+            lambda: self.client._request(
+                {"prompt": prompt, "image_url": image_url},
+                CrossAnchoredQuestionResult,
+                diagnostic,
+            ),
+        )
         return self._call(
             "independent_complete_mark_detection",
             image_path,
@@ -778,10 +1556,13 @@ def build_summary(
     expected_count: int | None,
     cv: dict,
     pipeline: dict | None,
+    pipeline_truth_comparison: dict | None = None,
     stable_experiment: dict | None = None,
+    cross_anchor_experiment: dict | None = None,
 ) -> dict:
     pipeline_ran = pipeline is not None
     stable_experiment_ran = stable_experiment is not None
+    cross_anchor_experiment_ran = cross_anchor_experiment is not None
     pipeline = pipeline or {}
     checkpoints = {
         "expected_error_count": expected_count,
@@ -791,6 +1572,12 @@ def build_summary(
         "normalized_mark_event_count": pipeline.get("mark_event_count"),
         "localized_mark_count": pipeline.get("localized_mark_count"),
         "content_item_count": pipeline.get("content_item_count"),
+        "pipeline_truth_matched_count": (pipeline_truth_comparison or {}).get(
+            "matched_truth_count"
+        ),
+        "pipeline_truth_recall": (pipeline_truth_comparison or {}).get(
+            "truth_recall"
+        ),
         "stable_primitive_count": (stable_experiment or {}).get("primitive_count"),
         "stable_event_count": (stable_experiment or {}).get("event_count"),
         "stable_duplicate_primitive_count": (
@@ -834,6 +1621,43 @@ def build_summary(
         "stable_event_consolidation_ms": (stable_experiment or {}).get(
             "event_consolidation_ms"
         ),
+        "cross_anchor_cv_candidate_count": (cross_anchor_experiment or {}).get(
+            "cv_candidate_count"
+        ),
+        "cross_anchor_confirmed_cross_count": (cross_anchor_experiment or {}).get(
+            "llm1_confirmed_cross_count"
+        ),
+        "cross_anchor_fallback_cross_count": (cross_anchor_experiment or {}).get(
+            "llm1_fallback_cross_count"
+        ),
+        "cross_anchor_llm1_truth_recall": (cross_anchor_experiment or {}).get(
+            "llm1_truth_recall"
+        ),
+        "cross_anchor_llm1_false_cross_count": (cross_anchor_experiment or {}).get(
+            "llm1_false_cross_count"
+        ),
+        "cross_anchor_matched_question_count": (cross_anchor_experiment or {}).get(
+            "llm2_matched_question_count"
+        ),
+        "cross_anchor_geometry_violation_count": (
+            cross_anchor_experiment or {}
+        ).get("geometry_violation_count"),
+        "cross_anchor_truth_matched_count": (cross_anchor_experiment or {}).get(
+            "truth_matched_count"
+        ),
+        "cross_anchor_truth_recall": (cross_anchor_experiment or {}).get(
+            "truth_recall"
+        ),
+        "cross_anchor_ocr_contradiction_count": (
+            sum(
+                (cross_anchor_experiment or {}).get("ocr_status_counts", {}).get(
+                    status, 0
+                )
+                for status in ("wrong_candidate", "text_mismatch")
+            )
+            if cross_anchor_experiment_ran
+            else None
+        ),
     }
     first_divergence = None
     if expected_count is not None and pipeline_ran:
@@ -848,6 +1672,9 @@ def build_summary(
         "pipeline_status": "completed_or_failed" if pipeline_ran else "not_run",
         "stable_experiment_status": (
             "completed" if stable_experiment_ran else "not_run"
+        ),
+        "cross_anchor_experiment_status": (
+            "completed" if cross_anchor_experiment_ran else "not_run"
         ),
         "checkpoints": checkpoints,
         "first_count_divergence": first_divergence,
@@ -890,6 +1717,24 @@ def _pipeline_arguments() -> dict:
     }
 
 
+def _build_diagnostic_ocr_verifier() -> RapidOCRVerifier:
+    return RapidOCRVerifier(
+        enabled=settings.LOCAL_OCR_ENABLED,
+        library_version=settings.LOCAL_OCR_VERSION,
+        engine_name=settings.LOCAL_OCR_ENGINE,
+        model_version=settings.LOCAL_OCR_MODEL_VERSION,
+        model_type=settings.LOCAL_OCR_MODEL_TYPE,
+        model_path=settings.LOCAL_OCR_MODEL_PATH,
+        max_pixels=settings.QUESTION_IMAGE_MAX_PIXELS,
+        line_confidence_threshold=settings.LOCAL_OCR_LINE_CONFIDENCE_THRESHOLD,
+        min_effective_characters=settings.LOCAL_OCR_MIN_EFFECTIVE_CHARACTERS,
+        support_similarity_threshold=settings.LOCAL_OCR_SUPPORT_SIMILARITY_THRESHOLD,
+        contradiction_similarity_threshold=(
+            settings.LOCAL_OCR_CONTRADICTION_SIMILARITY_THRESHOLD
+        ),
+    )
+
+
 def run_case(
     *,
     label: str,
@@ -898,7 +1743,10 @@ def run_case(
     expected_count: int | None,
     subject_hint: str | None,
     cv_only: bool,
+    cross_cv_config: dict | None = None,
+    truth_regions: list[dict] | None = None,
     compare_stable_events: bool = False,
+    compare_cross_anchor: bool = False,
     primitive_duplicate_containment_threshold: float | None = None,
     cross_circle_max_center_distance: float | None = None,
 ) -> dict:
@@ -915,9 +1763,22 @@ def run_case(
         group_max_gap_ratio=settings.LOCAL_RED_GROUP_MAX_GAP_RATIO,
         group_max_area_ratio=settings.LOCAL_RED_COMPONENT_MAX_AREA_RATIO,
     )
+    cross_cv_experiment = (
+        write_cross_cv_artifacts(
+            image_path,
+            case_dir,
+            cross_cv_config,
+            truth_regions,
+        )
+        if cross_cv_config is not None
+        else None
+    )
     pipeline_diagnostic = None
+    pipeline_truth_comparison = None
     stable_experiment = None
     stable_experiment_error = None
+    cross_anchor_experiment = None
+    cross_anchor_experiment_error = None
     error = None
     if not cv_only:
         recorder = ExchangeRecorder(case_dir)
@@ -949,6 +1810,16 @@ def run_case(
                 case_dir / "pipeline-overlay.jpg",
                 [("M", mark_entries, "red"), ("Q", location_entries, "blue")],
             )
+            if cross_cv_config is not None and truth_regions is not None:
+                pipeline_truth_comparison = compare_localized_questions_to_truth(
+                    location_entries,
+                    truth_regions,
+                    min_iou=float(cross_cv_config["question_truth_min_iou"]),
+                )
+                _write_json(
+                    case_dir / "pipeline-truth-comparison.json",
+                    pipeline_truth_comparison,
+                )
         except Exception as exc:
             error = {
                 "type": type(exc).__name__,
@@ -989,16 +1860,228 @@ def run_case(
                     case_dir / "stable-event-experiment-error.json",
                     stable_experiment_error,
                 )
+        if compare_cross_anchor:
+            try:
+                if cross_cv_config is None or truth_regions is None:
+                    raise ValueError(
+                        "cross-anchor comparison requires CV config and truth regions"
+                    )
+                cv_experiment_dir = case_dir / "cv-cross-experiment"
+                cv_candidates = json.loads(
+                    (cv_experiment_dir / "candidates.json").read_text(encoding="utf-8")
+                )
+                cross_anchor_experiment = run_cross_anchor_experiment(
+                    image_path=image_path,
+                    case_dir=case_dir,
+                    client=recording_client,
+                    cv_candidates=cv_candidates,
+                    candidate_overlay_path=(
+                        cv_experiment_dir / "candidates-overlay.jpg"
+                    ),
+                    truth_regions=truth_regions,
+                    config=cross_cv_config,
+                    subject_hint=subject_hint,
+                    ocr_verifier=_build_diagnostic_ocr_verifier(),
+                )
+            except Exception as exc:
+                cross_anchor_experiment_error = {
+                    "type": type(exc).__name__,
+                    "code": getattr(exc, "code", None),
+                    "message": str(exc),
+                    "diagnostic": getattr(exc, "diagnostic", None),
+                }
+                _write_json(
+                    case_dir / "cross-anchor-experiment-error.json",
+                    cross_anchor_experiment_error,
+                )
     summary = build_summary(
         label=label,
         expected_count=expected_count,
         cv=cv,
         pipeline=pipeline_diagnostic,
+        pipeline_truth_comparison=pipeline_truth_comparison,
         stable_experiment=stable_experiment,
+        cross_anchor_experiment=cross_anchor_experiment,
     )
     summary["error"] = error
     summary["stable_experiment_error"] = stable_experiment_error
+    summary["cross_anchor_experiment_error"] = cross_anchor_experiment_error
+    summary["cv_cross_experiment"] = cross_cv_experiment
     _write_json(case_dir / "summary.json", summary)
+    return summary
+
+
+def run_cross_anchor_experiment(
+    *,
+    image_path: Path,
+    case_dir: Path,
+    client,
+    cv_candidates: list[dict],
+    candidate_overlay_path: Path,
+    truth_regions: list[dict],
+    config: dict,
+    subject_hint: str | None,
+    ocr_verifier,
+) -> dict:
+    experiment_dir = case_dir / "cross-anchor-experiment"
+    experiment_dir.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(candidate_overlay_path, experiment_dir / "cv-candidates-overlay.jpg")
+
+    verification = client.verify_cross_candidates(
+        str(candidate_overlay_path),
+        cv_candidates,
+    )
+    _write_json(experiment_dir / "llm1-candidate-verification.json", verification)
+    candidate_ids = [candidate["candidate_id"] for candidate in cv_candidates]
+    candidate_audit = audit_cross_candidate_dispositions(
+        verification,
+        candidate_ids,
+    )
+    _write_json(
+        experiment_dir / "llm1-candidate-membership-audit.json",
+        candidate_audit,
+    )
+    if not candidate_audit["valid"]:
+        raise ValueError("candidate disposition audit failed")
+
+    anchors = build_confirmed_cross_anchors(verification)
+    _write_json(experiment_dir / "confirmed-crosses.json", anchors)
+    llm1_truth_comparison = compare_cross_candidates_to_truth(
+        [
+            {
+                "candidate_id": anchor["cross_id"],
+                "bbox": anchor["bbox"],
+                "center": [
+                    round((anchor["bbox"][0] + anchor["bbox"][2]) / 2, 6),
+                    round((anchor["bbox"][1] + anchor["bbox"][3]) / 2, 6),
+                ],
+            }
+            for anchor in anchors
+        ],
+        truth_regions,
+        margin_ratio=float(config.get("truth_match_margin_ratio", 0.0)),
+    )
+    _write_json(
+        experiment_dir / "llm1-truth-comparison.json",
+        llm1_truth_comparison,
+    )
+    anchor_entries = [
+        {"mark_id": anchor["cross_id"], "bbox": anchor["bbox"]}
+        for anchor in anchors
+    ]
+    anchor_overlay_path = experiment_dir / "confirmed-crosses-overlay.jpg"
+    _draw_boxes(
+        image_path,
+        anchor_overlay_path,
+        [("C", anchor_entries, "blue")],
+    )
+
+    anchored_questions = (
+        client.locate_cross_anchored_questions(
+            str(anchor_overlay_path),
+            anchors,
+            subject_hint,
+        )
+        if anchors
+        else CrossAnchoredQuestionResult(items=[])
+    )
+    _write_json(
+        experiment_dir / "llm2-anchored-questions.json",
+        anchored_questions,
+    )
+    assignment_audit = audit_cross_anchor_assignments(
+        anchored_questions,
+        [anchor["cross_id"] for anchor in anchors],
+    )
+    _write_json(
+        experiment_dir / "llm2-cross-assignment-audit.json",
+        assignment_audit,
+    )
+    if not assignment_audit["valid"]:
+        raise ValueError("cross anchor assignment audit failed")
+
+    geometry_audit = audit_anchored_question_geometry(
+        anchored_questions,
+        anchors,
+        max_area_ratio=float(config["cross_anchor_question_max_area_ratio"]),
+    )
+    _write_json(
+        experiment_dir / "question-geometry-audit.json",
+        geometry_audit,
+    )
+    truth_comparison = compare_anchored_questions_to_truth(
+        anchored_questions,
+        truth_regions,
+        min_iou=float(config["question_truth_min_iou"]),
+    )
+    _write_json(experiment_dir / "truth-comparison.json", truth_comparison)
+
+    matched_questions = [item for item in anchored_questions.items if item.matched]
+    vision_items = [
+        VisionItem(
+            raw_text=item.raw_text or "",
+            instruction=item.instruction or "",
+            prompt_text=item.prompt_text or "",
+            normalized_text=item.normalized_text,
+            answer=item.answer,
+            subject=item.subject,
+            question_type=item.question_type,
+            tags=item.tags,
+            difficulty=item.difficulty,
+            confidence=item.confidence,
+            uncertain_segments=item.uncertain_segments,
+        )
+        for item in matched_questions
+    ]
+    ocr_audit = []
+    if ocr_verifier is not None:
+        for target_index, item in enumerate(matched_questions):
+            verification_result = ocr_verifier.verify_crop(
+                str(image_path),
+                item.question_bbox,
+                target_index,
+                vision_items,
+            )
+            ocr_audit.append(
+                {
+                    "cross_id": item.cross_id,
+                    **verification_result.model_dump(mode="json"),
+                }
+            )
+    _write_json(experiment_dir / "ocr-audit.json", ocr_audit)
+    ocr_status_counts = {}
+    for audit in ocr_audit:
+        status = audit["status"]
+        ocr_status_counts[status] = ocr_status_counts.get(status, 0) + 1
+
+    summary = {
+        "cv_candidate_count": len(cv_candidates),
+        "llm1_confirmed_cross_count": len(anchors),
+        "llm1_cv_confirmed_cross_count": sum(
+            anchor["source"] == "cv_confirmed" for anchor in anchors
+        ),
+        "llm1_fallback_cross_count": sum(
+            anchor["source"] == "llm_fallback" for anchor in anchors
+        ),
+        "llm1_rejected_candidate_count": len(verification.rejected_candidate_ids),
+        "llm1_uncertain_candidate_count": len(verification.uncertain_candidate_ids),
+        "llm1_candidate_audit_valid": candidate_audit["valid"],
+        "llm1_truth_matched_count": llm1_truth_comparison["matched_truth_count"],
+        "llm1_truth_recall": llm1_truth_comparison["truth_recall"],
+        "llm1_false_cross_count": len(
+            llm1_truth_comparison["false_candidate_ids"]
+        ),
+        "llm2_matched_question_count": len(matched_questions),
+        "llm2_unmatched_cross_count": len(anchored_questions.items)
+        - len(matched_questions),
+        "llm2_assignment_audit_valid": assignment_audit["valid"],
+        "geometry_violation_count": len(geometry_audit["violations"]),
+        "truth_matched_count": truth_comparison["matched_truth_count"],
+        "truth_count": truth_comparison["truth_count"],
+        "truth_recall": truth_comparison["truth_recall"],
+        "ocr_status_counts": ocr_status_counts,
+    }
+    _write_json(experiment_dir / "summary.json", summary)
     return summary
 
 
@@ -1025,14 +2108,83 @@ def _parse_expected(values: list[str]) -> dict[str, int]:
     return parsed
 
 
+def load_cross_cv_inputs(
+    config_path: Path,
+    truth_path: Path,
+    labels: list[str],
+) -> tuple[dict, dict[str, list[dict]]]:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    required = {
+        "analysis_max_edge",
+        "red_min_channel",
+        "red_min_excess",
+        "axis_line_min_density",
+        "arm_inner_radius_ratio",
+        "arm_outer_radius_ratio",
+        "diagonal_band_ratio",
+        "arm_min_density",
+        "center_radius_ratio",
+        "center_min_density",
+        "candidate_merge_radius_ratio",
+        "bbox_padding_ratio",
+        "truth_match_margin_ratio",
+        "cross_anchor_question_max_area_ratio",
+        "question_truth_min_iou",
+    }
+    missing = sorted(required - set(config))
+    if missing:
+        raise ValueError(f"cross CV config missing fields: {missing}")
+    if int(config["analysis_max_edge"]) <= 0:
+        raise ValueError("analysis_max_edge must be positive")
+    for name in ("red_min_channel", "red_min_excess"):
+        if not 0 <= int(config[name]) <= 255:
+            raise ValueError(f"{name} must be between 0 and 255")
+    ratio_fields = required - {
+        "analysis_max_edge",
+        "red_min_channel",
+        "red_min_excess",
+    }
+    for name in ratio_fields:
+        if not 0 <= float(config[name]) <= 1:
+            raise ValueError(f"{name} must be between 0 and 1")
+    if float(config["arm_inner_radius_ratio"]) >= float(
+        config["arm_outer_radius_ratio"]
+    ):
+        raise ValueError("arm inner radius must be smaller than outer radius")
+
+    truth_payload = json.loads(truth_path.read_text(encoding="utf-8"))
+    pages = truth_payload.get("pages")
+    if not isinstance(pages, dict):
+        raise ValueError("truth JSON must contain a pages object")
+    truth_by_label = {}
+    for label in labels:
+        page = pages.get(label)
+        if not isinstance(page, dict):
+            raise ValueError(f"missing truth page: {label}")
+        regions = page.get("regions")
+        if not isinstance(regions, list) or not regions:
+            raise ValueError(f"truth page has no regions: {label}")
+        seen_truth_ids = set()
+        for region in regions:
+            truth_id = region.get("truth_id")
+            if not isinstance(truth_id, str) or not truth_id:
+                raise ValueError(f"invalid truth_id for page: {label}")
+            if truth_id in seen_truth_ids:
+                raise ValueError(f"duplicate truth_id for page {label}: {truth_id}")
+            seen_truth_ids.add(truth_id)
+            validate_normalized_bbox(region.get("source_bbox_normalized"))
+        truth_by_label[label] = regions
+    return config, truth_by_label
+
+
 def _write_report(output_dir: Path, summaries: list[dict]) -> None:
     lines = [
         "# 视觉识别流程诊断报告",
         "",
         "> CV 组件/证据组数量不等于错题数量；本表只用于定位首次数量偏差。",
         "",
-        "| 图片 | 人工错题 | CV组件 | CV证据组 | 当前primitive | 当前事件 | 当前定位 | 当前内容 | 当前首次偏差 | 实验primitive | 稳定事件 | 重复event候选 | 重复primitive候选 | 跨单元圈叉候选 | 圈叉归属异常 | 未分配primitive | 未覆盖CV组件 | LLM实验耗时(ms) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 人工错题 | CV组件 | CV证据组 | 当前primitive | 当前事件 | 当前定位 | 当前内容 | 当前真值命中 | 当前真值召回 | 当前首次偏差 | 实验primitive | 稳定事件 | 重复event候选 | 重复primitive候选 | 跨单元圈叉候选 | 圈叉归属异常 | 未分配primitive | 未覆盖CV组件 | LLM实验耗时(ms) | 新方案CV候选 | 新方案确认红叉 | LLM漏检补充 | LLM1真值召回 | LLM1区域外红叉 | 新方案错题定位 | 几何异常 | 新方案真值命中 | 新方案真值召回 | OCR矛盾 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for summary in summaries:
         item = summary["checkpoints"]
@@ -1049,7 +2201,7 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
             else summary["first_count_divergence"] or "无数量偏差"
         )
         lines.append(
-            "| {label} | {expected} | {components} | {groups} | {current_primitives} | {marks} | {located} | {content} | {divergence} | {primitives} | {stable} | {duplicate_events} | {duplicate_primitives} | {geometry_candidates} | {membership_violations} | {unassigned} | {uncovered} | {experiment_ms} |".format(
+            "| {label} | {expected} | {components} | {groups} | {current_primitives} | {marks} | {located} | {content} | {pipeline_truth_matched} | {pipeline_truth_recall} | {divergence} | {primitives} | {stable} | {duplicate_events} | {duplicate_primitives} | {geometry_candidates} | {membership_violations} | {unassigned} | {uncovered} | {experiment_ms} | {cross_candidates} | {confirmed_crosses} | {fallback_crosses} | {llm1_truth_recall} | {llm1_false_crosses} | {anchored_questions} | {anchored_geometry} | {truth_matched} | {truth_recall} | {ocr_contradictions} |".format(
                 label=summary["label"],
                 expected=item["expected_error_count"],
                 components=item["cv_raw_component_count"],
@@ -1058,6 +2210,8 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
                 marks=item["normalized_mark_event_count"],
                 located=item["localized_mark_count"],
                 content=item["content_item_count"],
+                pipeline_truth_matched=item["pipeline_truth_matched_count"],
+                pipeline_truth_recall=item["pipeline_truth_recall"],
                 divergence=divergence,
                 primitives=item["stable_primitive_count"],
                 stable=item["stable_event_count"],
@@ -1074,6 +2228,18 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
                 unassigned=item["stable_unassigned_primitive_count"],
                 uncovered=item["stable_uncovered_component_count"],
                 experiment_ms=experiment_ms,
+                cross_candidates=item["cross_anchor_cv_candidate_count"],
+                confirmed_crosses=item["cross_anchor_confirmed_cross_count"],
+                fallback_crosses=item["cross_anchor_fallback_cross_count"],
+                llm1_truth_recall=item["cross_anchor_llm1_truth_recall"],
+                llm1_false_crosses=item[
+                    "cross_anchor_llm1_false_cross_count"
+                ],
+                anchored_questions=item["cross_anchor_matched_question_count"],
+                anchored_geometry=item["cross_anchor_geometry_violation_count"],
+                truth_matched=item["cross_anchor_truth_matched_count"],
+                truth_recall=item["cross_anchor_truth_recall"],
+                ocr_contradictions=item["cross_anchor_ocr_contradiction_count"],
             )
         )
     (output_dir / "comparison-report.md").write_text(
@@ -1091,11 +2257,32 @@ def main() -> int:
     parser.add_argument("--subject", default="chinese")
     parser.add_argument("--cv-only", action="store_true")
     parser.add_argument(
+        "--cv-cross-only",
+        action="store_true",
+        help="run deterministic local red-cross CV and truth comparison without LLM",
+    )
+    parser.add_argument(
+        "--cross-cv-config",
+        help="JSON configuration for --cv-cross-only or --compare-cross-anchor",
+    )
+    parser.add_argument(
+        "--truth-regions",
+        help="truth-regions.json used by CV and cross-anchor comparison",
+    )
+    parser.add_argument(
         "--compare-stable-events",
         action="store_true",
         help=(
             "also run independent full-page mark detection, stable event consolidation, "
             "and audit-only CV validation"
+        ),
+    )
+    parser.add_argument(
+        "--compare-cross-anchor",
+        action="store_true",
+        help=(
+            "also run CV candidate verification, LLM fallback cross detection, "
+            "cross-anchored question localization, and OCR audit"
         ),
     )
     parser.add_argument(
@@ -1109,6 +2296,22 @@ def main() -> int:
         help="maximum normalized circle/cross center distance used by diagnostic audit",
     )
     args = parser.parse_args()
+
+    if args.cv_cross_only:
+        if not args.cross_cv_config:
+            parser.error("--cv-cross-only requires --cross-cv-config")
+        if not args.truth_regions:
+            parser.error("--cv-cross-only requires --truth-regions")
+        if args.compare_stable_events:
+            parser.error("--cv-cross-only cannot be combined with --compare-stable-events")
+        if args.compare_cross_anchor:
+            parser.error("--cv-cross-only cannot be combined with --compare-cross-anchor")
+
+    if args.compare_cross_anchor:
+        if not args.cross_cv_config:
+            parser.error("--compare-cross-anchor requires --cross-cv-config")
+        if not args.truth_regions:
+            parser.error("--compare-cross-anchor requires --truth-regions")
 
     if args.compare_stable_events:
         if args.stable_primitive_duplicate_containment_threshold is None:
@@ -1133,6 +2336,17 @@ def main() -> int:
         expected = _parse_expected(args.expected)
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
+    cross_cv_config = None
+    truth_by_label = {}
+    if args.cv_cross_only or args.compare_cross_anchor:
+        try:
+            cross_cv_config, truth_by_label = load_cross_cv_inputs(
+                Path(args.cross_cv_config).expanduser().resolve(),
+                Path(args.truth_regions).expanduser().resolve(),
+                [label for label, _path in images],
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            parser.error(str(exc))
     output_dir = Path(args.output).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
     _write_json(
@@ -1140,8 +2354,10 @@ def main() -> int:
         {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "warning": "Contains worksheet images, prompts, and model responses; delete after analysis.",
-            "cv_only": args.cv_only,
+            "cv_only": args.cv_only or args.cv_cross_only,
+            "cv_cross_only": args.cv_cross_only,
             "compare_stable_events": args.compare_stable_events,
+            "compare_cross_anchor": args.compare_cross_anchor,
             "stable_primitive_duplicate_containment_threshold": (
                 args.stable_primitive_duplicate_containment_threshold
             ),
@@ -1158,8 +2374,11 @@ def main() -> int:
             output_dir=output_dir,
             expected_count=expected.get(label),
             subject_hint=args.subject,
-            cv_only=args.cv_only,
+            cv_only=args.cv_only or args.cv_cross_only,
+            cross_cv_config=cross_cv_config,
+            truth_regions=truth_by_label.get(label),
             compare_stable_events=args.compare_stable_events,
+            compare_cross_anchor=args.compare_cross_anchor,
             primitive_duplicate_containment_threshold=(
                 args.stable_primitive_duplicate_containment_threshold
             ),
@@ -1175,7 +2394,9 @@ def main() -> int:
     return (
         1
         if any(
-            summary["error"] or summary["stable_experiment_error"]
+            summary["error"]
+            or summary["stable_experiment_error"]
+            or summary["cross_anchor_experiment_error"]
             for summary in summaries
         )
         else 0
