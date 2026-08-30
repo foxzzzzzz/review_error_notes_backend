@@ -319,7 +319,10 @@ def test_load_cross_cv_inputs_requires_config_and_truth_for_every_label(tmp_path
                 "cross_anchor_question_max_area_ratio": 0.3,
                 "cross_anchor_question_max_gap_ratio": 0.04,
                 "cross_anchor_duplicate_question_iou_threshold": 0.2,
+                "cross_anchor_llm1_verification_runs": 3,
                 "cross_anchor_retain_uncertain_candidates": True,
+                "cross_anchor_retain_rejected_candidates": True,
+                "cross_anchor_retain_uncertain_fallback_candidates": True,
                 "cross_anchor_high_cv_min_arm_density": 0.25,
                 "cross_anchor_high_cv_min_center_density": 0.7,
                 "cross_anchor_cv_dedupe_iou_threshold": 0.5,
@@ -499,6 +502,95 @@ def test_candidate_verification_returns_one_verdict_per_cv_candidate():
         "confirmed",
         "uncertain",
         "rejected",
+    ]
+
+
+def test_candidate_verification_runs_are_aggregated_for_recall_with_stability_audit():
+    diagnostic = _load_script_module()
+    runs = [
+        diagnostic.CrossCandidateVerificationResult.model_validate(
+            {
+                "verdicts": [
+                    {"candidate_id": 0, "disposition": "rejected", "confidence": 0.7},
+                    {"candidate_id": 1, "disposition": "rejected", "confidence": 0.8},
+                    {"candidate_id": 2, "disposition": "rejected", "confidence": 0.9},
+                ]
+            }
+        ),
+        diagnostic.CrossCandidateVerificationResult.model_validate(
+            {
+                "verdicts": [
+                    {"candidate_id": 0, "disposition": "confirmed", "confidence": 0.85},
+                    {"candidate_id": 1, "disposition": "uncertain", "confidence": 0.55},
+                    {"candidate_id": 2, "disposition": "rejected", "confidence": 0.8},
+                ]
+            }
+        ),
+        diagnostic.CrossCandidateVerificationResult.model_validate(
+            {
+                "verdicts": [
+                    {"candidate_id": 0, "disposition": "rejected", "confidence": 0.75},
+                    {"candidate_id": 1, "disposition": "rejected", "confidence": 0.85},
+                    {"candidate_id": 2, "disposition": "rejected", "confidence": 0.88},
+                ]
+            }
+        ),
+    ]
+
+    aggregated, audit = diagnostic.aggregate_cross_candidate_verifications(runs)
+
+    assert [item.disposition for item in aggregated.verdicts] == [
+        "confirmed",
+        "uncertain",
+        "rejected",
+    ]
+    assert [item.confidence for item in aggregated.verdicts] == [0.85, 0.55, 0.9]
+    assert audit["run_count"] == 3
+    assert audit["unstable_candidate_ids"] == [0, 1]
+    assert audit["candidates"][0] == {
+        "candidate_id": 0,
+        "dispositions": ["rejected", "confirmed", "rejected"],
+        "aggregated_disposition": "confirmed",
+        "agreement_ratio": 0.666667,
+    }
+
+
+def test_cross_anchors_can_retain_unanimously_rejected_cv_candidates_for_recall():
+    diagnostic = _load_script_module()
+    verification = diagnostic.CrossCandidateVerificationResult.model_validate(
+        {
+            "verdicts": [
+                {"candidate_id": 0, "disposition": "rejected", "confidence": 0.9},
+            ]
+        }
+    )
+    candidates = [
+        {
+            "candidate_id": 0,
+            "bbox": [0.1, 0.1, 0.2, 0.2],
+            "min_arm_density": 0.12,
+            "center_density": 0.3,
+        }
+    ]
+
+    anchors = diagnostic.build_cross_anchors(
+        verification,
+        diagnostic.IndependentCrossScanResult(crosses=[]),
+        candidates,
+        {
+            "cross_anchor_retain_uncertain_candidates": True,
+            "cross_anchor_retain_rejected_candidates": True,
+            "cross_anchor_high_cv_min_arm_density": 0.25,
+            "cross_anchor_high_cv_min_center_density": 0.7,
+            "cross_anchor_cv_dedupe_iou_threshold": 0.5,
+            "cross_anchor_cv_dedupe_center_distance_ratio": 0.03,
+            "cross_anchor_fallback_merge_iou_threshold": 0.2,
+            "cross_anchor_fallback_merge_center_distance_ratio": 0.04,
+        },
+    )
+
+    assert [(item["source"], item["source_candidate_ids"]) for item in anchors] == [
+        ("cv_rejected_retained", [0])
     ]
 
 
@@ -751,6 +843,138 @@ def test_region_truth_comparison_reports_multiple_crosses_for_same_truth():
     assert comparison["unassigned_matched_cross_ids"] == [1]
 
 
+def test_question_event_clustering_groups_transitive_overlaps_without_rewriting_items():
+    diagnostic = _load_script_module()
+    result = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": True,
+                    "question_bbox": [0.1, 0.1, 0.4, 0.4],
+                    "unmatched_reason": None,
+                    "confidence": 0.95,
+                },
+                {
+                    "cross_id": 1,
+                    "matched": True,
+                    "question_bbox": [0.2, 0.1, 0.5, 0.4],
+                    "unmatched_reason": None,
+                    "confidence": 0.9,
+                },
+                {
+                    "cross_id": 2,
+                    "matched": True,
+                    "question_bbox": [0.3, 0.1, 0.6, 0.4],
+                    "unmatched_reason": None,
+                    "confidence": 0.85,
+                },
+                {
+                    "cross_id": 3,
+                    "matched": True,
+                    "question_bbox": [0.7, 0.7, 0.9, 0.9],
+                    "unmatched_reason": None,
+                    "confidence": 0.8,
+                },
+                {
+                    "cross_id": 4,
+                    "matched": False,
+                    "question_bbox": None,
+                    "unmatched_reason": "not a correction mark",
+                    "confidence": 0.7,
+                },
+            ]
+        }
+    )
+
+    audit = diagnostic.cluster_anchored_question_events(result, min_iou=0.2)
+
+    assert audit["event_count"] == 2
+    assert audit["unmatched_cross_ids"] == [4]
+    assert audit["events"][0] == {
+        "event_id": 0,
+        "cross_ids": [0, 1, 2],
+        "representative_cross_id": 0,
+        "question_bboxes": [
+            [0.1, 0.1, 0.4, 0.4],
+            [0.2, 0.1, 0.5, 0.4],
+            [0.3, 0.1, 0.6, 0.4],
+        ],
+        "confidence": 0.95,
+    }
+    assert [item.cross_id for item in result.items] == [0, 1, 2, 3, 4]
+
+
+def test_question_event_truth_comparison_uses_best_member_bbox():
+    diagnostic = _load_script_module()
+    event_audit = {
+        "events": [
+            {
+                "event_id": 0,
+                "cross_ids": [0, 1],
+                "representative_cross_id": 0,
+                "question_bboxes": [
+                    [0.0, 0.0, 0.2, 0.2],
+                    [0.1, 0.1, 0.4, 0.4],
+                ],
+                "confidence": 0.9,
+            },
+            {
+                "event_id": 1,
+                "cross_ids": [2],
+                "representative_cross_id": 2,
+                "question_bboxes": [[0.8, 0.8, 0.9, 0.9]],
+                "confidence": 0.8,
+            },
+        ]
+    }
+
+    comparison = diagnostic.compare_question_events_to_truth(
+        event_audit,
+        [
+            {"truth_id": "T1", "source_bbox_normalized": [0.1, 0.1, 0.4, 0.4]},
+            {"truth_id": "T2", "source_bbox_normalized": [0.5, 0.5, 0.7, 0.7]},
+        ],
+        min_iou=0.2,
+    )
+
+    assert comparison["matched_truth_ids"] == ["T1"]
+    assert comparison["missed_truth_ids"] == ["T2"]
+    assert comparison["truth_recall"] == 0.5
+    assert comparison["false_event_ids"] == [1]
+    assert comparison["assignments"] == [
+        {"event_id": 0, "truth_id": "T1", "best_iou": 1.0},
+        {"event_id": 1, "truth_id": None, "best_iou": 0.0},
+    ]
+
+
+def test_question_event_truth_comparison_counts_duplicate_truth_events_as_false():
+    diagnostic = _load_script_module()
+    event_audit = {
+        "events": [
+            {
+                "event_id": 0,
+                "question_bboxes": [[0.1, 0.1, 0.4, 0.4]],
+            },
+            {
+                "event_id": 1,
+                "question_bboxes": [[0.12, 0.12, 0.38, 0.38]],
+            },
+        ]
+    }
+
+    comparison = diagnostic.compare_question_events_to_truth(
+        event_audit,
+        [{"truth_id": "T1", "source_bbox_normalized": [0.1, 0.1, 0.4, 0.4]}],
+        min_iou=0.2,
+    )
+
+    assert comparison["matched_truth_count"] == 1
+    assert comparison["truth_recall"] == 1.0
+    assert comparison["duplicate_truth_event_ids"] == [1]
+    assert comparison["false_event_ids"] == [1]
+
+
 def test_anchored_question_geometry_requires_bbox_to_contain_cross_center():
     diagnostic = _load_script_module()
     anchors = [
@@ -964,11 +1188,25 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
     class FakeClient:
         def verify_cross_candidates(self, image_path, received_candidates):
             calls.append(("verify", Path(image_path).name, len(received_candidates)))
+            verify_run = sum(call[0] == "verify" for call in calls)
+            dispositions = {
+                1: ("confirmed", "rejected"),
+                2: ("rejected", "uncertain"),
+                3: ("rejected", "rejected"),
+            }[verify_run]
             return diagnostic.CrossCandidateVerificationResult.model_validate(
                 {
                     "verdicts": [
-                        {"candidate_id": 0, "disposition": "confirmed", "confidence": 0.95},
-                        {"candidate_id": 1, "disposition": "rejected", "confidence": 0.9},
+                        {
+                            "candidate_id": 0,
+                            "disposition": dispositions[0],
+                            "confidence": 0.95,
+                        },
+                        {
+                            "candidate_id": 1,
+                            "disposition": dispositions[1],
+                            "confidence": 0.9,
+                        },
                     ],
                 }
             )
@@ -1032,7 +1270,10 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
             "cross_anchor_question_max_gap_ratio": 0.03,
             "cross_anchor_duplicate_question_iou_threshold": 0.2,
             "question_truth_min_iou": 0.2,
+            "cross_anchor_llm1_verification_runs": 3,
             "cross_anchor_retain_uncertain_candidates": True,
+            "cross_anchor_retain_rejected_candidates": True,
+            "cross_anchor_retain_uncertain_fallback_candidates": True,
             "cross_anchor_high_cv_min_arm_density": 0.25,
             "cross_anchor_high_cv_min_center_density": 0.7,
             "cross_anchor_cv_dedupe_iou_threshold": 0.5,
@@ -1050,45 +1291,35 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
 
     assert [call[0] for call in calls] == [
         "verify",
+        "verify",
+        "verify",
         "scan",
         "verify_fallback",
         "localize",
         "localize",
+        "localize",
     ]
     assert calls[0][1] == "candidate-montage.jpg"
-    assert calls[2][1] == "fallback-candidate-montage.jpg"
-    assert [call[2] for call in calls if call[0] == "localize"] == [1, 1]
-    assert summary == {
-        "cv_candidate_count": 2,
-        "llm1_confirmed_cross_count": 2,
-        "llm1_cv_confirmed_cross_count": 1,
-        "llm1_cv_uncertain_retained_count": 0,
-        "llm1_cv_high_score_retained_count": 0,
-        "llm1_fallback_cross_count": 1,
-        "llm1_fallback_verified_count": 1,
-        "llm1_independent_scan_count": 1,
-        "llm1_independent_supported_count": 1,
-        "llm1_rejected_candidate_count": 1,
-        "llm1_uncertain_candidate_count": 0,
-        "llm1_candidate_audit_valid": True,
-        "llm1_local_geometry_merge_count": 0,
-        "llm1_truth_matched_count": 2,
-        "llm1_truth_recall": 1.0,
-        "llm1_false_cross_count": 0,
-        "llm1_duplicate_truth_candidate_count": 0,
-        "llm2_matched_question_count": 2,
-        "llm2_unmatched_cross_count": 0,
-        "llm2_assignment_audit_valid": True,
-        "geometry_violation_count": 0,
-        "duplicate_question_candidate_count": 0,
-        "truth_matched_count": 2,
-        "truth_count": 2,
-        "truth_recall": 1.0,
-        "duplicate_truth_candidate_count": 0,
-        "content_ocr_status": "not_run",
-    }
+    assert calls[4][1] == "fallback-candidate-montage.jpg"
+    assert [call[2] for call in calls if call[0] == "localize"] == [1, 1, 1]
+    assert summary["llm1_verification_run_count"] == 3
+    assert summary["llm1_unstable_candidate_count"] == 2
+    assert summary["llm1_confirmed_cross_count"] == 3
+    assert summary["llm1_cv_confirmed_cross_count"] == 1
+    assert summary["llm1_cv_uncertain_retained_count"] == 1
+    assert summary["llm1_cv_rejected_retained_count"] == 0
+    assert summary["stable_question_event_count"] == 2
+    assert summary["stable_truth_recall"] == 1.0
+    assert summary["llm_request_count"] == 8
+    assert summary["timings_ms"]["total"] >= 0
+    assert summary["timings_ms"]["llm1_candidate_verification"] >= 0
+    assert summary["timings_ms"]["llm2_localization"] >= 0
     experiment_dir = case_dir / "cross-anchor-experiment"
     assert (experiment_dir / "llm1-candidate-verification.json").is_file()
+    assert (experiment_dir / "llm1-candidate-verification-run-001.json").is_file()
+    assert (experiment_dir / "llm1-candidate-verification-run-002.json").is_file()
+    assert (experiment_dir / "llm1-candidate-verification-run-003.json").is_file()
+    assert (experiment_dir / "llm1-candidate-stability-audit.json").is_file()
     assert (experiment_dir / "candidate-montage.jpg").is_file()
     assert (experiment_dir / "llm1-independent-scan.json").is_file()
     assert (experiment_dir / "fallback-candidate-montage.jpg").is_file()
@@ -1106,6 +1337,9 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
     assert (experiment_dir / "question-geometry-audit.json").is_file()
     assert (experiment_dir / "duplicate-question-audit.json").is_file()
     assert (experiment_dir / "truth-comparison.json").is_file()
+    assert (experiment_dir / "stable-question-events.json").is_file()
+    assert (experiment_dir / "stable-question-events-truth-comparison.json").is_file()
+    assert (experiment_dir / "timings.json").is_file()
     assert not (experiment_dir / "ocr-audit.json").exists()
     assert (experiment_dir / "summary.json").is_file()
 
@@ -1937,6 +2171,48 @@ def test_report_includes_cross_anchor_comparison_columns(tmp_path):
     assert "真值重复归属" in report
     assert "新方案真值召回" in report
     assert "内容/OCR状态" in report
+    assert "召回优先新方案判定" in report
+    assert "保留LLM1拒绝CV" in report
+    assert "稳定错题事件" in report
+    assert "稳定真值召回" in report
+    assert "新方案LLM请求" in report
+
+
+def test_timing_report_compares_old_and_new_flows_with_stage_costs(tmp_path):
+    diagnostic = _load_script_module()
+    summary = diagnostic.build_summary(
+        label="page35",
+        expected_count=5,
+        cv={"raw_component_count": 18, "evidence_group_count": 8},
+        pipeline=None,
+        cross_anchor_experiment={
+            "llm1_verification_run_count": 3,
+            "llm_request_count": 8,
+            "timings_ms": {
+                "llm1_candidate_verification": 1200.0,
+                "independent_cross_scan": 300.0,
+                "fallback_montage_and_verification": 400.0,
+                "llm2_localization": 900.0,
+                "post_llm2_audit": 10.0,
+            },
+        },
+    )
+    summary["timings_ms"] = {
+        "total": 5000.0,
+        "red_evidence_cv": 20.0,
+        "cross_candidate_cv": 30.0,
+        "production_pipeline": 1000.0,
+        "stable_event_experiment": 1100.0,
+        "cross_anchor_experiment": 2800.0,
+    }
+
+    diagnostic._write_timing_report(tmp_path, [summary])
+
+    report = (tmp_path / "timing-report.md").read_text("utf-8")
+    assert "旧生产流程" in report
+    assert "旧stable实验" in report
+    assert "新方案总耗时" in report
+    assert "| page35 | 5000.0 | 20.0 | 30.0 | 1000.0 | 1100.0 | 2800.0 | 3 | 8 |" in report
 
 
 def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
@@ -1966,7 +2242,10 @@ def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
                     "cross_anchor_question_max_area_ratio": 0.3,
                     "cross_anchor_question_max_gap_ratio": 0.04,
                     "cross_anchor_duplicate_question_iou_threshold": 0.2,
+                    "cross_anchor_llm1_verification_runs": 3,
                     "cross_anchor_retain_uncertain_candidates": True,
+                    "cross_anchor_retain_rejected_candidates": True,
+                    "cross_anchor_retain_uncertain_fallback_candidates": True,
                     "cross_anchor_high_cv_min_arm_density": 0.25,
                     "cross_anchor_high_cv_min_center_density": 0.7,
                     "cross_anchor_cv_dedupe_iou_threshold": 0.5,
