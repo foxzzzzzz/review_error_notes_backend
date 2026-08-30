@@ -319,7 +319,9 @@ def test_load_cross_cv_inputs_requires_config_and_truth_for_every_label(tmp_path
                 "cross_anchor_question_max_area_ratio": 0.3,
                 "cross_anchor_question_max_gap_ratio": 0.04,
                 "cross_anchor_duplicate_question_iou_threshold": 0.2,
-                "cross_anchor_llm1_verification_runs": 3,
+                "cross_anchor_llm1_verification_runs": 1,
+                "cross_anchor_llm2_localization_runs": 2,
+                "cross_anchor_fallback_generates_anchors": False,
                 "cross_anchor_retain_uncertain_candidates": True,
                 "cross_anchor_retain_rejected_candidates": True,
                 "cross_anchor_retain_uncertain_fallback_candidates": True,
@@ -365,6 +367,7 @@ def test_load_cross_cv_inputs_requires_config_and_truth_for_every_label(tmp_path
     )
 
     assert config["analysis_max_edge"] == 1600
+    assert config["cross_anchor_llm2_localization_runs"] == 2
     assert truth["page33"][0]["truth_id"] == "T1"
     with pytest.raises(ValueError, match="missing truth page: page34"):
         diagnostic.load_cross_cv_inputs(
@@ -372,6 +375,13 @@ def test_load_cross_cv_inputs_requires_config_and_truth_for_every_label(tmp_path
             truth_path,
             ["page33", "page34"],
         )
+    config["cross_anchor_llm2_localization_runs"] = 0
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match="cross_anchor_llm2_localization_runs must be positive",
+    ):
+        diagnostic.load_cross_cv_inputs(config_path, truth_path, ["page33"])
 
 
 def test_load_cross_cv_inputs_requires_cross_anchor_evaluation_thresholds(tmp_path):
@@ -941,10 +951,21 @@ def test_question_event_truth_comparison_uses_best_member_bbox():
     assert comparison["matched_truth_ids"] == ["T1"]
     assert comparison["missed_truth_ids"] == ["T2"]
     assert comparison["truth_recall"] == 0.5
+    assert comparison["minimum_matched_truth_coverage"] == 1.0
     assert comparison["false_event_ids"] == [1]
     assert comparison["assignments"] == [
-        {"event_id": 0, "truth_id": "T1", "best_iou": 1.0},
-        {"event_id": 1, "truth_id": None, "best_iou": 0.0},
+        {
+            "event_id": 0,
+            "truth_id": "T1",
+            "best_iou": 1.0,
+            "truth_coverage": 1.0,
+        },
+        {
+            "event_id": 1,
+            "truth_id": None,
+            "best_iou": 0.0,
+            "truth_coverage": 0.0,
+        },
     ]
 
 
@@ -973,6 +994,86 @@ def test_question_event_truth_comparison_counts_duplicate_truth_events_as_false(
     assert comparison["truth_recall"] == 1.0
     assert comparison["duplicate_truth_event_ids"] == [1]
     assert comparison["false_event_ids"] == [1]
+
+
+def test_question_event_clustering_unions_two_llm2_runs_without_losing_disagreement():
+    diagnostic = _load_script_module()
+    runs = [
+        diagnostic.CrossAnchoredQuestionResult.model_validate(
+            {
+                "items": [
+                    {
+                        "cross_id": 0,
+                        "matched": True,
+                        "question_bbox": [0.1, 0.1, 0.3, 0.3],
+                        "unmatched_reason": None,
+                        "confidence": 0.9,
+                    },
+                    {
+                        "cross_id": 1,
+                        "matched": True,
+                        "question_bbox": [0.7, 0.1, 0.9, 0.3],
+                        "unmatched_reason": None,
+                        "confidence": 0.8,
+                    },
+                ]
+            }
+        ),
+        diagnostic.CrossAnchoredQuestionResult.model_validate(
+            {
+                "items": [
+                    {
+                        "cross_id": 0,
+                        "matched": True,
+                        "question_bbox": [0.11, 0.11, 0.31, 0.31],
+                        "unmatched_reason": None,
+                        "confidence": 0.95,
+                    },
+                    {
+                        "cross_id": 1,
+                        "matched": True,
+                        "question_bbox": [0.4, 0.4, 0.6, 0.6],
+                        "unmatched_reason": None,
+                        "confidence": 0.9,
+                    },
+                ]
+            }
+        ),
+    ]
+
+    events = diagnostic.cluster_anchored_question_runs(runs, min_iou=0.2)
+    first_events = diagnostic.cluster_anchored_question_events(runs[0], min_iou=0.2)
+    truths = [
+        {"truth_id": "T1", "source_bbox_normalized": [0.1, 0.1, 0.3, 0.3]},
+        {"truth_id": "T2", "source_bbox_normalized": [0.4, 0.4, 0.6, 0.6]},
+    ]
+    first_truth = diagnostic.compare_question_events_to_truth(
+        first_events, truths, min_iou=0.2
+    )
+    union_truth = diagnostic.compare_question_events_to_truth(
+        events, truths, min_iou=0.2
+    )
+    benefit = diagnostic.compare_llm2_pass_benefit(first_truth, union_truth)
+
+    assert events["run_count"] == 2
+    assert events["observation_count"] == 4
+    assert events["event_count"] == 3
+    assert events["events"][0]["observation_ids"] == ["run-001-cross-0", "run-002-cross-0"]
+    assert events["events"][1]["observation_ids"] == ["run-001-cross-1"]
+    assert events["events"][2]["observation_ids"] == ["run-002-cross-1"]
+    assert benefit == {
+        "first_pass_matched_truth_count": 1,
+        "union_matched_truth_count": 2,
+        "recovered_truth_ids": ["T2"],
+        "recovered_truth_count": 1,
+        "remaining_missed_truth_ids": [],
+        "first_pass_false_event_count": 1,
+        "union_false_event_count": 1,
+        "additional_false_event_count": 0,
+        "first_pass_minimum_matched_truth_coverage": 1.0,
+        "union_minimum_matched_truth_coverage": 1.0,
+        "truth_recall_delta": 0.5,
+    }
 
 
 def test_anchored_question_geometry_requires_bbox_to_contain_cross_center():
@@ -1188,23 +1289,17 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
     class FakeClient:
         def verify_cross_candidates(self, image_path, received_candidates):
             calls.append(("verify", Path(image_path).name, len(received_candidates)))
-            verify_run = sum(call[0] == "verify" for call in calls)
-            dispositions = {
-                1: ("confirmed", "rejected"),
-                2: ("rejected", "uncertain"),
-                3: ("rejected", "rejected"),
-            }[verify_run]
             return diagnostic.CrossCandidateVerificationResult.model_validate(
                 {
                     "verdicts": [
                         {
                             "candidate_id": 0,
-                            "disposition": dispositions[0],
+                            "disposition": "confirmed",
                             "confidence": 0.95,
                         },
                         {
                             "candidate_id": 1,
-                            "disposition": dispositions[1],
+                            "disposition": "rejected",
                             "confidence": 0.9,
                         },
                     ],
@@ -1236,11 +1331,14 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
         def locate_cross_anchored_questions(self, image_path, anchors, subject_hint):
             calls.append(("localize", Path(image_path).name, len(anchors), subject_hint))
             anchor = anchors[0]
-            question_bbox = (
-                [0.05, 0.05, 0.3, 0.3]
-                if anchor["cross_id"] == 0
-                else [0.5, 0.5, 0.75, 0.75]
-            )
+            localize_call = sum(call[0] == "localize" for call in calls)
+            run_index = (localize_call - 1) // 2 + 1
+            if anchor["cross_id"] == 0:
+                question_bbox = [0.05, 0.05, 0.3, 0.3]
+            elif run_index == 1:
+                question_bbox = [0.75, 0.75, 0.95, 0.95]
+            else:
+                question_bbox = [0.5, 0.5, 0.75, 0.75]
             return diagnostic.CrossAnchoredQuestionResult.model_validate(
                 {
                     "items": [
@@ -1270,7 +1368,9 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
             "cross_anchor_question_max_gap_ratio": 0.03,
             "cross_anchor_duplicate_question_iou_threshold": 0.2,
             "question_truth_min_iou": 0.2,
-            "cross_anchor_llm1_verification_runs": 3,
+            "cross_anchor_llm1_verification_runs": 1,
+            "cross_anchor_llm2_localization_runs": 2,
+            "cross_anchor_fallback_generates_anchors": False,
             "cross_anchor_retain_uncertain_candidates": True,
             "cross_anchor_retain_rejected_candidates": True,
             "cross_anchor_retain_uncertain_fallback_candidates": True,
@@ -1291,34 +1391,44 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
 
     assert [call[0] for call in calls] == [
         "verify",
-        "verify",
-        "verify",
         "scan",
         "verify_fallback",
         "localize",
         "localize",
         "localize",
+        "localize",
     ]
     assert calls[0][1] == "candidate-montage.jpg"
-    assert calls[4][1] == "fallback-candidate-montage.jpg"
-    assert [call[2] for call in calls if call[0] == "localize"] == [1, 1, 1]
-    assert summary["llm1_verification_run_count"] == 3
-    assert summary["llm1_unstable_candidate_count"] == 2
-    assert summary["llm1_confirmed_cross_count"] == 3
+    assert calls[2][1] == "fallback-candidate-montage.jpg"
+    assert [call[2] for call in calls if call[0] == "localize"] == [1, 1, 1, 1]
+    assert summary["llm1_verification_run_count"] == 1
+    assert summary["llm1_unstable_candidate_count"] == 0
+    assert summary["llm1_confirmed_cross_count"] == 2
     assert summary["llm1_cv_confirmed_cross_count"] == 1
-    assert summary["llm1_cv_uncertain_retained_count"] == 1
-    assert summary["llm1_cv_rejected_retained_count"] == 0
-    assert summary["stable_question_event_count"] == 2
+    assert summary["llm1_cv_uncertain_retained_count"] == 0
+    assert summary["llm1_cv_rejected_retained_count"] == 1
+    assert summary["llm1_fallback_cross_count"] == 0
+    assert summary["llm1_fallback_verified_count"] == 1
+    assert summary["llm2_localization_run_count"] == 2
+    assert summary["first_pass_stable_question_event_count"] == 2
+    assert summary["first_pass_stable_truth_recall"] == 0.5
+    assert summary["stable_question_event_count"] == 3
     assert summary["stable_truth_recall"] == 1.0
-    assert summary["llm_request_count"] == 8
+    assert summary["llm2_second_pass_recovered_truth_count"] == 1
+    assert summary["llm2_second_pass_recovered_truth_ids"] == ["T2"]
+    assert summary["llm2_second_pass_additional_false_event_count"] == 0
+    assert summary["first_pass_minimum_matched_truth_coverage"] == 1.0
+    assert summary["stable_minimum_matched_truth_coverage"] == 1.0
+    assert summary["llm_request_count"] == 7
     assert summary["timings_ms"]["total"] >= 0
     assert summary["timings_ms"]["llm1_candidate_verification"] >= 0
     assert summary["timings_ms"]["llm2_localization"] >= 0
+    assert summary["timings_ms"]["llm2_localization_run_001"] >= 0
+    assert summary["timings_ms"]["llm2_localization_run_002"] >= 0
     experiment_dir = case_dir / "cross-anchor-experiment"
     assert (experiment_dir / "llm1-candidate-verification.json").is_file()
     assert (experiment_dir / "llm1-candidate-verification-run-001.json").is_file()
-    assert (experiment_dir / "llm1-candidate-verification-run-002.json").is_file()
-    assert (experiment_dir / "llm1-candidate-verification-run-003.json").is_file()
+    assert not (experiment_dir / "llm1-candidate-verification-run-002.json").exists()
     assert (experiment_dir / "llm1-candidate-stability-audit.json").is_file()
     assert (experiment_dir / "candidate-montage.jpg").is_file()
     assert (experiment_dir / "llm1-independent-scan.json").is_file()
@@ -1328,16 +1438,30 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
     assert (experiment_dir / "llm1-anchor-merge-audit.json").is_file()
     assert (experiment_dir / "confirmed-crosses.json").is_file()
     assert (experiment_dir / "confirmed-crosses-overlay.jpg").is_file()
-    assert (experiment_dir / "llm2-batch-001-overlay.jpg").is_file()
-    assert (experiment_dir / "llm2-batch-002-overlay.jpg").is_file()
+    assert (experiment_dir / "llm2-run-001-batch-001-overlay.jpg").is_file()
+    assert (experiment_dir / "llm2-run-001-batch-002-overlay.jpg").is_file()
+    assert (experiment_dir / "llm2-run-002-batch-001-overlay.jpg").is_file()
+    assert (experiment_dir / "llm2-run-002-batch-002-overlay.jpg").is_file()
     assert (experiment_dir / "llm1-truth-comparison.json").is_file()
     assert (experiment_dir / "llm1-truth-multiplicity-audit.json").is_file()
     assert (experiment_dir / "llm2-anchored-questions.json").is_file()
+    assert (experiment_dir / "llm2-anchored-questions-run-001.json").is_file()
+    assert (experiment_dir / "llm2-anchored-questions-run-002.json").is_file()
+    assert (experiment_dir / "llm2-pass-benefit.json").is_file()
+    benefit = json.loads(
+        (experiment_dir / "llm2-pass-benefit.json").read_text("utf-8")
+    )
+    assert benefit["second_pass_elapsed_ms"] >= 0
+    assert benefit["total_llm2_elapsed_ms"] >= benefit["second_pass_elapsed_ms"]
     assert (experiment_dir / "llm2-cross-assignment-audit.json").is_file()
     assert (experiment_dir / "question-geometry-audit.json").is_file()
     assert (experiment_dir / "duplicate-question-audit.json").is_file()
     assert (experiment_dir / "truth-comparison.json").is_file()
     assert (experiment_dir / "stable-question-events.json").is_file()
+    assert (experiment_dir / "stable-question-events-first-pass.json").is_file()
+    assert (
+        experiment_dir / "stable-question-events-first-pass-truth-comparison.json"
+    ).is_file()
     assert (experiment_dir / "stable-question-events-truth-comparison.json").is_file()
     assert (experiment_dir / "timings.json").is_file()
     assert not (experiment_dir / "ocr-audit.json").exists()
@@ -2076,6 +2200,7 @@ def test_comparison_summary_keeps_cross_anchor_stage_counts_separate():
             "llm1_truth_recall": 1.0,
             "llm1_false_cross_count": 1,
             "llm1_duplicate_truth_candidate_count": 2,
+            "llm2_localization_run_count": 2,
             "llm2_matched_question_count": 6,
             "llm2_unmatched_cross_count": 1,
             "llm2_assignment_audit_valid": True,
@@ -2085,6 +2210,18 @@ def test_comparison_summary_keeps_cross_anchor_stage_counts_separate():
             "truth_matched_count": 6,
             "truth_count": 6,
             "truth_recall": 1.0,
+            "first_pass_stable_question_event_count": 6,
+            "first_pass_stable_truth_matched_count": 5,
+            "first_pass_stable_truth_recall": 0.833333,
+            "first_pass_stable_false_event_count": 1,
+            "stable_question_event_count": 7,
+            "stable_truth_matched_count": 6,
+            "stable_truth_recall": 1.0,
+            "stable_false_event_count": 1,
+            "llm2_second_pass_recovered_truth_count": 1,
+            "llm2_second_pass_recovered_truth_ids": ["T4"],
+            "llm2_second_pass_additional_false_event_count": 0,
+            "llm_request_count": 12,
             "content_ocr_status": "not_run",
         },
     )
@@ -2106,6 +2243,12 @@ def test_comparison_summary_keeps_cross_anchor_stage_counts_separate():
     assert checkpoints["cross_anchor_llm1_false_cross_count"] == 1
     assert checkpoints["cross_anchor_llm1_duplicate_truth_candidate_count"] == 2
     assert checkpoints["cross_anchor_matched_question_count"] == 6
+    assert checkpoints["cross_anchor_llm2_localization_run_count"] == 2
+    assert checkpoints["cross_anchor_first_pass_stable_truth_recall"] == 0.833333
+    assert checkpoints["cross_anchor_stable_truth_recall"] == 1.0
+    assert checkpoints["cross_anchor_second_pass_recovered_truth_count"] == 1
+    assert checkpoints["cross_anchor_second_pass_recovered_truth_ids"] == ["T4"]
+    assert checkpoints["cross_anchor_second_pass_additional_false_event_count"] == 0
     assert checkpoints["cross_anchor_geometry_violation_count"] == 1
     assert checkpoints["cross_anchor_duplicate_question_candidate_count"] == 2
     assert checkpoints["cross_anchor_duplicate_truth_candidate_count"] == 1
@@ -2176,6 +2319,10 @@ def test_report_includes_cross_anchor_comparison_columns(tmp_path):
     assert "稳定错题事件" in report
     assert "稳定真值召回" in report
     assert "新方案LLM请求" in report
+    assert "第二次新增找回" in report
+    assert "第二次新增误报" in report
+    assert "合并最小真值覆盖" in report
+    assert "fallback生成锚点" in report
 
 
 def test_timing_report_compares_old_and_new_flows_with_stage_costs(tmp_path):
@@ -2193,6 +2340,7 @@ def test_timing_report_compares_old_and_new_flows_with_stage_costs(tmp_path):
                 "independent_cross_scan": 300.0,
                 "fallback_montage_and_verification": 400.0,
                 "llm2_localization": 900.0,
+                "llm2_localization_run_002": 450.0,
                 "post_llm2_audit": 10.0,
             },
         },
@@ -2212,6 +2360,7 @@ def test_timing_report_compares_old_and_new_flows_with_stage_costs(tmp_path):
     assert "旧生产流程" in report
     assert "旧stable实验" in report
     assert "新方案总耗时" in report
+    assert "LLM2第二次" in report
     assert "| page35 | 5000.0 | 20.0 | 30.0 | 1000.0 | 1100.0 | 2800.0 | 3 | 8 |" in report
 
 
@@ -2242,7 +2391,9 @@ def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
                     "cross_anchor_question_max_area_ratio": 0.3,
                     "cross_anchor_question_max_gap_ratio": 0.04,
                     "cross_anchor_duplicate_question_iou_threshold": 0.2,
-                    "cross_anchor_llm1_verification_runs": 3,
+                    "cross_anchor_llm1_verification_runs": 1,
+                    "cross_anchor_llm2_localization_runs": 2,
+                    "cross_anchor_fallback_generates_anchors": False,
                     "cross_anchor_retain_uncertain_candidates": True,
                     "cross_anchor_retain_rejected_candidates": True,
                     "cross_anchor_retain_uncertain_fallback_candidates": True,

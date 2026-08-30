@@ -1298,6 +1298,120 @@ def cluster_anchored_question_events(
     }
 
 
+def cluster_anchored_question_runs(
+    runs: list[CrossAnchoredQuestionResult],
+    *,
+    min_iou: float,
+) -> dict:
+    observations = [
+        {
+            "observation_id": f"run-{run_index:03d}-cross-{item.cross_id}",
+            "run_index": run_index,
+            "cross_id": item.cross_id,
+            "question_bbox": item.question_bbox,
+            "confidence": item.confidence,
+        }
+        for run_index, result in enumerate(runs, 1)
+        for item in result.items
+        if item.matched and item.question_bbox is not None
+    ]
+    remaining = {
+        observation["observation_id"]: observation
+        for observation in observations
+    }
+    clusters = []
+    while remaining:
+        first_id = next(iter(remaining))
+        cluster = [remaining.pop(first_id)]
+        index = 0
+        while index < len(cluster):
+            current = cluster[index]
+            connected_ids = [
+                observation_id
+                for observation_id, candidate in remaining.items()
+                if _bbox_iou(
+                    current["question_bbox"],
+                    candidate["question_bbox"],
+                )
+                >= min_iou
+            ]
+            for observation_id in connected_ids:
+                cluster.append(remaining.pop(observation_id))
+            index += 1
+        clusters.append(cluster)
+
+    events = []
+    for event_id, cluster in enumerate(clusters):
+        representative = min(
+            cluster,
+            key=lambda observation: (
+                -observation["confidence"],
+                observation["observation_id"],
+            ),
+        )
+        events.append(
+            {
+                "event_id": event_id,
+                "observation_ids": sorted(
+                    observation["observation_id"] for observation in cluster
+                ),
+                "cross_ids": sorted(
+                    {observation["cross_id"] for observation in cluster}
+                ),
+                "representative_observation_id": representative[
+                    "observation_id"
+                ],
+                "question_bboxes": [
+                    observation["question_bbox"] for observation in cluster
+                ],
+                "confidence": representative["confidence"],
+            }
+        )
+    return {
+        "run_count": len(runs),
+        "min_iou": min_iou,
+        "observation_count": len(observations),
+        "event_count": len(events),
+        "unmatched_observation_ids": sorted(
+            f"run-{run_index:03d}-cross-{item.cross_id}"
+            for run_index, result in enumerate(runs, 1)
+            for item in result.items
+            if not item.matched
+        ),
+        "events": events,
+        "policy": "All LLM2 runs are unioned, then IoU-clustered without discarding disagreements.",
+    }
+
+
+def compare_llm2_pass_benefit(first_pass: dict, union: dict) -> dict:
+    recovered_truth_ids = sorted(
+        set(union["matched_truth_ids"]) - set(first_pass["matched_truth_ids"])
+    )
+    return {
+        "first_pass_matched_truth_count": first_pass["matched_truth_count"],
+        "union_matched_truth_count": union["matched_truth_count"],
+        "recovered_truth_ids": recovered_truth_ids,
+        "recovered_truth_count": len(recovered_truth_ids),
+        "remaining_missed_truth_ids": union["missed_truth_ids"],
+        "first_pass_false_event_count": len(first_pass["false_event_ids"]),
+        "union_false_event_count": len(union["false_event_ids"]),
+        "additional_false_event_count": (
+            len(union["false_event_ids"])
+            - len(first_pass["false_event_ids"])
+        ),
+        "first_pass_minimum_matched_truth_coverage": first_pass[
+            "minimum_matched_truth_coverage"
+        ],
+        "union_minimum_matched_truth_coverage": union[
+            "minimum_matched_truth_coverage"
+        ],
+        "truth_recall_delta": round(
+            union["truth_recall"] - first_pass["truth_recall"],
+            6,
+        ),
+    }
+
+
 def compare_question_events_to_truth(
     event_audit: dict,
     truth_regions: list[dict],
@@ -1310,18 +1424,21 @@ def compare_question_events_to_truth(
     for event in event_audit["events"]:
         scored_truths = [
             (
-                max(
-                    _bbox_iou(bbox, truth["source_bbox_normalized"])
+                *max(
+                    (
+                        _bbox_iou(bbox, truth["source_bbox_normalized"]),
+                        bbox,
+                    )
                     for bbox in event["question_bboxes"]
                 ),
                 truth,
             )
             for truth in truth_regions
         ]
-        best_iou, best_truth = max(
+        best_iou, best_bbox, best_truth = max(
             scored_truths,
-            key=lambda pair: (pair[0], pair[1]["truth_id"]),
-            default=(0.0, None),
+            key=lambda entry: (entry[0], entry[2]["truth_id"]),
+            default=(0.0, None, None),
         )
         truth_id = (
             best_truth["truth_id"]
@@ -1332,11 +1449,20 @@ def compare_question_events_to_truth(
             false_event_ids.append(event["event_id"])
         else:
             matched_truth_ids.add(truth_id)
+        truth_coverage = 0.0
+        if best_truth is not None and best_bbox is not None:
+            truth_area = _bbox_area(best_truth["source_bbox_normalized"])
+            if truth_area:
+                truth_coverage = _bbox_intersection_area(
+                    best_bbox,
+                    best_truth["source_bbox_normalized"],
+                ) / truth_area
         assignments.append(
             {
                 "event_id": event["event_id"],
                 "truth_id": truth_id,
                 "best_iou": round(best_iou, 6),
+                "truth_coverage": round(truth_coverage, 6),
             }
         )
     duplicate_truth_event_ids = []
@@ -1362,6 +1488,12 @@ def compare_question_events_to_truth(
     matched = [truth_id for truth_id in ordered_truth_ids if truth_id in matched_truth_ids]
     missed = [truth_id for truth_id in ordered_truth_ids if truth_id not in matched_truth_ids]
     truth_count = len(truth_regions)
+    matched_coverages = [
+        assignment["truth_coverage"]
+        for assignment in assignments
+        if assignment["truth_id"] is not None
+        and assignment["event_id"] not in duplicate_truth_event_ids
+    ]
     return {
         "truth_count": truth_count,
         "event_count": len(event_audit["events"]),
@@ -1372,6 +1504,9 @@ def compare_question_events_to_truth(
         "missed_truth_ids": missed,
         "false_event_ids": false_event_ids,
         "duplicate_truth_event_ids": sorted(duplicate_truth_event_ids),
+        "minimum_matched_truth_coverage": (
+            min(matched_coverages) if matched_coverages else None
+        ),
         "assignments": assignments,
     }
 
@@ -2145,6 +2280,9 @@ def build_summary(
         "cross_anchor_fallback_uncertain_retained_count": (
             cross_anchor_experiment or {}
         ).get("llm1_fallback_uncertain_retained_count"),
+        "cross_anchor_fallback_generates_anchors": (
+            cross_anchor_experiment or {}
+        ).get("llm1_fallback_generates_anchors"),
         "cross_anchor_llm1_verification_run_count": (
             cross_anchor_experiment or {}
         ).get("llm1_verification_run_count"),
@@ -2178,6 +2316,9 @@ def build_summary(
         "cross_anchor_matched_question_count": (cross_anchor_experiment or {}).get(
             "llm2_matched_question_count"
         ),
+        "cross_anchor_llm2_localization_run_count": (
+            cross_anchor_experiment or {}
+        ).get("llm2_localization_run_count"),
         "cross_anchor_geometry_violation_count": (
             cross_anchor_experiment or {}
         ).get("geometry_violation_count"),
@@ -2199,6 +2340,9 @@ def build_summary(
         "cross_anchor_stable_question_event_count": (
             cross_anchor_experiment or {}
         ).get("stable_question_event_count"),
+        "cross_anchor_first_pass_stable_truth_recall": (
+            cross_anchor_experiment or {}
+        ).get("first_pass_stable_truth_recall"),
         "cross_anchor_stable_truth_matched_count": (
             cross_anchor_experiment or {}
         ).get("stable_truth_matched_count"),
@@ -2208,6 +2352,21 @@ def build_summary(
         "cross_anchor_stable_false_event_count": (
             cross_anchor_experiment or {}
         ).get("stable_false_event_count"),
+        "cross_anchor_second_pass_recovered_truth_count": (
+            cross_anchor_experiment or {}
+        ).get("llm2_second_pass_recovered_truth_count"),
+        "cross_anchor_second_pass_recovered_truth_ids": (
+            cross_anchor_experiment or {}
+        ).get("llm2_second_pass_recovered_truth_ids"),
+        "cross_anchor_second_pass_additional_false_event_count": (
+            cross_anchor_experiment or {}
+        ).get("llm2_second_pass_additional_false_event_count"),
+        "cross_anchor_first_pass_minimum_truth_coverage": (
+            cross_anchor_experiment or {}
+        ).get("first_pass_minimum_matched_truth_coverage"),
+        "cross_anchor_stable_minimum_truth_coverage": (
+            cross_anchor_experiment or {}
+        ).get("stable_minimum_matched_truth_coverage"),
         "cross_anchor_llm_request_count": (cross_anchor_experiment or {}).get(
             "llm_request_count"
         ),
@@ -2642,11 +2801,15 @@ def run_cross_anchor_experiment(
     }
     retained_fallback_ids = confirmed_fallback_ids | uncertain_fallback_ids
     phase_started = time.perf_counter()
+    fallback_generates_anchors = bool(
+        config.get("cross_anchor_fallback_generates_anchors", True)
+    )
     verified_independent_scan = IndependentCrossScanResult(
         crosses=[
             cross
             for candidate_id, cross in enumerate(independent_scan.crosses)
-            if candidate_id in retained_fallback_ids
+            if fallback_generates_anchors
+            and candidate_id in retained_fallback_ids
         ]
     )
     anchors = build_cross_anchors(
@@ -2732,57 +2895,97 @@ def run_cross_anchor_experiment(
         (time.perf_counter() - phase_started) * 1000, 2
     )
 
-    anchored_items = []
     batch_size = int(config["cross_anchor_llm2_batch_size"])
+    llm2_run_count = int(config.get("cross_anchor_llm2_localization_runs", 1))
     llm2_batch_count = 0
-    phase_started = time.perf_counter()
-    for batch_index, start in enumerate(range(0, len(anchors), batch_size), 1):
-        llm2_batch_count += 1
-        batch = anchors[start : start + batch_size]
-        batch_entries = [
-            {"mark_id": anchor["cross_id"], "bbox": anchor["bbox"]}
-            for anchor in batch
-        ]
-        batch_overlay_path = (
-            experiment_dir / f"llm2-batch-{batch_index:03d}-overlay.jpg"
+    llm2_started = time.perf_counter()
+    llm2_runs = []
+    assignment_audits = []
+    geometry_audits = []
+    for run_index in range(1, llm2_run_count + 1):
+        run_started = time.perf_counter()
+        anchored_items = []
+        for batch_index, start in enumerate(
+            range(0, len(anchors), batch_size),
+            1,
+        ):
+            llm2_batch_count += 1
+            batch = anchors[start : start + batch_size]
+            batch_entries = [
+                {"mark_id": anchor["cross_id"], "bbox": anchor["bbox"]}
+                for anchor in batch
+            ]
+            batch_overlay_path = experiment_dir / (
+                f"llm2-run-{run_index:03d}-batch-{batch_index:03d}-overlay.jpg"
+            )
+            _draw_boxes(
+                image_path,
+                batch_overlay_path,
+                [("C", batch_entries, "blue")],
+            )
+            batch_result = client.locate_cross_anchored_questions(
+                str(batch_overlay_path),
+                batch,
+                subject_hint,
+            )
+            anchored_items.extend(batch_result.items)
+        run_result = CrossAnchoredQuestionResult(items=anchored_items)
+        llm2_runs.append(run_result)
+        _write_json(
+            experiment_dir
+            / f"llm2-anchored-questions-run-{run_index:03d}.json",
+            run_result,
         )
-        _draw_boxes(
-            image_path,
-            batch_overlay_path,
-            [("C", batch_entries, "blue")],
+        run_assignment_audit = audit_cross_anchor_assignments(
+            run_result,
+            [anchor["cross_id"] for anchor in anchors],
         )
-        batch_result = client.locate_cross_anchored_questions(
-            str(batch_overlay_path),
-            batch,
-            subject_hint,
+        assignment_audits.append(run_assignment_audit)
+        _write_json(
+            experiment_dir
+            / f"llm2-cross-assignment-audit-run-{run_index:03d}.json",
+            run_assignment_audit,
         )
-        anchored_items.extend(batch_result.items)
+        if not run_assignment_audit["valid"]:
+            raise ValueError("cross anchor assignment audit failed")
+        run_geometry_audit = audit_anchored_question_geometry(
+            run_result,
+            anchors,
+            max_area_ratio=float(config["cross_anchor_question_max_area_ratio"]),
+            max_gap_ratio=float(config["cross_anchor_question_max_gap_ratio"]),
+        )
+        geometry_audits.append(run_geometry_audit)
+        _write_json(
+            experiment_dir / f"question-geometry-audit-run-{run_index:03d}.json",
+            run_geometry_audit,
+        )
+        timings_ms[f"llm2_localization_run_{run_index:03d}"] = round(
+            (time.perf_counter() - run_started) * 1000,
+            2,
+        )
     timings_ms["llm2_localization"] = round(
-        (time.perf_counter() - phase_started) * 1000, 2
+        (time.perf_counter() - llm2_started) * 1000, 2
     )
     phase_started = time.perf_counter()
-    anchored_questions = CrossAnchoredQuestionResult(items=anchored_items)
+    anchored_questions = llm2_runs[0]
     _write_json(
         experiment_dir / "llm2-anchored-questions.json",
         anchored_questions,
     )
-    assignment_audit = audit_cross_anchor_assignments(
-        anchored_questions,
-        [anchor["cross_id"] for anchor in anchors],
-    )
+    assignment_audit = assignment_audits[0]
     _write_json(
         experiment_dir / "llm2-cross-assignment-audit.json",
         assignment_audit,
     )
-    if not assignment_audit["valid"]:
-        raise ValueError("cross anchor assignment audit failed")
-
-    geometry_audit = audit_anchored_question_geometry(
-        anchored_questions,
-        anchors,
-        max_area_ratio=float(config["cross_anchor_question_max_area_ratio"]),
-        max_gap_ratio=float(config["cross_anchor_question_max_gap_ratio"]),
-    )
+    geometry_audit = {
+        "run_count": llm2_run_count,
+        "violations": [
+            {"run_index": run_index, **violation}
+            for run_index, audit in enumerate(geometry_audits, 1)
+            for violation in audit["violations"]
+        ],
+        "policy": "Geometry violations from every LLM2 run are audit-only.",
+    }
     _write_json(
         experiment_dir / "question-geometry-audit.json",
         geometry_audit,
@@ -2801,8 +3004,26 @@ def run_cross_anchor_experiment(
         min_iou=float(config["question_truth_min_iou"]),
     )
     _write_json(experiment_dir / "truth-comparison.json", truth_comparison)
-    stable_question_events = cluster_anchored_question_events(
+    first_pass_stable_events = cluster_anchored_question_events(
         anchored_questions,
+        min_iou=float(config["cross_anchor_duplicate_question_iou_threshold"]),
+    )
+    _write_json(
+        experiment_dir / "stable-question-events-first-pass.json",
+        first_pass_stable_events,
+    )
+    first_pass_stable_truth_comparison = compare_question_events_to_truth(
+        first_pass_stable_events,
+        truth_regions,
+        min_iou=float(config["question_truth_min_iou"]),
+    )
+    _write_json(
+        experiment_dir
+        / "stable-question-events-first-pass-truth-comparison.json",
+        first_pass_stable_truth_comparison,
+    )
+    stable_question_events = cluster_anchored_question_runs(
+        llm2_runs,
         min_iou=float(config["cross_anchor_duplicate_question_iou_threshold"]),
     )
     _write_json(
@@ -2817,6 +3038,20 @@ def run_cross_anchor_experiment(
     _write_json(
         experiment_dir / "stable-question-events-truth-comparison.json",
         stable_truth_comparison,
+    )
+    llm2_pass_benefit = compare_llm2_pass_benefit(
+        first_pass_stable_truth_comparison,
+        stable_truth_comparison,
+    )
+    llm2_pass_benefit["second_pass_elapsed_ms"] = timings_ms.get(
+        "llm2_localization_run_002"
+    )
+    llm2_pass_benefit["total_llm2_elapsed_ms"] = timings_ms[
+        "llm2_localization"
+    ]
+    _write_json(
+        experiment_dir / "llm2-pass-benefit.json",
+        llm2_pass_benefit,
     )
     timings_ms["post_llm2_audit"] = round(
         (time.perf_counter() - phase_started) * 1000, 2
@@ -2858,6 +3093,7 @@ def run_cross_anchor_experiment(
         ),
         "llm1_fallback_verified_count": len(confirmed_fallback_ids),
         "llm1_fallback_uncertain_retained_count": len(uncertain_fallback_ids),
+        "llm1_fallback_generates_anchors": fallback_generates_anchors,
         "llm1_independent_scan_count": len(independent_scan.crosses),
         "llm1_independent_supported_count": sum(
             anchor["independent_scan_supported"] for anchor in anchors
@@ -2880,6 +3116,7 @@ def run_cross_anchor_experiment(
         "llm2_unmatched_cross_count": len(anchored_questions.items)
         - len(matched_questions),
         "llm2_assignment_audit_valid": assignment_audit["valid"],
+        "llm2_localization_run_count": llm2_run_count,
         "geometry_violation_count": len(geometry_audit["violations"]),
         "duplicate_question_candidate_count": len(
             duplicate_question_audit["duplicate_candidates"]
@@ -2893,6 +3130,18 @@ def run_cross_anchor_experiment(
         "unassigned_matched_cross_count": len(
             truth_comparison["unassigned_matched_cross_ids"]
         ),
+        "first_pass_stable_question_event_count": first_pass_stable_events[
+            "event_count"
+        ],
+        "first_pass_stable_truth_matched_count": (
+            first_pass_stable_truth_comparison["matched_truth_count"]
+        ),
+        "first_pass_stable_truth_recall": first_pass_stable_truth_comparison[
+            "truth_recall"
+        ],
+        "first_pass_stable_false_event_count": len(
+            first_pass_stable_truth_comparison["false_event_ids"]
+        ),
         "stable_question_event_count": stable_question_events["event_count"],
         "stable_truth_matched_count": stable_truth_comparison[
             "matched_truth_count"
@@ -2901,6 +3150,21 @@ def run_cross_anchor_experiment(
         "stable_false_event_count": len(
             stable_truth_comparison["false_event_ids"]
         ),
+        "llm2_second_pass_recovered_truth_count": llm2_pass_benefit[
+            "recovered_truth_count"
+        ],
+        "llm2_second_pass_recovered_truth_ids": llm2_pass_benefit[
+            "recovered_truth_ids"
+        ],
+        "llm2_second_pass_additional_false_event_count": llm2_pass_benefit[
+            "additional_false_event_count"
+        ],
+        "first_pass_minimum_matched_truth_coverage": llm2_pass_benefit[
+            "first_pass_minimum_matched_truth_coverage"
+        ],
+        "stable_minimum_matched_truth_coverage": llm2_pass_benefit[
+            "union_minimum_matched_truth_coverage"
+        ],
         "llm_request_count": (
             verification_run_count
             + 1
@@ -2961,6 +3225,8 @@ def load_cross_cv_inputs(
         "cross_anchor_question_max_gap_ratio",
         "cross_anchor_duplicate_question_iou_threshold",
         "cross_anchor_llm1_verification_runs",
+        "cross_anchor_llm2_localization_runs",
+        "cross_anchor_fallback_generates_anchors",
         "cross_anchor_retain_uncertain_candidates",
         "cross_anchor_retain_rejected_candidates",
         "cross_anchor_retain_uncertain_fallback_candidates",
@@ -2987,6 +3253,7 @@ def load_cross_cv_inputs(
         "cross_anchor_montage_columns",
         "cross_anchor_llm2_batch_size",
         "cross_anchor_llm1_verification_runs",
+        "cross_anchor_llm2_localization_runs",
     }
     for name in positive_integer_fields:
         if int(config[name]) <= 0:
@@ -2995,6 +3262,7 @@ def load_cross_cv_inputs(
         "cross_anchor_retain_uncertain_candidates",
         "cross_anchor_retain_rejected_candidates",
         "cross_anchor_retain_uncertain_fallback_candidates",
+        "cross_anchor_fallback_generates_anchors",
     }
     for name in boolean_fields:
         if not isinstance(config[name], bool):
@@ -3134,14 +3402,14 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
             "",
             "> 稳定错题事件由LLM2原始错题框做审计性聚类得到，不改写模型原始返回；目标是稳定真值召回为1.0，允许存在误报事件。",
             "",
-            "| 图片 | LLM1核验次数 | 不稳定CV候选 | 保留LLM1拒绝CV | 保留fallback uncertain | 原始未分配结果 | 稳定错题事件 | 稳定真值命中 | 稳定真值召回 | 稳定误报事件 | 新方案LLM请求 |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 图片 | LLM1核验次数 | 不稳定CV候选 | 保留LLM1拒绝CV | fallback uncertain审计 | fallback生成锚点 | LLM2定位次数 | 第一次真值召回 | 第一次最小真值覆盖 | 第二次新增找回 | 第二次新增误报 | 稳定错题事件 | 合并真值命中 | 合并真值召回 | 合并最小真值覆盖 | 合并误报事件 | 新方案LLM请求 |",
+            "|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for summary in summaries:
         item = summary["checkpoints"]
         lines.append(
-            "| {label} | {runs} | {unstable} | {rejected} | {fallback_uncertain} | {unassigned} | {events} | {matched} | {recall} | {false_events} | {requests} |".format(
+            "| {label} | {runs} | {unstable} | {rejected} | {fallback_uncertain} | {fallback_generates} | {llm2_runs} | {first_recall} | {first_coverage} | {recovered} | {additional_false} | {events} | {matched} | {recall} | {union_coverage} | {false_events} | {requests} |".format(
                 label=summary["label"],
                 runs=item["cross_anchor_llm1_verification_run_count"],
                 unstable=item["cross_anchor_llm1_unstable_candidate_count"],
@@ -3149,12 +3417,28 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
                 fallback_uncertain=item[
                     "cross_anchor_fallback_uncertain_retained_count"
                 ],
-                unassigned=item[
-                    "cross_anchor_unassigned_matched_cross_count"
+                fallback_generates=item[
+                    "cross_anchor_fallback_generates_anchors"
+                ],
+                llm2_runs=item["cross_anchor_llm2_localization_run_count"],
+                first_recall=item[
+                    "cross_anchor_first_pass_stable_truth_recall"
+                ],
+                first_coverage=item[
+                    "cross_anchor_first_pass_minimum_truth_coverage"
+                ],
+                recovered=item[
+                    "cross_anchor_second_pass_recovered_truth_count"
+                ],
+                additional_false=item[
+                    "cross_anchor_second_pass_additional_false_event_count"
                 ],
                 events=item["cross_anchor_stable_question_event_count"],
                 matched=item["cross_anchor_stable_truth_matched_count"],
                 recall=item["cross_anchor_stable_truth_recall"],
+                union_coverage=item[
+                    "cross_anchor_stable_minimum_truth_coverage"
+                ],
                 false_events=item["cross_anchor_stable_false_event_count"],
                 requests=item["cross_anchor_llm_request_count"],
             )
@@ -3170,15 +3454,15 @@ def _write_timing_report(output_dir: Path, summaries: list[dict]) -> None:
         "",
         "> 单位均为毫秒。旧生产流程、旧stable实验和新cross-anchor实验在同一轮中串行执行；整页总耗时包含本地CV、文件输出及所有启用实验。",
         "",
-        "| 图片 | 整页总耗时 | 红色证据CV | 红叉候选CV | 旧生产流程 | 旧stable实验 | 新方案总耗时 | LLM1核验次数 | 新方案LLM请求 | LLM1候选核验 | 独立漏检扫描 | fallback复核 | LLM2定位 | 后置审计 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 整页总耗时 | 红色证据CV | 红叉候选CV | 旧生产流程 | 旧stable实验 | 新方案总耗时 | LLM1核验次数 | 新方案LLM请求 | LLM1候选核验 | 独立漏检扫描 | fallback复核 | LLM2定位总计 | LLM2第二次 | 后置审计 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for summary in summaries:
         case_timings = summary.get("timings_ms") or {}
         checkpoints = summary["checkpoints"]
         stage_timings = checkpoints.get("cross_anchor_stage_timings_ms") or {}
         lines.append(
-            "| {label} | {total} | {red_cv} | {cross_cv} | {production} | {stable} | {cross_anchor} | {runs} | {requests} | {verify} | {scan} | {fallback} | {llm2} | {audit} |".format(
+            "| {label} | {total} | {red_cv} | {cross_cv} | {production} | {stable} | {cross_anchor} | {runs} | {requests} | {verify} | {scan} | {fallback} | {llm2} | {llm2_second} | {audit} |".format(
                 label=summary["label"],
                 total=case_timings.get("total"),
                 red_cv=case_timings.get("red_evidence_cv"),
@@ -3196,6 +3480,9 @@ def _write_timing_report(output_dir: Path, summaries: list[dict]) -> None:
                     "fallback_montage_and_verification"
                 ),
                 llm2=stage_timings.get("llm2_localization"),
+                llm2_second=stage_timings.get(
+                    "llm2_localization_run_002"
+                ),
                 audit=stage_timings.get("post_llm2_audit"),
             )
         )
