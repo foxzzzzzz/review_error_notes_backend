@@ -122,7 +122,7 @@ FALLBACK_CROSS_VERIFICATION_PROMPT = """你是小学作业独立扫描红叉复�
 """
 
 
-CROSS_ANCHORED_QUESTION_PROMPT = """你是小学作业红叉锚定错题区域定位器。图片可能是原始整页作业，也可能是单个可疑红叉附近的局部放大图；图片上叠加了蓝色 C0、C1... 编号框，输入 JSON 给出每个 cross_id 在当前输入图片坐标系中的位置和来源风险。
+CROSS_ANCHORED_QUESTION_PROMPT = """你是小学作业红叉锚定错题区域定位器。图片可能是叠加蓝色 C0、C1... 编号框的原始整页作业，也可能是不叠加任何蓝框的单个可疑红叉附近局部原图；输入 JSON 给出每个 cross_id 在当前输入图片坐标系中的位置和来源风险。
 
 本阶段唯一目标：逐个判断红叉候选能否关联到一个明确的最小独立作答单元，并只返回完整 question_bbox。不要识别或返回题目文字、学生答案、正确答案、题型、标签或难度。
 
@@ -133,7 +133,7 @@ CROSS_ANCHORED_QUESTION_PROMPT = """你是小学作业红叉锚定错题区域�
 4. 红叉是决定性主锚点。若附近存在老师画出的闭合或近似闭合红圈，可将红圈作为辅助证据，用于确认对应的学生作答、区分相邻作答单元，并确定 question_bbox 的扩展方向和边界。不得仅凭红圈或教师批注新增错题，不得把红圈关联到相邻小题；无需单独返回红圈或教师批注。
 5. source=llm_fallback 表示低可信独立扫描结果，不得默认其为真实红叉，必须根据图片重新核验。
 6. matched=false 时 question_bbox 必须为 null；matched=true 时 unmatched_reason 应为 null。
-7. question_bbox 使用当前输入图片的归一化 [left, top, right, bottom]。若 anchor 的 image_scope=local_retry_crop，必须按当前局部放大图返回坐标；蓝色编号框只是提示，不是图片原有内容。
+7. question_bbox 使用当前输入图片的归一化 [left, top, right, bottom]。若 anchor 的 image_scope=local_retry_crop，当前图片是不带蓝框的局部原图，必须结合输入 JSON 中的 bbox 查找候选，并按当前局部图返回坐标。整页图片上的蓝色编号框只是提示，不是图片原有内容。
 8. 只返回严格 JSON，不要解释或 Markdown。
 
 返回格式：{"items":[{"cross_id":0,"matched":true,"question_bbox":[0.1,0.2,0.4,0.5],"unmatched_reason":null,"confidence":0.95},{"cross_id":1,"matched":false,"question_bbox":null,"unmatched_reason":"不是明确红叉","confidence":0.8}]}。
@@ -1245,6 +1245,7 @@ def _find_spatially_separated_shared_question_anchors(
     *,
     question_iou_threshold: float,
     min_anchor_distance_ratio: float,
+    min_group_size: int,
 ) -> set[int]:
     anchor_by_id = {anchor["cross_id"]: anchor for anchor in anchors}
     matched_items = [
@@ -1269,7 +1270,7 @@ def _find_spatially_separated_shared_question_anchors(
 
     outliers = set()
     for cross_id, peer_ids in duplicate_peers.items():
-        if not peer_ids:
+        if len(peer_ids) + 1 < min_group_size:
             continue
         nearest_peer_distance = min(
             _bbox_center_distance(
@@ -1293,17 +1294,13 @@ def select_llm2_retry_anchors(
     max_question_cross_iou: float,
     shared_question_iou_threshold: float,
     shared_question_min_anchor_distance_ratio: float,
+    shared_question_min_group_size: int,
+    max_retry_requests: int,
 ) -> dict:
     items_by_id = {item.cross_id: item for item in first_pass.items}
     geometry_reasons = {
         violation["cross_id"]: list(violation["reasons"])
         for violation in geometry_audit["violations"]
-    }
-    high_evidence_sources = {
-        "cv_confirmed",
-        "cv_uncertain",
-        "cv_high_score_retained",
-        "llm_fallback",
     }
     strong_anomaly_reasons = {
         "question_bbox_copies_cross",
@@ -1317,9 +1314,9 @@ def select_llm2_retry_anchors(
         min_anchor_distance_ratio=(
             shared_question_min_anchor_distance_ratio
         ),
+        min_group_size=shared_question_min_group_size,
     )
-    selected = []
-    triggers = []
+    candidates = []
     suppressed = []
     for anchor in anchors:
         cross_id = anchor["cross_id"]
@@ -1353,16 +1350,29 @@ def select_llm2_retry_anchors(
                     "shared_question_bbox_for_spatially_separated_anchor"
                 )
             reasons.extend(geometry_reasons.get(cross_id, []))
-        elif (
-            anchor.get("source") in high_evidence_sources
-            or anchor.get("independent_scan_supported") is True
-        ):
-            reasons.append("unmatched_high_evidence_anchor")
+        else:
+            reasons.append("unmatched_retained_anchor")
         if not reasons:
+            continue
+        center_gap_only = set(reasons).issubset(
+            {
+                "cross_center_outside_question_bbox",
+                "question_bbox_not_near_cross",
+            }
+        )
+        if center_gap_only:
+            suppressed.append(
+                {
+                    "cross_id": cross_id,
+                    "reasons": ["center_gap_without_independent_anomaly"],
+                    "candidate_reasons": sorted(set(reasons)),
+                }
+            )
             continue
         if (
             anchor.get("source") == "cv_rejected_retained"
             and anchor.get("independent_scan_supported") is not True
+            and "unmatched_retained_anchor" not in reasons
             and not strong_anomaly_reasons.intersection(reasons)
         ):
             suppressed.append(
@@ -1375,16 +1385,53 @@ def select_llm2_retry_anchors(
                 }
             )
             continue
-        selected.append(anchor)
-        triggers.append(
+        reason_set = set(reasons)
+        priority = (
+            0
+            if "unmatched_retained_anchor" in reason_set
+            else 1
+            if reason_set.intersection(
+                {"question_bbox_copies_cross", "question_bbox_not_larger_than_cross"}
+            )
+            else 2
+            if "shared_question_bbox_for_spatially_separated_anchor" in reason_set
+            else 3
+        )
+        source_priority = {
+            "cv_confirmed": 0,
+            "cv_uncertain": 1,
+            "cv_high_score_retained": 2,
+            "llm_fallback": 3,
+            "cv_rejected_retained": 4,
+        }.get(anchor.get("source"), 5)
+        candidates.append(
+            (
+                priority,
+                source_priority,
+                -float(anchor.get("confidence") or 0),
+                cross_id,
+                anchor,
+                {
+                    "cross_id": cross_id,
+                    "reasons": sorted(reason_set),
+                    "cross_center_gap_ratio": (
+                        round(center_gap, 6) if center_gap is not None else None
+                    ),
+                },
+            )
+        )
+    candidates.sort(key=lambda entry: entry[:4])
+    selected_candidates = candidates[:max_retry_requests]
+    for *_rank, cross_id, _anchor, trigger in candidates[max_retry_requests:]:
+        suppressed.append(
             {
                 "cross_id": cross_id,
-                "reasons": sorted(set(reasons)),
-                "cross_center_gap_ratio": (
-                    round(center_gap, 6) if center_gap is not None else None
-                ),
+                "reasons": ["retry_budget_exhausted"],
+                "candidate_reasons": trigger["reasons"],
             }
         )
+    selected = [entry[4] for entry in selected_candidates]
+    triggers = [entry[5] for entry in selected_candidates]
     return {
         "trigger_count": len(triggers),
         "anchors": selected,
@@ -1399,6 +1446,8 @@ def select_llm2_retry_anchors(
         "shared_question_min_anchor_distance_ratio": (
             shared_question_min_anchor_distance_ratio
         ),
+        "shared_question_min_group_size": shared_question_min_group_size,
+        "max_retry_requests": max_retry_requests,
         "policy": (
             "Only actionable first-pass anomalies receive a local LLM2 retry; "
             "strong LLM2 self-inconsistency may override rejected-anchor "
@@ -1540,23 +1589,6 @@ def write_cross_anchor_retry_crop(
         "bbox": _map_bbox_to_crop(bbox, crop_bbox),
         "image_scope": "local_retry_crop",
     }
-    draw = ImageDraw.Draw(crop)
-    local_bbox = mapped_anchor["bbox"]
-    draw.rectangle(
-        (
-            local_bbox[0] * crop.width,
-            local_bbox[1] * crop.height,
-            local_bbox[2] * crop.width,
-            local_bbox[3] * crop.height,
-        ),
-        outline="blue",
-        width=max(2, round(min(crop.width, crop.height) * 0.005)),
-    )
-    draw.text(
-        (local_bbox[0] * crop.width, local_bbox[1] * crop.height),
-        f"C{anchor['cross_id']}",
-        fill="blue",
-    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     crop.save(output_path, format="JPEG", quality=92)
     return {
@@ -2814,6 +2846,9 @@ def build_summary(
         "cross_anchor_llm1_truth_recall": (cross_anchor_experiment or {}).get(
             "llm1_truth_recall"
         ),
+        "cross_anchor_llm1_model_confirmed_truth_recall": (
+            cross_anchor_experiment or {}
+        ).get("llm1_model_confirmed_truth_recall"),
         "cross_anchor_llm1_false_cross_count": (cross_anchor_experiment or {}).get(
             "llm1_false_cross_count"
         ),
@@ -3402,6 +3437,23 @@ def run_cross_anchor_experiment(
         experiment_dir / "llm1-truth-comparison.json",
         llm1_truth_comparison,
     )
+    llm1_model_confirmed_truth_comparison = compare_cross_candidates_to_truth(
+        [
+            candidate
+            for candidate in cv_candidates
+            if any(
+                verdict.candidate_id == candidate["candidate_id"]
+                and verdict.disposition == "confirmed"
+                for verdict in verification.verdicts
+            )
+        ],
+        truth_regions,
+        margin_ratio=float(config.get("truth_match_margin_ratio", 0.0)),
+    )
+    _write_json(
+        experiment_dir / "llm1-model-confirmed-truth-comparison.json",
+        llm1_model_confirmed_truth_comparison,
+    )
     llm1_truth_multiplicity = []
     for truth in truth_regions:
         candidate_ids = sorted(
@@ -3524,6 +3576,14 @@ def run_cross_anchor_experiment(
             config[
                 "cross_anchor_llm2_retry_shared_question_min_anchor_distance_ratio"
             ]
+        ),
+        shared_question_min_group_size=int(
+            config[
+                "cross_anchor_llm2_retry_shared_question_min_group_size"
+            ]
+        ),
+        max_retry_requests=int(
+            config["cross_anchor_llm2_retry_max_requests_per_page"]
         ),
     )
     _write_json(experiment_dir / "llm2-retry-selection.json", retry_selection)
@@ -3795,6 +3855,12 @@ def run_cross_anchor_experiment(
         ),
         "llm1_truth_matched_count": llm1_truth_comparison["matched_truth_count"],
         "llm1_truth_recall": llm1_truth_comparison["truth_recall"],
+        "llm1_model_confirmed_truth_matched_count": (
+            llm1_model_confirmed_truth_comparison["matched_truth_count"]
+        ),
+        "llm1_model_confirmed_truth_recall": (
+            llm1_model_confirmed_truth_comparison["truth_recall"]
+        ),
         "llm1_false_cross_count": len(
             llm1_truth_comparison["false_candidate_ids"]
         ),
@@ -3935,6 +4001,8 @@ def load_cross_cv_inputs(
         "cross_anchor_llm2_retry_max_question_cross_iou",
         "cross_anchor_llm2_retry_shared_question_iou_threshold",
         "cross_anchor_llm2_retry_shared_question_min_anchor_distance_ratio",
+        "cross_anchor_llm2_retry_shared_question_min_group_size",
+        "cross_anchor_llm2_retry_max_requests_per_page",
         "cross_anchor_fallback_generates_anchors",
         "cross_anchor_retain_uncertain_candidates",
         "cross_anchor_retain_rejected_candidates",
@@ -3963,6 +4031,8 @@ def load_cross_cv_inputs(
         "cross_anchor_llm2_batch_size",
         "cross_anchor_llm1_verification_runs",
         "cross_anchor_llm2_localization_runs",
+        "cross_anchor_llm2_retry_shared_question_min_group_size",
+        "cross_anchor_llm2_retry_max_requests_per_page",
     }
     for name in positive_integer_fields:
         if int(config[name]) <= 0:
@@ -4034,8 +4104,8 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
         "",
         "> CV 组件/证据组数量不等于错题数量；本表只用于定位首次数量偏差。",
         "",
-        "| 图片 | 人工错题 | CV组件 | CV证据组 | 当前primitive | 当前事件 | 当前定位 | 当前内容 | 当前真值命中 | 当前真值召回 | 当前首次偏差 | 实验primitive | 稳定事件 | 重复event候选 | 重复primitive候选 | 跨单元圈叉候选 | 圈叉归属异常 | 未分配primitive | 未覆盖CV组件 | LLM实验耗时(ms) | 新方案CV候选 | 新方案确认红叉 | 保留uncertain | 保留高分CV | LLM漏检补充 | 复核通过fallback | 独立扫描红叉 | 独立扫描支持 | 本地几何合并 | LLM1真值召回 | LLM1区域外红叉 | LLM1真值重复 | 新方案错题定位 | 几何异常 | 重复错题候选 | 真值重复归属 | 新方案真值命中 | 新方案真值召回 | 内容/OCR状态 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 人工错题 | CV组件 | CV证据组 | 当前primitive | 当前事件 | 当前定位 | 当前内容 | 当前真值命中 | 当前真值召回 | 当前首次偏差 | 实验primitive | 稳定事件 | 重复event候选 | 重复primitive候选 | 跨单元圈叉候选 | 圈叉归属异常 | 未分配primitive | 未覆盖CV组件 | LLM实验耗时(ms) | 新方案CV候选 | 新方案确认红叉 | 保留uncertain | 保留高分CV | LLM漏检补充 | 复核通过fallback | 独立扫描红叉 | 独立扫描支持 | 本地几何合并 | LLM1确认真值召回 | 保留锚点真值召回 | LLM1区域外红叉 | LLM1真值重复 | 新方案错题定位 | 几何异常 | 重复错题候选 | 真值重复归属 | 新方案真值命中 | 新方案真值召回 | 内容/OCR状态 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for summary in summaries:
         item = summary["checkpoints"]
@@ -4052,7 +4122,7 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
             else summary["first_count_divergence"] or "无数量偏差"
         )
         lines.append(
-            "| {label} | {expected} | {components} | {groups} | {current_primitives} | {marks} | {located} | {content} | {pipeline_truth_matched} | {pipeline_truth_recall} | {divergence} | {primitives} | {stable} | {duplicate_events} | {duplicate_primitives} | {geometry_candidates} | {membership_violations} | {unassigned} | {uncovered} | {experiment_ms} | {cross_candidates} | {confirmed_crosses} | {uncertain_retained} | {high_score_retained} | {fallback_crosses} | {fallback_verified} | {independent_scan} | {independent_supported} | {local_merges} | {llm1_truth_recall} | {llm1_false_crosses} | {llm1_duplicate_truth} | {anchored_questions} | {anchored_geometry} | {duplicate_questions} | {duplicate_truth} | {truth_matched} | {truth_recall} | {content_ocr_status} |".format(
+            "| {label} | {expected} | {components} | {groups} | {current_primitives} | {marks} | {located} | {content} | {pipeline_truth_matched} | {pipeline_truth_recall} | {divergence} | {primitives} | {stable} | {duplicate_events} | {duplicate_primitives} | {geometry_candidates} | {membership_violations} | {unassigned} | {uncovered} | {experiment_ms} | {cross_candidates} | {confirmed_crosses} | {uncertain_retained} | {high_score_retained} | {fallback_crosses} | {fallback_verified} | {independent_scan} | {independent_supported} | {local_merges} | {llm1_confirmed_truth_recall} | {llm1_truth_recall} | {llm1_false_crosses} | {llm1_duplicate_truth} | {anchored_questions} | {anchored_geometry} | {duplicate_questions} | {duplicate_truth} | {truth_matched} | {truth_recall} | {content_ocr_status} |".format(
                 label=summary["label"],
                 expected=item["expected_error_count"],
                 components=item["cv_raw_component_count"],
@@ -4094,6 +4164,9 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
                     "cross_anchor_independent_supported_count"
                 ],
                 local_merges=item["cross_anchor_local_geometry_merge_count"],
+                llm1_confirmed_truth_recall=item[
+                    "cross_anchor_llm1_model_confirmed_truth_recall"
+                ],
                 llm1_truth_recall=item["cross_anchor_llm1_truth_recall"],
                 llm1_false_crosses=item[
                     "cross_anchor_llm1_false_cross_count"
