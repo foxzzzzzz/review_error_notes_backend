@@ -323,8 +323,11 @@ def test_load_cross_cv_inputs_requires_config_and_truth_for_every_label(tmp_path
                 "cross_anchor_llm2_localization_runs": 2,
                 "cross_anchor_llm2_retry_min_center_gap_ratio": 0.03,
                 "cross_anchor_llm2_retry_crop_padding_ratio": 0.12,
+                "cross_anchor_llm2_retry_first_pass_min_question_cross_area_ratio": 1.1,
                 "cross_anchor_llm2_retry_min_question_cross_area_ratio": 1.5,
                 "cross_anchor_llm2_retry_max_question_cross_iou": 0.8,
+                "cross_anchor_llm2_retry_shared_question_iou_threshold": 0.8,
+                "cross_anchor_llm2_retry_shared_question_min_anchor_distance_ratio": 0.1,
                 "cross_anchor_fallback_generates_anchors": False,
                 "cross_anchor_retain_uncertain_candidates": True,
                 "cross_anchor_retain_rejected_candidates": True,
@@ -374,8 +377,21 @@ def test_load_cross_cv_inputs_requires_config_and_truth_for_every_label(tmp_path
     assert config["cross_anchor_llm2_localization_runs"] == 2
     assert config["cross_anchor_llm2_retry_min_center_gap_ratio"] == 0.03
     assert config["cross_anchor_llm2_retry_crop_padding_ratio"] == 0.12
+    assert (
+        config[
+            "cross_anchor_llm2_retry_first_pass_min_question_cross_area_ratio"
+        ]
+        == 1.1
+    )
     assert config["cross_anchor_llm2_retry_min_question_cross_area_ratio"] == 1.5
     assert config["cross_anchor_llm2_retry_max_question_cross_iou"] == 0.8
+    assert config["cross_anchor_llm2_retry_shared_question_iou_threshold"] == 0.8
+    assert (
+        config[
+            "cross_anchor_llm2_retry_shared_question_min_anchor_distance_ratio"
+        ]
+        == 0.1
+    )
     assert truth["page33"][0]["truth_id"] == "T1"
     with pytest.raises(ValueError, match="missing truth page: page34"):
         diagnostic.load_cross_cv_inputs(
@@ -1327,6 +1343,10 @@ def test_llm2_retry_selection_targets_only_actionable_first_pass_results():
         anchors,
         geometry_audit,
         min_center_gap_ratio=0.03,
+        min_first_pass_question_cross_area_ratio=1.1,
+        max_question_cross_iou=0.8,
+        shared_question_iou_threshold=0.8,
+        shared_question_min_anchor_distance_ratio=0.1,
     )
 
     assert [anchor["cross_id"] for anchor in selection["anchors"]] == [1, 3]
@@ -1386,6 +1406,10 @@ def test_llm2_retry_selection_suppresses_rejected_anchor_without_scan_support():
             ]
         },
         min_center_gap_ratio=0.03,
+        min_first_pass_question_cross_area_ratio=1.1,
+        max_question_cross_iou=0.8,
+        shared_question_iou_threshold=0.8,
+        shared_question_min_anchor_distance_ratio=0.1,
     )
 
     assert selection["trigger_count"] == 0
@@ -1399,6 +1423,154 @@ def test_llm2_retry_selection_suppresses_rejected_anchor_without_scan_support():
                 "question_bbox_not_near_cross",
             ],
         }
+    ]
+
+
+def test_llm2_retry_selection_bypasses_rejected_suppression_for_cross_copy():
+    diagnostic = _load_script_module()
+    anchors = [
+        {
+            "cross_id": 3,
+            "source": "cv_rejected_retained",
+            "bbox": [0.62, 0.44, 0.73, 0.53],
+            "confidence": 0.8,
+            "independent_scan_supported": False,
+        }
+    ]
+    first_pass = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 3,
+                    "matched": True,
+                    "question_bbox": [0.62, 0.44, 0.73, 0.53],
+                    "unmatched_reason": None,
+                    "confidence": 0.75,
+                }
+            ]
+        }
+    )
+
+    selection = diagnostic.select_llm2_retry_anchors(
+        first_pass,
+        anchors,
+        {"violations": []},
+        min_center_gap_ratio=0.03,
+        min_first_pass_question_cross_area_ratio=1.1,
+        max_question_cross_iou=0.8,
+        shared_question_iou_threshold=0.8,
+        shared_question_min_anchor_distance_ratio=0.1,
+    )
+
+    assert [anchor["cross_id"] for anchor in selection["anchors"]] == [3]
+    assert selection["suppressed"] == []
+    assert selection["triggers"] == [
+        {
+            "cross_id": 3,
+            "reasons": [
+                "question_bbox_copies_cross",
+                "question_bbox_not_larger_than_cross",
+            ],
+            "cross_center_gap_ratio": 0.0,
+        }
+    ]
+
+
+def test_llm2_retry_selection_does_not_retry_modestly_expanded_question_bbox():
+    diagnostic = _load_script_module()
+    anchors = [
+        {
+            "cross_id": 0,
+            "source": "cv_rejected_retained",
+            "bbox": [0.1, 0.1, 0.2, 0.2],
+            "confidence": 0.8,
+            "independent_scan_supported": False,
+        }
+    ]
+    first_pass = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": True,
+                    "question_bbox": [0.09, 0.09, 0.21, 0.21],
+                    "unmatched_reason": None,
+                    "confidence": 0.9,
+                }
+            ]
+        }
+    )
+
+    selection = diagnostic.select_llm2_retry_anchors(
+        first_pass,
+        anchors,
+        {"violations": []},
+        min_center_gap_ratio=0.03,
+        min_first_pass_question_cross_area_ratio=1.1,
+        max_question_cross_iou=0.8,
+        shared_question_iou_threshold=0.8,
+        shared_question_min_anchor_distance_ratio=0.1,
+    )
+
+    assert selection["trigger_count"] == 0
+    assert selection["anchors"] == []
+
+
+def test_llm2_retry_selection_targets_outlier_anchor_sharing_question_bbox():
+    diagnostic = _load_script_module()
+    anchors = [
+        {
+            "cross_id": 3,
+            "source": "cv_rejected_retained",
+            "bbox": [0.627297, 0.448, 0.733596, 0.529],
+            "confidence": 0.8,
+            "independent_scan_supported": False,
+        },
+        {
+            "cross_id": 4,
+            "source": "cv_rejected_retained",
+            "bbox": [0.76378, 0.541, 0.870079, 0.622],
+            "confidence": 0.8,
+            "independent_scan_supported": False,
+        },
+        {
+            "cross_id": 5,
+            "source": "cv_rejected_retained",
+            "bbox": [0.821522, 0.544, 0.927822, 0.625],
+            "confidence": 0.8,
+            "independent_scan_supported": False,
+        },
+    ]
+    first_pass = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": cross_id,
+                    "matched": True,
+                    "question_bbox": [0.703, 0.443, 0.953, 0.633],
+                    "unmatched_reason": None,
+                    "confidence": 0.82,
+                }
+                for cross_id in (3, 4, 5)
+            ]
+        }
+    )
+
+    selection = diagnostic.select_llm2_retry_anchors(
+        first_pass,
+        anchors,
+        {"violations": []},
+        min_center_gap_ratio=0.03,
+        min_first_pass_question_cross_area_ratio=1.1,
+        max_question_cross_iou=0.8,
+        shared_question_iou_threshold=0.8,
+        shared_question_min_anchor_distance_ratio=0.1,
+    )
+
+    assert [anchor["cross_id"] for anchor in selection["anchors"]] == [3]
+    assert selection["suppressed"] == []
+    assert selection["triggers"][0]["reasons"] == [
+        "shared_question_bbox_for_spatially_separated_anchor"
     ]
 
 
@@ -1900,8 +2072,11 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
             "cross_anchor_llm2_localization_runs": 2,
             "cross_anchor_llm2_retry_min_center_gap_ratio": 0.03,
             "cross_anchor_llm2_retry_crop_padding_ratio": 0.2,
+            "cross_anchor_llm2_retry_first_pass_min_question_cross_area_ratio": 1.1,
             "cross_anchor_llm2_retry_min_question_cross_area_ratio": 1.5,
             "cross_anchor_llm2_retry_max_question_cross_iou": 0.8,
+            "cross_anchor_llm2_retry_shared_question_iou_threshold": 0.8,
+            "cross_anchor_llm2_retry_shared_question_min_anchor_distance_ratio": 0.1,
             "cross_anchor_fallback_generates_anchors": False,
             "cross_anchor_retain_uncertain_candidates": True,
             "cross_anchor_retain_rejected_candidates": True,
@@ -2124,8 +2299,11 @@ def test_cross_anchor_experiment_skips_llm2_when_no_cross_is_confirmed(tmp_path)
             "question_truth_min_iou": 0.2,
             "cross_anchor_llm2_retry_min_center_gap_ratio": 0.03,
             "cross_anchor_llm2_retry_crop_padding_ratio": 0.12,
+            "cross_anchor_llm2_retry_first_pass_min_question_cross_area_ratio": 1.1,
             "cross_anchor_llm2_retry_min_question_cross_area_ratio": 1.5,
             "cross_anchor_llm2_retry_max_question_cross_iou": 0.8,
+            "cross_anchor_llm2_retry_shared_question_iou_threshold": 0.8,
+            "cross_anchor_llm2_retry_shared_question_min_anchor_distance_ratio": 0.1,
             "cross_anchor_retain_uncertain_candidates": True,
             "cross_anchor_high_cv_min_arm_density": 0.25,
             "cross_anchor_high_cv_min_center_density": 0.7,
@@ -2494,6 +2672,18 @@ def test_independent_mark_prompt_forbids_external_cv_coordinates_and_fragments()
     assert "不得把圆弧、叉的一条笔画或孤立红线作为独立标记" in prompt
     assert "教师文字批注必须标为 annotation" in prompt
     assert "local_red_regions" not in prompt
+
+
+def test_cross_anchored_prompt_uses_circle_only_as_localization_evidence():
+    diagnostic = _load_script_module()
+
+    prompt = diagnostic.CROSS_ANCHORED_QUESTION_PROMPT
+
+    assert "红叉是决定性主锚点" in prompt
+    assert "红圈作为辅助证据" in prompt
+    assert "区分相邻作答单元" in prompt
+    assert "不得仅凭红圈或教师批注新增错题" in prompt
+    assert "无需单独返回红圈或教师批注" in prompt
 
 
 def test_stable_event_prompt_unassigns_teacher_annotations_and_forbids_distant_pairs():
@@ -2976,8 +3166,11 @@ def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
                     "cross_anchor_llm2_localization_runs": 2,
                     "cross_anchor_llm2_retry_min_center_gap_ratio": 0.03,
                     "cross_anchor_llm2_retry_crop_padding_ratio": 0.12,
+                    "cross_anchor_llm2_retry_first_pass_min_question_cross_area_ratio": 1.1,
                     "cross_anchor_llm2_retry_min_question_cross_area_ratio": 1.5,
                     "cross_anchor_llm2_retry_max_question_cross_iou": 0.8,
+                    "cross_anchor_llm2_retry_shared_question_iou_threshold": 0.8,
+                    "cross_anchor_llm2_retry_shared_question_min_anchor_distance_ratio": 0.1,
                     "cross_anchor_fallback_generates_anchors": False,
                     "cross_anchor_retain_uncertain_candidates": True,
                     "cross_anchor_retain_rejected_candidates": True,

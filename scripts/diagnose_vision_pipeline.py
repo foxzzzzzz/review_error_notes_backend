@@ -124,16 +124,17 @@ FALLBACK_CROSS_VERIFICATION_PROMPT = """你是小学作业独立扫描红叉复�
 
 CROSS_ANCHORED_QUESTION_PROMPT = """你是小学作业红叉锚定错题区域定位器。图片可能是原始整页作业，也可能是单个可疑红叉附近的局部放大图；图片上叠加了蓝色 C0、C1... 编号框，输入 JSON 给出每个 cross_id 在当前输入图片坐标系中的位置和来源风险。
 
-本阶段唯一目标：逐个判断红叉候选能否关联到一个明确的最小独立作答单元，并只返回完整 question_bbox。不要识别或返回题目文字、学生答案、正确答案、题型、标签、难度、红圈或教师批注。
+本阶段唯一目标：逐个判断红叉候选能否关联到一个明确的最小独立作答单元，并只返回完整 question_bbox。不要识别或返回题目文字、学生答案、正确答案、题型、标签或难度。
 
 要求：
 1. 每个输入 cross_id 必须且只能返回一次，不得新增、删除、合并或重排。输入可能含误报；若看不到明确老师判错红叉，或无法唯一关联作答单元，必须返回 matched=false，并简要填写 unmatched_reason。
 2. matched=true 时，question_bbox 覆盖与该红叉直接相关的完整最小作答单元：印刷提示、学生实际作答以及相关批改痕迹；红叉可以位于框内，也可以紧邻该作答单元，不得因红叉画在作答框上方、右侧或外沿而返回 unmatched；不得吞入相邻兄弟小题或整页区域。
 3. question_bbox 不得直接复制红叉框。红叉框只标出批改痕迹，question_bbox 必须扩展到完整印刷提示和学生作答；如果无法看清完整边界，返回 matched=false。
-4. source=llm_fallback 表示低可信独立扫描结果，不得默认其为真实红叉，必须根据图片重新核验。
-5. matched=false 时 question_bbox 必须为 null；matched=true 时 unmatched_reason 应为 null。
-6. question_bbox 使用当前输入图片的归一化 [left, top, right, bottom]。若 anchor 的 image_scope=local_retry_crop，必须按当前局部放大图返回坐标；蓝色编号框只是提示，不是图片原有内容。
-7. 只返回严格 JSON，不要解释或 Markdown。
+4. 红叉是决定性主锚点。若附近存在老师画出的闭合或近似闭合红圈，可将红圈作为辅助证据，用于确认对应的学生作答、区分相邻作答单元，并确定 question_bbox 的扩展方向和边界。不得仅凭红圈或教师批注新增错题，不得把红圈关联到相邻小题；无需单独返回红圈或教师批注。
+5. source=llm_fallback 表示低可信独立扫描结果，不得默认其为真实红叉，必须根据图片重新核验。
+6. matched=false 时 question_bbox 必须为 null；matched=true 时 unmatched_reason 应为 null。
+7. question_bbox 使用当前输入图片的归一化 [left, top, right, bottom]。若 anchor 的 image_scope=local_retry_crop，必须按当前局部放大图返回坐标；蓝色编号框只是提示，不是图片原有内容。
+8. 只返回严格 JSON，不要解释或 Markdown。
 
 返回格式：{"items":[{"cross_id":0,"matched":true,"question_bbox":[0.1,0.2,0.4,0.5],"unmatched_reason":null,"confidence":0.95},{"cross_id":1,"matched":false,"question_bbox":null,"unmatched_reason":"不是明确红叉","confidence":0.8}]}。
 
@@ -1238,12 +1239,60 @@ def _point_bbox_gap_distance(point: tuple[float, float], bbox: list[float]) -> f
     return math.hypot(dx, dy)
 
 
+def _find_spatially_separated_shared_question_anchors(
+    first_pass: CrossAnchoredQuestionResult,
+    anchors: list[dict],
+    *,
+    question_iou_threshold: float,
+    min_anchor_distance_ratio: float,
+) -> set[int]:
+    anchor_by_id = {anchor["cross_id"]: anchor for anchor in anchors}
+    matched_items = [
+        item
+        for item in first_pass.items
+        if item.matched
+        and item.question_bbox is not None
+        and item.cross_id in anchor_by_id
+    ]
+    duplicate_peers: dict[int, set[int]] = {
+        item.cross_id: set() for item in matched_items
+    }
+    for index, first in enumerate(matched_items):
+        for second in matched_items[index + 1 :]:
+            if (
+                _bbox_iou(first.question_bbox, second.question_bbox)
+                < question_iou_threshold
+            ):
+                continue
+            duplicate_peers[first.cross_id].add(second.cross_id)
+            duplicate_peers[second.cross_id].add(first.cross_id)
+
+    outliers = set()
+    for cross_id, peer_ids in duplicate_peers.items():
+        if not peer_ids:
+            continue
+        nearest_peer_distance = min(
+            _bbox_center_distance(
+                anchor_by_id[cross_id]["bbox"],
+                anchor_by_id[peer_id]["bbox"],
+            )
+            for peer_id in peer_ids
+        )
+        if nearest_peer_distance >= min_anchor_distance_ratio:
+            outliers.add(cross_id)
+    return outliers
+
+
 def select_llm2_retry_anchors(
     first_pass: CrossAnchoredQuestionResult,
     anchors: list[dict],
     geometry_audit: dict,
     *,
     min_center_gap_ratio: float,
+    min_first_pass_question_cross_area_ratio: float,
+    max_question_cross_iou: float,
+    shared_question_iou_threshold: float,
+    shared_question_min_anchor_distance_ratio: float,
 ) -> dict:
     items_by_id = {item.cross_id: item for item in first_pass.items}
     geometry_reasons = {
@@ -1256,6 +1305,19 @@ def select_llm2_retry_anchors(
         "cv_high_score_retained",
         "llm_fallback",
     }
+    strong_anomaly_reasons = {
+        "question_bbox_copies_cross",
+        "question_bbox_not_larger_than_cross",
+        "shared_question_bbox_for_spatially_separated_anchor",
+    }
+    shared_question_outlier_ids = _find_spatially_separated_shared_question_anchors(
+        first_pass,
+        anchors,
+        question_iou_threshold=shared_question_iou_threshold,
+        min_anchor_distance_ratio=(
+            shared_question_min_anchor_distance_ratio
+        ),
+    )
     selected = []
     triggers = []
     suppressed = []
@@ -1266,6 +1328,12 @@ def select_llm2_retry_anchors(
         center_gap = None
         if item.matched and item.question_bbox is not None:
             cross_bbox = anchor["bbox"]
+            cross_area = _bbox_area(cross_bbox)
+            question_area = _bbox_area(item.question_bbox)
+            question_cross_area_ratio = (
+                question_area / cross_area if cross_area else 0.0
+            )
+            question_cross_iou = _bbox_iou(item.question_bbox, cross_bbox)
             cross_center = (
                 (cross_bbox[0] + cross_bbox[2]) / 2,
                 (cross_bbox[1] + cross_bbox[3]) / 2,
@@ -1273,6 +1341,17 @@ def select_llm2_retry_anchors(
             center_gap = _point_bbox_gap_distance(cross_center, item.question_bbox)
             if center_gap > min_center_gap_ratio:
                 reasons.append("cross_center_outside_question_bbox")
+            if (
+                question_cross_area_ratio
+                < min_first_pass_question_cross_area_ratio
+            ):
+                reasons.append("question_bbox_not_larger_than_cross")
+            if question_cross_iou > max_question_cross_iou:
+                reasons.append("question_bbox_copies_cross")
+            if cross_id in shared_question_outlier_ids:
+                reasons.append(
+                    "shared_question_bbox_for_spatially_separated_anchor"
+                )
             reasons.extend(geometry_reasons.get(cross_id, []))
         elif (
             anchor.get("source") in high_evidence_sources
@@ -1284,6 +1363,7 @@ def select_llm2_retry_anchors(
         if (
             anchor.get("source") == "cv_rejected_retained"
             and anchor.get("independent_scan_supported") is not True
+            and not strong_anomaly_reasons.intersection(reasons)
         ):
             suppressed.append(
                 {
@@ -1311,9 +1391,18 @@ def select_llm2_retry_anchors(
         "triggers": triggers,
         "suppressed": suppressed,
         "min_center_gap_ratio": min_center_gap_ratio,
+        "min_first_pass_question_cross_area_ratio": (
+            min_first_pass_question_cross_area_ratio
+        ),
+        "max_question_cross_iou": max_question_cross_iou,
+        "shared_question_iou_threshold": shared_question_iou_threshold,
+        "shared_question_min_anchor_distance_ratio": (
+            shared_question_min_anchor_distance_ratio
+        ),
         "policy": (
             "Only actionable first-pass anomalies receive a local LLM2 retry; "
-            "rejected CV anchors require independent scan support."
+            "strong LLM2 self-inconsistency may override rejected-anchor "
+            "source suppression."
         ),
     }
 
@@ -3418,6 +3507,24 @@ def run_cross_anchor_experiment(
         min_center_gap_ratio=float(
             config["cross_anchor_llm2_retry_min_center_gap_ratio"]
         ),
+        min_first_pass_question_cross_area_ratio=float(
+            config[
+                "cross_anchor_llm2_retry_first_pass_min_question_cross_area_ratio"
+            ]
+        ),
+        max_question_cross_iou=float(
+            config["cross_anchor_llm2_retry_max_question_cross_iou"]
+        ),
+        shared_question_iou_threshold=float(
+            config[
+                "cross_anchor_llm2_retry_shared_question_iou_threshold"
+            ]
+        ),
+        shared_question_min_anchor_distance_ratio=float(
+            config[
+                "cross_anchor_llm2_retry_shared_question_min_anchor_distance_ratio"
+            ]
+        ),
     )
     _write_json(experiment_dir / "llm2-retry-selection.json", retry_selection)
     retry_request_count = 0
@@ -3823,8 +3930,11 @@ def load_cross_cv_inputs(
         "cross_anchor_llm2_localization_runs",
         "cross_anchor_llm2_retry_min_center_gap_ratio",
         "cross_anchor_llm2_retry_crop_padding_ratio",
+        "cross_anchor_llm2_retry_first_pass_min_question_cross_area_ratio",
         "cross_anchor_llm2_retry_min_question_cross_area_ratio",
         "cross_anchor_llm2_retry_max_question_cross_iou",
+        "cross_anchor_llm2_retry_shared_question_iou_threshold",
+        "cross_anchor_llm2_retry_shared_question_min_anchor_distance_ratio",
         "cross_anchor_fallback_generates_anchors",
         "cross_anchor_retain_uncertain_candidates",
         "cross_anchor_retain_rejected_candidates",
@@ -3875,19 +3985,19 @@ def load_cross_cv_inputs(
         *positive_integer_fields,
         "red_min_channel",
         "red_min_excess",
+        "cross_anchor_llm2_retry_first_pass_min_question_cross_area_ratio",
         "cross_anchor_llm2_retry_min_question_cross_area_ratio",
         *boolean_fields,
     }
     for name in ratio_fields:
         if not 0 <= float(config[name]) <= 1:
             raise ValueError(f"{name} must be between 0 and 1")
-    if (
-        float(config["cross_anchor_llm2_retry_min_question_cross_area_ratio"])
-        <= 0
+    for name in (
+        "cross_anchor_llm2_retry_first_pass_min_question_cross_area_ratio",
+        "cross_anchor_llm2_retry_min_question_cross_area_ratio",
     ):
-        raise ValueError(
-            "cross_anchor_llm2_retry_min_question_cross_area_ratio must be positive"
-        )
+        if float(config[name]) <= 0:
+            raise ValueError(f"{name} must be positive")
     if float(config["arm_inner_radius_ratio"]) >= float(
         config["arm_outer_radius_ratio"]
     ):
