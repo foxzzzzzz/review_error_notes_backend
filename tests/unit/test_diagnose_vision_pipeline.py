@@ -868,7 +868,7 @@ def test_region_truth_comparison_reports_multiple_crosses_for_same_truth():
     assert comparison["unassigned_matched_cross_ids"] == [1]
 
 
-def test_question_event_clustering_groups_transitive_overlaps_without_rewriting_items():
+def test_question_events_preserve_distinct_cross_ids_despite_bbox_overlap():
     diagnostic = _load_script_module()
     result = diagnostic.CrossAnchoredQuestionResult.model_validate(
         {
@@ -914,19 +914,18 @@ def test_question_event_clustering_groups_transitive_overlaps_without_rewriting_
 
     audit = diagnostic.cluster_anchored_question_events(result, min_iou=0.2)
 
-    assert audit["event_count"] == 2
+    assert audit["event_count"] == 4
     assert audit["unmatched_cross_ids"] == [4]
     assert audit["events"][0] == {
         "event_id": 0,
-        "cross_ids": [0, 1, 2],
+        "cross_ids": [0],
         "representative_cross_id": 0,
-        "question_bboxes": [
-            [0.1, 0.1, 0.4, 0.4],
-            [0.2, 0.1, 0.5, 0.4],
-            [0.3, 0.1, 0.6, 0.4],
-        ],
+        "question_bboxes": [[0.1, 0.1, 0.4, 0.4]],
         "confidence": 0.95,
     }
+    assert audit["events"][1]["cross_ids"] == [1]
+    assert audit["events"][2]["cross_ids"] == [2]
+    assert audit["events"][3]["cross_ids"] == [3]
     assert [item.cross_id for item in result.items] == [0, 1, 2, 3, 4]
 
 
@@ -1011,6 +1010,84 @@ def test_question_event_truth_comparison_counts_duplicate_truth_events_as_false(
     assert comparison["false_event_ids"] == [1]
 
 
+def test_first_pass_llm2_risk_audit_identifies_true_anchor_localization_failures():
+    diagnostic = _load_script_module()
+    first_pass = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": True,
+                    "question_bbox": [0.05, 0.05, 0.25, 0.25],
+                    "unmatched_reason": None,
+                    "confidence": 0.9,
+                },
+                {
+                    "cross_id": 1,
+                    "matched": True,
+                    "question_bbox": [0.35, 0.35, 0.55, 0.55],
+                    "unmatched_reason": None,
+                    "confidence": 0.8,
+                },
+                {
+                    "cross_id": 2,
+                    "matched": False,
+                    "question_bbox": None,
+                    "unmatched_reason": "not found",
+                    "confidence": 0.7,
+                },
+            ]
+        }
+    )
+    anchors = [
+        {"cross_id": 0, "source": "cv_confirmed", "bbox": [0.1, 0.1, 0.2, 0.2]},
+        {"cross_id": 1, "source": "cv_confirmed", "bbox": [0.4, 0.4, 0.5, 0.5]},
+        {"cross_id": 2, "source": "cv_confirmed", "bbox": [0.7, 0.7, 0.8, 0.8]},
+    ]
+
+    audit = diagnostic.audit_first_pass_llm2_localization_risk(
+        first_pass,
+        anchors,
+        {
+            "assignments": [
+                {"candidate_id": 0, "truth_id": "T1"},
+                {"candidate_id": 1, "truth_id": None},
+                {"candidate_id": 2, "truth_id": "T3"},
+            ]
+        },
+        {
+            "items": [
+                {"cross_id": 0, "truth_id": "T2", "meets_threshold": True},
+                {"cross_id": 1, "truth_id": None, "meets_threshold": False},
+            ]
+        },
+        {
+            "violations": [
+                {
+                    "cross_id": 0,
+                    "reasons": ["question_bbox_not_near_cross"],
+                }
+            ]
+        },
+    )
+
+    assert audit["true_anchor_count"] == 2
+    assert audit["true_anchor_localization_failure_count"] == 2
+    assert audit["false_anchor_matched_count"] == 1
+    assert [item["localization_status"] for item in audit["items"]] == [
+        "wrong_truth",
+        "matched_false_anchor",
+        "unmatched_true_anchor",
+    ]
+    assert audit["items"][0]["question_cross_area_ratio"] == 4.0
+    assert audit["items"][0]["question_cross_width_ratio"] == 2.0
+    assert audit["items"][0]["question_cross_height_ratio"] == 2.0
+    assert audit["items"][0]["cross_center_gap_ratio"] == 0.0
+    assert audit["items"][0]["geometry_reasons"] == [
+        "question_bbox_not_near_cross"
+    ]
+
+
 def test_question_event_clustering_unions_two_llm2_runs_without_losing_disagreement():
     diagnostic = _load_script_module()
     runs = [
@@ -1072,10 +1149,9 @@ def test_question_event_clustering_unions_two_llm2_runs_without_losing_disagreem
 
     assert events["run_count"] == 2
     assert events["observation_count"] == 4
-    assert events["event_count"] == 3
+    assert events["event_count"] == 2
     assert events["events"][0]["observation_ids"] == ["run-001-cross-0", "run-002-cross-0"]
-    assert events["events"][1]["observation_ids"] == ["run-001-cross-1"]
-    assert events["events"][2]["observation_ids"] == ["run-002-cross-1"]
+    assert events["events"][1]["observation_ids"] == ["run-001-cross-1", "run-002-cross-1"]
     assert benefit == {
         "first_pass_matched_truth_count": 1,
         "union_matched_truth_count": 2,
@@ -1084,9 +1160,9 @@ def test_question_event_clustering_unions_two_llm2_runs_without_losing_disagreem
         "recovered_truth_count": 1,
         "remaining_missed_truth_ids": [],
         "first_pass_false_event_count": 1,
-        "union_false_event_count": 1,
+        "union_false_event_count": 0,
         "additional_false_event_count": 0,
-        "net_false_event_delta": 0,
+        "net_false_event_delta": -1,
         "first_pass_minimum_matched_truth_coverage": 1.0,
         "union_minimum_matched_truth_coverage": 1.0,
         "truth_recall_delta": 0.5,
@@ -1869,7 +1945,7 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
     assert summary["llm2_localization_run_count"] == 2
     assert summary["first_pass_stable_question_event_count"] == 2
     assert summary["first_pass_stable_truth_recall"] == 0.5
-    assert summary["stable_question_event_count"] == 3
+    assert summary["stable_question_event_count"] == 2
     assert summary["stable_truth_recall"] == 1.0
     assert summary["llm2_second_pass_recovered_truth_count"] == 1
     assert summary["llm2_second_pass_recovered_truth_ids"] == ["T2"]
@@ -1881,6 +1957,8 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
     assert summary["llm2_retry_accepted_count"] == 1
     assert summary["llm2_retry_rejected_count"] == 0
     assert summary["llm2_retry_suppressed_count"] == 0
+    assert summary["llm2_first_pass_true_anchor_localization_failure_count"] == 1
+    assert summary["llm2_first_pass_false_anchor_matched_count"] == 0
     assert summary["llm_request_count"] == 6
     assert summary["timings_ms"]["total"] >= 0
     assert summary["timings_ms"]["llm1_candidate_verification"] >= 0
@@ -1912,6 +1990,7 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
     assert (experiment_dir / "llm2-anchored-questions-run-001.json").is_file()
     assert (experiment_dir / "llm2-anchored-questions-run-002.json").is_file()
     assert (experiment_dir / "llm2-pass-benefit.json").is_file()
+    assert (experiment_dir / "llm2-first-pass-risk-audit.json").is_file()
     benefit = json.loads(
         (experiment_dir / "llm2-pass-benefit.json").read_text("utf-8")
     )
@@ -2674,6 +2753,8 @@ def test_comparison_summary_keeps_cross_anchor_stage_counts_separate():
             "llm2_retry_suppressed_count": 1,
             "llm2_retry_accepted_count": 1,
             "llm2_retry_rejected_count": 1,
+            "llm2_first_pass_true_anchor_localization_failure_count": 2,
+            "llm2_first_pass_false_anchor_matched_count": 1,
             "llm2_matched_question_count": 6,
             "llm2_unmatched_cross_count": 1,
             "llm2_assignment_audit_valid": True,
@@ -2722,6 +2803,12 @@ def test_comparison_summary_keeps_cross_anchor_stage_counts_separate():
     assert checkpoints["cross_anchor_llm2_retry_suppressed_count"] == 1
     assert checkpoints["cross_anchor_llm2_retry_accepted_count"] == 1
     assert checkpoints["cross_anchor_llm2_retry_rejected_count"] == 1
+    assert (
+        checkpoints[
+            "cross_anchor_llm2_first_pass_true_anchor_localization_failure_count"
+        ]
+        == 2
+    )
     assert checkpoints["cross_anchor_first_pass_stable_truth_recall"] == 0.833333
     assert checkpoints["cross_anchor_stable_truth_recall"] == 1.0
     assert checkpoints["cross_anchor_second_pass_recovered_truth_count"] == 1
@@ -2767,6 +2854,8 @@ def test_report_includes_cross_anchor_comparison_columns(tmp_path):
             "llm2_retry_suppressed_count": 1,
             "llm2_retry_accepted_count": 1,
             "llm2_retry_rejected_count": 1,
+            "llm2_first_pass_true_anchor_localization_failure_count": 2,
+            "llm2_first_pass_false_anchor_matched_count": 1,
             "geometry_violation_count": 1,
             "duplicate_question_candidate_count": 2,
             "duplicate_truth_candidate_count": 1,
@@ -2809,7 +2898,8 @@ def test_report_includes_cross_anchor_comparison_columns(tmp_path):
     assert "复查触发抑制" in report
     assert "复查结果接纳" in report
     assert "复查结果拒绝" in report
-    assert "合并最小真值覆盖" in report
+    assert "LLM2真锚定位失败" in report
+    assert "稳定最小真值覆盖" in report
     assert "fallback生成锚点" in report
 
 
