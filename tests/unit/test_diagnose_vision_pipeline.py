@@ -323,6 +323,8 @@ def test_load_cross_cv_inputs_requires_config_and_truth_for_every_label(tmp_path
                 "cross_anchor_llm2_localization_runs": 2,
                 "cross_anchor_llm2_retry_min_center_gap_ratio": 0.03,
                 "cross_anchor_llm2_retry_crop_padding_ratio": 0.12,
+                "cross_anchor_llm2_retry_min_question_cross_area_ratio": 1.5,
+                "cross_anchor_llm2_retry_max_question_cross_iou": 0.8,
                 "cross_anchor_fallback_generates_anchors": False,
                 "cross_anchor_retain_uncertain_candidates": True,
                 "cross_anchor_retain_rejected_candidates": True,
@@ -372,6 +374,8 @@ def test_load_cross_cv_inputs_requires_config_and_truth_for_every_label(tmp_path
     assert config["cross_anchor_llm2_localization_runs"] == 2
     assert config["cross_anchor_llm2_retry_min_center_gap_ratio"] == 0.03
     assert config["cross_anchor_llm2_retry_crop_padding_ratio"] == 0.12
+    assert config["cross_anchor_llm2_retry_min_question_cross_area_ratio"] == 1.5
+    assert config["cross_anchor_llm2_retry_max_question_cross_iou"] == 0.8
     assert truth["page33"][0]["truth_id"] == "T1"
     with pytest.raises(ValueError, match="missing truth page: page34"):
         diagnostic.load_cross_cv_inputs(
@@ -1183,6 +1187,7 @@ def test_llm2_retry_selection_targets_only_actionable_first_pass_results():
             "source": "cv_rejected_retained",
             "bbox": [0.4, 0.1, 0.5, 0.2],
             "confidence": 0.8,
+            "independent_scan_supported": True,
         },
         {
             "cross_id": 2,
@@ -1265,6 +1270,221 @@ def test_llm2_retry_selection_targets_only_actionable_first_pass_results():
             "cross_center_gap_ratio": None,
         },
     ]
+
+
+def test_llm2_retry_selection_suppresses_rejected_anchor_without_scan_support():
+    diagnostic = _load_script_module()
+    anchors = [
+        {
+            "cross_id": 9,
+            "source": "cv_rejected_retained",
+            "bbox": [0.25, 0.7, 0.36, 0.78],
+            "confidence": 0.75,
+            "independent_scan_supported": False,
+        }
+    ]
+    first_pass = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 9,
+                    "matched": True,
+                    "question_bbox": [0.08, 0.8, 0.32, 0.95],
+                    "unmatched_reason": None,
+                    "confidence": 0.9,
+                }
+            ]
+        }
+    )
+
+    selection = diagnostic.select_llm2_retry_anchors(
+        first_pass,
+        anchors,
+        {
+            "violations": [
+                {
+                    "cross_id": 9,
+                    "reasons": ["question_bbox_not_near_cross"],
+                    "question_area_ratio": 0.036,
+                }
+            ]
+        },
+        min_center_gap_ratio=0.03,
+    )
+
+    assert selection["trigger_count"] == 0
+    assert selection["anchors"] == []
+    assert selection["suppressed"] == [
+        {
+            "cross_id": 9,
+            "reasons": ["rejected_anchor_without_independent_scan_support"],
+            "candidate_reasons": [
+                "cross_center_outside_question_bbox",
+                "question_bbox_not_near_cross",
+            ],
+        }
+    ]
+
+
+def test_retry_decision_rejects_cross_copy_and_first_pass_duplicate():
+    diagnostic = _load_script_module()
+    first_pass = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": True,
+                    "question_bbox": [0.1, 0.1, 0.3, 0.3],
+                    "unmatched_reason": None,
+                    "confidence": 0.9,
+                },
+                {
+                    "cross_id": 1,
+                    "matched": False,
+                    "question_bbox": None,
+                    "unmatched_reason": "not found",
+                    "confidence": 0.9,
+                },
+                {
+                    "cross_id": 2,
+                    "matched": True,
+                    "question_bbox": [0.55, 0.55, 0.75, 0.75],
+                    "unmatched_reason": None,
+                    "confidence": 0.9,
+                },
+            ]
+        }
+    )
+    retry = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": True,
+                    "question_bbox": [0.102, 0.102, 0.198, 0.198],
+                    "unmatched_reason": None,
+                    "confidence": 0.92,
+                },
+                {
+                    "cross_id": 1,
+                    "matched": True,
+                    "question_bbox": [0.56, 0.56, 0.76, 0.76],
+                    "unmatched_reason": None,
+                    "confidence": 0.85,
+                },
+            ]
+        }
+    )
+    anchors = [
+        {"cross_id": 0, "bbox": [0.1, 0.1, 0.2, 0.2]},
+        {"cross_id": 1, "bbox": [0.6, 0.6, 0.7, 0.7]},
+    ]
+
+    accepted, audit = diagnostic.decide_llm2_retry_results(
+        first_pass,
+        retry,
+        anchors,
+        min_question_cross_area_ratio=1.5,
+        max_question_cross_iou=0.8,
+        duplicate_question_iou_threshold=0.2,
+    )
+
+    assert accepted.items == []
+    assert audit["accepted_count"] == 0
+    assert audit["rejected_count"] == 2
+    assert audit["decisions"][0]["reasons"] == [
+        "question_bbox_copies_cross",
+        "question_bbox_not_larger_than_cross",
+    ]
+    assert audit["decisions"][1]["reasons"] == [
+        "duplicates_first_pass_question"
+    ]
+
+
+def test_retry_decision_accepts_expanded_novel_question_region():
+    diagnostic = _load_script_module()
+    first_pass = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": False,
+                    "question_bbox": None,
+                    "unmatched_reason": "not found",
+                    "confidence": 0.8,
+                }
+            ]
+        }
+    )
+    retry = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": True,
+                    "question_bbox": [0.35, 0.35, 0.65, 0.65],
+                    "unmatched_reason": None,
+                    "confidence": 0.9,
+                }
+            ]
+        }
+    )
+
+    accepted, audit = diagnostic.decide_llm2_retry_results(
+        first_pass,
+        retry,
+        [{"cross_id": 0, "bbox": [0.45, 0.45, 0.55, 0.55]}],
+        min_question_cross_area_ratio=1.5,
+        max_question_cross_iou=0.8,
+        duplicate_question_iou_threshold=0.2,
+    )
+
+    assert [item.cross_id for item in accepted.items] == [0]
+    assert audit["accepted_count"] == 1
+    assert audit["rejected_count"] == 0
+    assert audit["decisions"][0]["accepted"] is True
+
+
+def test_retry_decision_allows_improved_bbox_for_same_cross():
+    diagnostic = _load_script_module()
+    first_pass = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": True,
+                    "question_bbox": [0.4, 0.4, 0.6, 0.6],
+                    "unmatched_reason": None,
+                    "confidence": 0.8,
+                }
+            ]
+        }
+    )
+    retry = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": True,
+                    "question_bbox": [0.35, 0.35, 0.65, 0.65],
+                    "unmatched_reason": None,
+                    "confidence": 0.9,
+                }
+            ]
+        }
+    )
+
+    accepted, audit = diagnostic.decide_llm2_retry_results(
+        first_pass,
+        retry,
+        [{"cross_id": 0, "bbox": [0.45, 0.45, 0.55, 0.55]}],
+        min_question_cross_area_ratio=1.5,
+        max_question_cross_iou=0.8,
+        duplicate_question_iou_threshold=0.2,
+    )
+
+    assert [item.cross_id for item in accepted.items] == [0]
+    assert audit["decisions"][0]["accepted"] is True
 
 
 def test_retry_crop_maps_anchor_and_question_bbox_between_coordinate_spaces(tmp_path):
@@ -1604,6 +1824,8 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
             "cross_anchor_llm2_localization_runs": 2,
             "cross_anchor_llm2_retry_min_center_gap_ratio": 0.03,
             "cross_anchor_llm2_retry_crop_padding_ratio": 0.2,
+            "cross_anchor_llm2_retry_min_question_cross_area_ratio": 1.5,
+            "cross_anchor_llm2_retry_max_question_cross_iou": 0.8,
             "cross_anchor_fallback_generates_anchors": False,
             "cross_anchor_retain_uncertain_candidates": True,
             "cross_anchor_retain_rejected_candidates": True,
@@ -1643,6 +1865,7 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
     assert summary["llm1_cv_rejected_retained_count"] == 1
     assert summary["llm1_fallback_cross_count"] == 0
     assert summary["llm1_fallback_verified_count"] == 1
+    assert summary["llm1_independent_supported_count"] == 1
     assert summary["llm2_localization_run_count"] == 2
     assert summary["first_pass_stable_question_event_count"] == 2
     assert summary["first_pass_stable_truth_recall"] == 0.5
@@ -1655,6 +1878,9 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
     assert summary["stable_minimum_matched_truth_coverage"] == 1.0
     assert summary["llm2_retry_trigger_count"] == 1
     assert summary["llm2_retry_request_count"] == 1
+    assert summary["llm2_retry_accepted_count"] == 1
+    assert summary["llm2_retry_rejected_count"] == 0
+    assert summary["llm2_retry_suppressed_count"] == 0
     assert summary["llm_request_count"] == 6
     assert summary["timings_ms"]["total"] >= 0
     assert summary["timings_ms"]["llm1_candidate_verification"] >= 0
@@ -1678,6 +1904,8 @@ def test_cross_anchor_experiment_runs_candidate_verification_and_region_localiza
     assert (experiment_dir / "llm2-run-001-batch-002-overlay.jpg").is_file()
     assert (experiment_dir / "llm2-retry-cross-001.jpg").is_file()
     assert (experiment_dir / "llm2-retry-selection.json").is_file()
+    assert (experiment_dir / "llm2-retry-decision-audit.json").is_file()
+    assert (experiment_dir / "llm2-accepted-retry-questions.json").is_file()
     assert (experiment_dir / "llm1-truth-comparison.json").is_file()
     assert (experiment_dir / "llm1-truth-multiplicity-audit.json").is_file()
     assert (experiment_dir / "llm2-anchored-questions.json").is_file()
@@ -1817,6 +2045,8 @@ def test_cross_anchor_experiment_skips_llm2_when_no_cross_is_confirmed(tmp_path)
             "question_truth_min_iou": 0.2,
             "cross_anchor_llm2_retry_min_center_gap_ratio": 0.03,
             "cross_anchor_llm2_retry_crop_padding_ratio": 0.12,
+            "cross_anchor_llm2_retry_min_question_cross_area_ratio": 1.5,
+            "cross_anchor_llm2_retry_max_question_cross_iou": 0.8,
             "cross_anchor_retain_uncertain_candidates": True,
             "cross_anchor_high_cv_min_arm_density": 0.25,
             "cross_anchor_high_cv_min_center_density": 0.7,
@@ -2441,6 +2671,9 @@ def test_comparison_summary_keeps_cross_anchor_stage_counts_separate():
             "llm2_localization_run_count": 2,
             "llm2_retry_trigger_count": 2,
             "llm2_retry_request_count": 2,
+            "llm2_retry_suppressed_count": 1,
+            "llm2_retry_accepted_count": 1,
+            "llm2_retry_rejected_count": 1,
             "llm2_matched_question_count": 6,
             "llm2_unmatched_cross_count": 1,
             "llm2_assignment_audit_valid": True,
@@ -2486,6 +2719,9 @@ def test_comparison_summary_keeps_cross_anchor_stage_counts_separate():
     assert checkpoints["cross_anchor_llm2_localization_run_count"] == 2
     assert checkpoints["cross_anchor_llm2_retry_trigger_count"] == 2
     assert checkpoints["cross_anchor_llm2_retry_request_count"] == 2
+    assert checkpoints["cross_anchor_llm2_retry_suppressed_count"] == 1
+    assert checkpoints["cross_anchor_llm2_retry_accepted_count"] == 1
+    assert checkpoints["cross_anchor_llm2_retry_rejected_count"] == 1
     assert checkpoints["cross_anchor_first_pass_stable_truth_recall"] == 0.833333
     assert checkpoints["cross_anchor_stable_truth_recall"] == 1.0
     assert checkpoints["cross_anchor_second_pass_recovered_truth_count"] == 1
@@ -2528,6 +2764,9 @@ def test_report_includes_cross_anchor_comparison_columns(tmp_path):
             "llm2_assignment_audit_valid": True,
             "llm2_retry_trigger_count": 2,
             "llm2_retry_request_count": 2,
+            "llm2_retry_suppressed_count": 1,
+            "llm2_retry_accepted_count": 1,
+            "llm2_retry_rejected_count": 1,
             "geometry_violation_count": 1,
             "duplicate_question_candidate_count": 2,
             "duplicate_truth_candidate_count": 1,
@@ -2567,6 +2806,9 @@ def test_report_includes_cross_anchor_comparison_columns(tmp_path):
     assert "定向复查新增误报" in report
     assert "定向复查触发" in report
     assert "定向复查请求" in report
+    assert "复查触发抑制" in report
+    assert "复查结果接纳" in report
+    assert "复查结果拒绝" in report
     assert "合并最小真值覆盖" in report
     assert "fallback生成锚点" in report
 
@@ -2644,6 +2886,8 @@ def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
                     "cross_anchor_llm2_localization_runs": 2,
                     "cross_anchor_llm2_retry_min_center_gap_ratio": 0.03,
                     "cross_anchor_llm2_retry_crop_padding_ratio": 0.12,
+                    "cross_anchor_llm2_retry_min_question_cross_area_ratio": 1.5,
+                    "cross_anchor_llm2_retry_max_question_cross_iou": 0.8,
                     "cross_anchor_fallback_generates_anchors": False,
                     "cross_anchor_retain_uncertain_candidates": True,
                     "cross_anchor_retain_rejected_candidates": True,

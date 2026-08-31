@@ -1151,6 +1151,23 @@ def build_cross_anchors(
     ]
 
 
+def mark_existing_anchor_scan_support(
+    anchors: list[dict],
+    independent_scan: IndependentCrossScanResult,
+    *,
+    min_iou: float,
+    max_center_distance_ratio: float,
+) -> None:
+    for anchor in anchors:
+        if any(
+            _bbox_iou(anchor["bbox"], cross.bbox) >= min_iou
+            or _bbox_center_distance(anchor["bbox"], cross.bbox)
+            <= max_center_distance_ratio
+            for cross in independent_scan.crosses
+        ):
+            anchor["independent_scan_supported"] = True
+
+
 def audit_cross_anchor_assignments(
     result: CrossAnchoredQuestionResult,
     cross_ids: list[int],
@@ -1241,6 +1258,7 @@ def select_llm2_retry_anchors(
     }
     selected = []
     triggers = []
+    suppressed = []
     for anchor in anchors:
         cross_id = anchor["cross_id"]
         item = items_by_id[cross_id]
@@ -1263,6 +1281,20 @@ def select_llm2_retry_anchors(
             reasons.append("unmatched_high_evidence_anchor")
         if not reasons:
             continue
+        if (
+            anchor.get("source") == "cv_rejected_retained"
+            and anchor.get("independent_scan_supported") is not True
+        ):
+            suppressed.append(
+                {
+                    "cross_id": cross_id,
+                    "reasons": [
+                        "rejected_anchor_without_independent_scan_support"
+                    ],
+                    "candidate_reasons": sorted(set(reasons)),
+                }
+            )
+            continue
         selected.append(anchor)
         triggers.append(
             {
@@ -1277,8 +1309,95 @@ def select_llm2_retry_anchors(
         "trigger_count": len(triggers),
         "anchors": selected,
         "triggers": triggers,
+        "suppressed": suppressed,
         "min_center_gap_ratio": min_center_gap_ratio,
-        "policy": "Only actionable first-pass anomalies receive a local LLM2 retry.",
+        "policy": (
+            "Only actionable first-pass anomalies receive a local LLM2 retry; "
+            "rejected CV anchors require independent scan support."
+        ),
+    }
+
+
+def decide_llm2_retry_results(
+    first_pass: CrossAnchoredQuestionResult,
+    retry: CrossAnchoredQuestionResult,
+    anchors: list[dict],
+    *,
+    min_question_cross_area_ratio: float,
+    max_question_cross_iou: float,
+    duplicate_question_iou_threshold: float,
+) -> tuple[CrossAnchoredQuestionResult, dict]:
+    anchor_by_id = {anchor["cross_id"]: anchor for anchor in anchors}
+    first_pass_bboxes = [
+        (item.cross_id, item.question_bbox)
+        for item in first_pass.items
+        if item.matched and item.question_bbox is not None
+    ]
+    accepted_items = []
+    decisions = []
+    for item in retry.items:
+        reasons = []
+        metrics = {
+            "question_cross_area_ratio": None,
+            "question_cross_iou": None,
+            "max_first_pass_question_iou": None,
+        }
+        anchor = anchor_by_id.get(item.cross_id)
+        if not item.matched or item.question_bbox is None:
+            reasons.append("retry_unmatched")
+        elif anchor is None:
+            reasons.append("unknown_cross_id")
+        else:
+            cross_bbox = anchor["bbox"]
+            cross_area = _bbox_area(cross_bbox)
+            question_area = _bbox_area(item.question_bbox)
+            area_ratio = question_area / cross_area if cross_area > 0 else 0.0
+            cross_iou = _bbox_iou(item.question_bbox, cross_bbox)
+            metrics["question_cross_area_ratio"] = round(area_ratio, 6)
+            metrics["question_cross_iou"] = round(cross_iou, 6)
+            if cross_iou > max_question_cross_iou:
+                reasons.append("question_bbox_copies_cross")
+            if area_ratio < min_question_cross_area_ratio:
+                reasons.append("question_bbox_not_larger_than_cross")
+            if not reasons:
+                max_first_pass_iou = max(
+                    (
+                        _bbox_iou(item.question_bbox, bbox)
+                        for cross_id, bbox in first_pass_bboxes
+                        if cross_id != item.cross_id
+                    ),
+                    default=0.0,
+                )
+                metrics["max_first_pass_question_iou"] = round(
+                    max_first_pass_iou, 6
+                )
+                if max_first_pass_iou >= duplicate_question_iou_threshold:
+                    reasons.append("duplicates_first_pass_question")
+        accepted = not reasons
+        if accepted:
+            accepted_items.append(item.model_dump())
+        decisions.append(
+            {
+                "cross_id": item.cross_id,
+                "accepted": accepted,
+                "reasons": sorted(set(reasons)),
+                **metrics,
+            }
+        )
+    accepted_result = CrossAnchoredQuestionResult.model_validate(
+        {"items": accepted_items}
+    )
+    return accepted_result, {
+        "accepted_count": len(accepted_items),
+        "rejected_count": len(decisions) - len(accepted_items),
+        "min_question_cross_area_ratio": min_question_cross_area_ratio,
+        "max_question_cross_iou": max_question_cross_iou,
+        "duplicate_question_iou_threshold": duplicate_question_iou_threshold,
+        "decisions": decisions,
+        "policy": (
+            "Retry output is a challenger: only expanded, non-copying, novel "
+            "question regions may join first-pass events."
+        ),
     }
 
 
@@ -2511,6 +2630,15 @@ def build_summary(
         "cross_anchor_llm2_retry_request_count": (
             cross_anchor_experiment or {}
         ).get("llm2_retry_request_count"),
+        "cross_anchor_llm2_retry_suppressed_count": (
+            cross_anchor_experiment or {}
+        ).get("llm2_retry_suppressed_count"),
+        "cross_anchor_llm2_retry_accepted_count": (
+            cross_anchor_experiment or {}
+        ).get("llm2_retry_accepted_count"),
+        "cross_anchor_llm2_retry_rejected_count": (
+            cross_anchor_experiment or {}
+        ).get("llm2_retry_rejected_count"),
         "cross_anchor_geometry_violation_count": (
             cross_anchor_experiment or {}
         ).get("geometry_violation_count"),
@@ -2996,19 +3124,33 @@ def run_cross_anchor_experiment(
     fallback_generates_anchors = bool(
         config.get("cross_anchor_fallback_generates_anchors", True)
     )
-    verified_independent_scan = IndependentCrossScanResult(
+    retained_independent_scan = IndependentCrossScanResult(
         crosses=[
             cross
             for candidate_id, cross in enumerate(independent_scan.crosses)
-            if fallback_generates_anchors
-            and candidate_id in retained_fallback_ids
+            if candidate_id in retained_fallback_ids
         ]
+    )
+    verified_independent_scan = IndependentCrossScanResult(
+        crosses=(
+            retained_independent_scan.crosses
+            if fallback_generates_anchors
+            else []
+        )
     )
     anchors = build_cross_anchors(
         verification,
         verified_independent_scan,
         cv_candidates,
         config,
+    )
+    mark_existing_anchor_scan_support(
+        anchors,
+        retained_independent_scan,
+        min_iou=float(config["cross_anchor_fallback_merge_iou_threshold"]),
+        max_center_distance_ratio=float(
+            config["cross_anchor_fallback_merge_center_distance_ratio"]
+        ),
     )
     anchor_merge_audit = {
         "cv_dedupe_iou_threshold": config[
@@ -3160,6 +3302,24 @@ def run_cross_anchor_experiment(
     )
     _write_json(experiment_dir / "llm2-retry-selection.json", retry_selection)
     retry_request_count = 0
+    retry_decision_audit = {
+        "accepted_count": 0,
+        "rejected_count": 0,
+        "min_question_cross_area_ratio": float(
+            config["cross_anchor_llm2_retry_min_question_cross_area_ratio"]
+        ),
+        "max_question_cross_iou": float(
+            config["cross_anchor_llm2_retry_max_question_cross_iou"]
+        ),
+        "duplicate_question_iou_threshold": float(
+            config["cross_anchor_duplicate_question_iou_threshold"]
+        ),
+        "decisions": [],
+        "policy": (
+            "Retry output is a challenger: only expanded, non-copying, novel "
+            "question regions may join first-pass events."
+        ),
+    }
     if llm2_run_count >= 2:
         retry_started = time.perf_counter()
         retry_items = []
@@ -3195,7 +3355,6 @@ def run_cross_anchor_experiment(
             )
             retry_items.extend(mapped_result.items)
         retry_run = CrossAnchoredQuestionResult(items=retry_items)
-        llm2_runs.append(retry_run)
         _write_json(
             experiment_dir / "llm2-anchored-questions-run-002.json",
             retry_run,
@@ -3225,10 +3384,35 @@ def run_cross_anchor_experiment(
             experiment_dir / "question-geometry-audit-run-002.json",
             retry_geometry_audit,
         )
+        accepted_retry_run, retry_decision_audit = decide_llm2_retry_results(
+            first_run,
+            retry_run,
+            retry_selection["anchors"],
+            min_question_cross_area_ratio=float(
+                config[
+                    "cross_anchor_llm2_retry_min_question_cross_area_ratio"
+                ]
+            ),
+            max_question_cross_iou=float(
+                config["cross_anchor_llm2_retry_max_question_cross_iou"]
+            ),
+            duplicate_question_iou_threshold=float(
+                config["cross_anchor_duplicate_question_iou_threshold"]
+            ),
+        )
+        llm2_runs.append(accepted_retry_run)
+        _write_json(
+            experiment_dir / "llm2-accepted-retry-questions.json",
+            accepted_retry_run,
+        )
         timings_ms["llm2_localization_run_002"] = round(
             (time.perf_counter() - retry_started) * 1000,
             2,
         )
+    _write_json(
+        experiment_dir / "llm2-retry-decision-audit.json",
+        retry_decision_audit,
+    )
     timings_ms["llm2_localization"] = round(
         (time.perf_counter() - llm2_started) * 1000, 2
     )
@@ -3387,6 +3571,9 @@ def run_cross_anchor_experiment(
         "llm2_localization_run_count": len(llm2_runs),
         "llm2_retry_trigger_count": retry_selection["trigger_count"],
         "llm2_retry_request_count": retry_request_count,
+        "llm2_retry_suppressed_count": len(retry_selection["suppressed"]),
+        "llm2_retry_accepted_count": retry_decision_audit["accepted_count"],
+        "llm2_retry_rejected_count": retry_decision_audit["rejected_count"],
         "geometry_violation_count": len(geometry_audit["violations"]),
         "duplicate_question_candidate_count": len(
             duplicate_question_audit["duplicate_candidates"]
@@ -3498,6 +3685,8 @@ def load_cross_cv_inputs(
         "cross_anchor_llm2_localization_runs",
         "cross_anchor_llm2_retry_min_center_gap_ratio",
         "cross_anchor_llm2_retry_crop_padding_ratio",
+        "cross_anchor_llm2_retry_min_question_cross_area_ratio",
+        "cross_anchor_llm2_retry_max_question_cross_iou",
         "cross_anchor_fallback_generates_anchors",
         "cross_anchor_retain_uncertain_candidates",
         "cross_anchor_retain_rejected_candidates",
@@ -3548,11 +3737,19 @@ def load_cross_cv_inputs(
         *positive_integer_fields,
         "red_min_channel",
         "red_min_excess",
+        "cross_anchor_llm2_retry_min_question_cross_area_ratio",
         *boolean_fields,
     }
     for name in ratio_fields:
         if not 0 <= float(config[name]) <= 1:
             raise ValueError(f"{name} must be between 0 and 1")
+    if (
+        float(config["cross_anchor_llm2_retry_min_question_cross_area_ratio"])
+        <= 0
+    ):
+        raise ValueError(
+            "cross_anchor_llm2_retry_min_question_cross_area_ratio must be positive"
+        )
     if float(config["arm_inner_radius_ratio"]) >= float(
         config["arm_outer_radius_ratio"]
     ):
@@ -3674,16 +3871,16 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
             "",
             "## 召回优先新方案判定",
             "",
-            "> 稳定错题事件由LLM2原始错题框做审计性聚类得到，不改写模型原始返回；目标是稳定真值召回为1.0，允许存在误报事件。",
+            "> 首轮LLM2结果始终保留，只有经过本地审核合格的定向复查结果才会加入稳定事件；目标是稳定真值召回为1.0，允许存在误报事件。",
             "",
-            "| 图片 | LLM1核验次数 | 不稳定CV候选 | 保留LLM1拒绝CV | fallback uncertain审计 | fallback生成锚点 | LLM2定位次数 | 定向复查触发 | 定向复查请求 | 第一次真值召回 | 第一次最小真值覆盖 | 定向复查新增找回 | 定向复查新增误报 | 稳定错题事件 | 合并真值命中 | 合并真值召回 | 合并最小真值覆盖 | 合并误报事件 | 新方案LLM请求 |",
-            "|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 图片 | LLM1核验次数 | 不稳定CV候选 | 保留LLM1拒绝CV | fallback uncertain审计 | fallback生成锚点 | LLM2定位次数 | 定向复查触发 | 定向复查请求 | 复查触发抑制 | 复查结果接纳 | 复查结果拒绝 | 第一次真值召回 | 第一次最小真值覆盖 | 定向复查新增找回 | 定向复查新增误报 | 稳定错题事件 | 合并真值命中 | 合并真值召回 | 合并最小真值覆盖 | 合并误报事件 | 新方案LLM请求 |",
+            "|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for summary in summaries:
         item = summary["checkpoints"]
         lines.append(
-            "| {label} | {runs} | {unstable} | {rejected} | {fallback_uncertain} | {fallback_generates} | {llm2_runs} | {retry_triggers} | {retry_requests} | {first_recall} | {first_coverage} | {recovered} | {additional_false} | {events} | {matched} | {recall} | {union_coverage} | {false_events} | {requests} |".format(
+            "| {label} | {runs} | {unstable} | {rejected} | {fallback_uncertain} | {fallback_generates} | {llm2_runs} | {retry_triggers} | {retry_requests} | {retry_suppressed} | {retry_accepted} | {retry_rejected} | {first_recall} | {first_coverage} | {recovered} | {additional_false} | {events} | {matched} | {recall} | {union_coverage} | {false_events} | {requests} |".format(
                 label=summary["label"],
                 runs=item["cross_anchor_llm1_verification_run_count"],
                 unstable=item["cross_anchor_llm1_unstable_candidate_count"],
@@ -3697,6 +3894,15 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
                 llm2_runs=item["cross_anchor_llm2_localization_run_count"],
                 retry_triggers=item["cross_anchor_llm2_retry_trigger_count"],
                 retry_requests=item["cross_anchor_llm2_retry_request_count"],
+                retry_suppressed=item[
+                    "cross_anchor_llm2_retry_suppressed_count"
+                ],
+                retry_accepted=item[
+                    "cross_anchor_llm2_retry_accepted_count"
+                ],
+                retry_rejected=item[
+                    "cross_anchor_llm2_retry_rejected_count"
+                ],
                 first_recall=item[
                     "cross_anchor_first_pass_stable_truth_recall"
                 ],
