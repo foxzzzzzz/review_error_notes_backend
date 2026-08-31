@@ -122,7 +122,7 @@ FALLBACK_CROSS_VERIFICATION_PROMPT = """你是小学作业独立扫描红叉复�
 """
 
 
-CROSS_ANCHORED_QUESTION_PROMPT = """你是小学作业红叉锚定错题区域定位器。图片是在原始整页作业上叠加了蓝色 C0、C1... 编号框的红叉候选；输入 JSON 给出每个 cross_id 的坐标和来源风险。
+CROSS_ANCHORED_QUESTION_PROMPT = """你是小学作业红叉锚定错题区域定位器。图片可能是原始整页作业，也可能是单个可疑红叉附近的局部放大图；图片上叠加了蓝色 C0、C1... 编号框，输入 JSON 给出每个 cross_id 在当前输入图片坐标系中的位置和来源风险。
 
 本阶段唯一目标：逐个判断红叉候选能否关联到一个明确的最小独立作答单元，并只返回完整 question_bbox。不要识别或返回题目文字、学生答案、正确答案、题型、标签、难度、红圈或教师批注。
 
@@ -132,7 +132,7 @@ CROSS_ANCHORED_QUESTION_PROMPT = """你是小学作业红叉锚定错题区域�
 3. question_bbox 不得直接复制红叉框。红叉框只标出批改痕迹，question_bbox 必须扩展到完整印刷提示和学生作答；如果无法看清完整边界，返回 matched=false。
 4. source=llm_fallback 表示低可信独立扫描结果，不得默认其为真实红叉，必须根据图片重新核验。
 5. matched=false 时 question_bbox 必须为 null；matched=true 时 unmatched_reason 应为 null。
-6. question_bbox 使用原始整页归一化 [left, top, right, bottom]。蓝色编号框只是提示，不是图片原有内容。
+6. question_bbox 使用当前输入图片的归一化 [left, top, right, bottom]。若 anchor 的 image_scope=local_retry_crop，必须按当前局部放大图返回坐标；蓝色编号框只是提示，不是图片原有内容。
 7. 只返回严格 JSON，不要解释或 Markdown。
 
 返回格式：{"items":[{"cross_id":0,"matched":true,"question_bbox":[0.1,0.2,0.4,0.5],"unmatched_reason":null,"confidence":0.95},{"cross_id":1,"matched":false,"question_bbox":null,"unmatched_reason":"不是明确红叉","confidence":0.8}]}。
@@ -1214,6 +1214,170 @@ def audit_anchored_question_geometry(
     }
 
 
+def _point_bbox_gap_distance(point: tuple[float, float], bbox: list[float]) -> float:
+    x, y = point
+    dx = max(bbox[0] - x, 0.0, x - bbox[2])
+    dy = max(bbox[1] - y, 0.0, y - bbox[3])
+    return math.hypot(dx, dy)
+
+
+def select_llm2_retry_anchors(
+    first_pass: CrossAnchoredQuestionResult,
+    anchors: list[dict],
+    geometry_audit: dict,
+    *,
+    min_center_gap_ratio: float,
+) -> dict:
+    items_by_id = {item.cross_id: item for item in first_pass.items}
+    geometry_reasons = {
+        violation["cross_id"]: list(violation["reasons"])
+        for violation in geometry_audit["violations"]
+    }
+    high_evidence_sources = {
+        "cv_confirmed",
+        "cv_uncertain",
+        "cv_high_score_retained",
+        "llm_fallback",
+    }
+    selected = []
+    triggers = []
+    for anchor in anchors:
+        cross_id = anchor["cross_id"]
+        item = items_by_id[cross_id]
+        reasons = []
+        center_gap = None
+        if item.matched and item.question_bbox is not None:
+            cross_bbox = anchor["bbox"]
+            cross_center = (
+                (cross_bbox[0] + cross_bbox[2]) / 2,
+                (cross_bbox[1] + cross_bbox[3]) / 2,
+            )
+            center_gap = _point_bbox_gap_distance(cross_center, item.question_bbox)
+            if center_gap > min_center_gap_ratio:
+                reasons.append("cross_center_outside_question_bbox")
+            reasons.extend(geometry_reasons.get(cross_id, []))
+        elif (
+            anchor.get("source") in high_evidence_sources
+            or anchor.get("independent_scan_supported") is True
+        ):
+            reasons.append("unmatched_high_evidence_anchor")
+        if not reasons:
+            continue
+        selected.append(anchor)
+        triggers.append(
+            {
+                "cross_id": cross_id,
+                "reasons": sorted(set(reasons)),
+                "cross_center_gap_ratio": (
+                    round(center_gap, 6) if center_gap is not None else None
+                ),
+            }
+        )
+    return {
+        "trigger_count": len(triggers),
+        "anchors": selected,
+        "triggers": triggers,
+        "min_center_gap_ratio": min_center_gap_ratio,
+        "policy": "Only actionable first-pass anomalies receive a local LLM2 retry.",
+    }
+
+
+def _map_bbox_to_crop(bbox: list[float], crop_bbox: list[float]) -> list[float]:
+    crop_width = crop_bbox[2] - crop_bbox[0]
+    crop_height = crop_bbox[3] - crop_bbox[1]
+    return [
+        (bbox[0] - crop_bbox[0]) / crop_width,
+        (bbox[1] - crop_bbox[1]) / crop_height,
+        (bbox[2] - crop_bbox[0]) / crop_width,
+        (bbox[3] - crop_bbox[1]) / crop_height,
+    ]
+
+
+def _map_bbox_from_crop(bbox: list[float], crop_bbox: list[float]) -> list[float]:
+    crop_width = crop_bbox[2] - crop_bbox[0]
+    crop_height = crop_bbox[3] - crop_bbox[1]
+    return [
+        crop_bbox[0] + bbox[0] * crop_width,
+        crop_bbox[1] + bbox[1] * crop_height,
+        crop_bbox[0] + bbox[2] * crop_width,
+        crop_bbox[1] + bbox[3] * crop_height,
+    ]
+
+
+def write_cross_anchor_retry_crop(
+    image_path: Path,
+    output_path: Path,
+    anchor: dict,
+    *,
+    padding_ratio: float,
+) -> dict:
+    bbox = anchor["bbox"]
+    crop_bbox = [
+        max(0.0, bbox[0] - padding_ratio),
+        max(0.0, bbox[1] - padding_ratio),
+        min(1.0, bbox[2] + padding_ratio),
+        min(1.0, bbox[3] + padding_ratio),
+    ]
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+    pixel_bbox = (
+        round(crop_bbox[0] * image.width),
+        round(crop_bbox[1] * image.height),
+        round(crop_bbox[2] * image.width),
+        round(crop_bbox[3] * image.height),
+    )
+    crop = image.crop(pixel_bbox)
+    mapped_anchor = {
+        **anchor,
+        "bbox": _map_bbox_to_crop(bbox, crop_bbox),
+        "image_scope": "local_retry_crop",
+    }
+    draw = ImageDraw.Draw(crop)
+    local_bbox = mapped_anchor["bbox"]
+    draw.rectangle(
+        (
+            local_bbox[0] * crop.width,
+            local_bbox[1] * crop.height,
+            local_bbox[2] * crop.width,
+            local_bbox[3] * crop.height,
+        ),
+        outline="blue",
+        width=max(2, round(min(crop.width, crop.height) * 0.005)),
+    )
+    draw.text(
+        (local_bbox[0] * crop.width, local_bbox[1] * crop.height),
+        f"C{anchor['cross_id']}",
+        fill="blue",
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    crop.save(output_path, format="JPEG", quality=92)
+    return {
+        "source_crop_bbox": crop_bbox,
+        "anchor": mapped_anchor,
+    }
+
+
+def map_retry_result_to_source(
+    result: CrossAnchoredQuestionResult,
+    source_crop_bbox: list[float],
+) -> CrossAnchoredQuestionResult:
+    return CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    **item.model_dump(),
+                    "question_bbox": (
+                        _map_bbox_from_crop(item.question_bbox, source_crop_bbox)
+                        if item.question_bbox is not None
+                        else None
+                    ),
+                }
+                for item in result.items
+            ]
+        }
+    )
+
+
 def audit_duplicate_anchored_questions(
     result: CrossAnchoredQuestionResult,
     *,
@@ -1315,30 +1479,33 @@ def cluster_anchored_question_runs(
         for item in result.items
         if item.matched and item.question_bbox is not None
     ]
-    remaining = {
-        observation["observation_id"]: observation
-        for observation in observations
-    }
+    first_pass = cluster_anchored_question_events(runs[0], min_iou=min_iou)
     clusters = []
-    while remaining:
-        first_id = next(iter(remaining))
-        cluster = [remaining.pop(first_id)]
-        index = 0
-        while index < len(cluster):
-            current = cluster[index]
-            connected_ids = [
-                observation_id
-                for observation_id, candidate in remaining.items()
-                if _bbox_iou(
-                    current["question_bbox"],
-                    candidate["question_bbox"],
-                )
-                >= min_iou
-            ]
-            for observation_id in connected_ids:
-                cluster.append(remaining.pop(observation_id))
-            index += 1
+    base_event_by_cross_id = {}
+    observation_by_id = {
+        observation["observation_id"]: observation for observation in observations
+    }
+    for event in first_pass["events"]:
+        cluster = [
+            observation_by_id[f"run-001-cross-{cross_id}"]
+            for cross_id in event["cross_ids"]
+        ]
+        cluster_index = len(clusters)
         clusters.append(cluster)
+        for cross_id in event["cross_ids"]:
+            base_event_by_cross_id[cross_id] = cluster_index
+    for observation in observations:
+        if observation["run_index"] == 1:
+            continue
+        base_index = base_event_by_cross_id.get(observation["cross_id"])
+        if base_index is not None and any(
+            _bbox_iou(observation["question_bbox"], existing["question_bbox"])
+            >= min_iou
+            for existing in clusters[base_index]
+        ):
+            clusters[base_index].append(observation)
+        else:
+            clusters.append([observation])
 
     events = []
     for event_id, cluster in enumerate(clusters):
@@ -1379,26 +1546,45 @@ def cluster_anchored_question_runs(
             if not item.matched
         ),
         "events": events,
-        "policy": "All LLM2 runs are unioned, then IoU-clustered without discarding disagreements.",
+        "policy": (
+            "First-pass event boundaries are preserved; retry observations may join "
+            "their own overlapping first-pass event but cannot bridge distinct events."
+        ),
     }
 
 
 def compare_llm2_pass_benefit(first_pass: dict, union: dict) -> dict:
+    effective_matched_truth_ids = sorted(
+        set(first_pass["matched_truth_ids"]) | set(union["matched_truth_ids"])
+    )
     recovered_truth_ids = sorted(
         set(union["matched_truth_ids"]) - set(first_pass["matched_truth_ids"])
     )
+    remaining_missed_truth_ids = sorted(
+        set(first_pass["missed_truth_ids"]) & set(union["missed_truth_ids"])
+    )
+    false_event_delta = len(union["false_event_ids"]) - len(
+        first_pass["false_event_ids"]
+    )
+    truth_count = len(effective_matched_truth_ids) + len(remaining_missed_truth_ids)
+    effective_truth_recall = (
+        len(effective_matched_truth_ids) / truth_count if truth_count else None
+    )
     return {
         "first_pass_matched_truth_count": first_pass["matched_truth_count"],
-        "union_matched_truth_count": union["matched_truth_count"],
+        "union_matched_truth_count": len(effective_matched_truth_ids),
+        "union_truth_recall": (
+            round(effective_truth_recall, 6)
+            if effective_truth_recall is not None
+            else None
+        ),
         "recovered_truth_ids": recovered_truth_ids,
         "recovered_truth_count": len(recovered_truth_ids),
-        "remaining_missed_truth_ids": union["missed_truth_ids"],
+        "remaining_missed_truth_ids": remaining_missed_truth_ids,
         "first_pass_false_event_count": len(first_pass["false_event_ids"]),
         "union_false_event_count": len(union["false_event_ids"]),
-        "additional_false_event_count": (
-            len(union["false_event_ids"])
-            - len(first_pass["false_event_ids"])
-        ),
+        "additional_false_event_count": max(0, false_event_delta),
+        "net_false_event_delta": false_event_delta,
         "first_pass_minimum_matched_truth_coverage": first_pass[
             "minimum_matched_truth_coverage"
         ],
@@ -1406,7 +1592,7 @@ def compare_llm2_pass_benefit(first_pass: dict, union: dict) -> dict:
             "minimum_matched_truth_coverage"
         ],
         "truth_recall_delta": round(
-            union["truth_recall"] - first_pass["truth_recall"],
+            effective_truth_recall - first_pass["truth_recall"],
             6,
         ),
     }
@@ -2319,6 +2505,12 @@ def build_summary(
         "cross_anchor_llm2_localization_run_count": (
             cross_anchor_experiment or {}
         ).get("llm2_localization_run_count"),
+        "cross_anchor_llm2_retry_trigger_count": (
+            cross_anchor_experiment or {}
+        ).get("llm2_retry_trigger_count"),
+        "cross_anchor_llm2_retry_request_count": (
+            cross_anchor_experiment or {}
+        ).get("llm2_retry_request_count"),
         "cross_anchor_geometry_violation_count": (
             cross_anchor_experiment or {}
         ).get("geometry_violation_count"),
@@ -2902,65 +3094,139 @@ def run_cross_anchor_experiment(
     llm2_runs = []
     assignment_audits = []
     geometry_audits = []
-    for run_index in range(1, llm2_run_count + 1):
-        run_started = time.perf_counter()
-        anchored_items = []
-        for batch_index, start in enumerate(
-            range(0, len(anchors), batch_size),
-            1,
-        ):
+    run_started = time.perf_counter()
+    anchored_items = []
+    for batch_index, start in enumerate(range(0, len(anchors), batch_size), 1):
+        llm2_batch_count += 1
+        batch = anchors[start : start + batch_size]
+        batch_entries = [
+            {"mark_id": anchor["cross_id"], "bbox": anchor["bbox"]}
+            for anchor in batch
+        ]
+        batch_overlay_path = experiment_dir / (
+            f"llm2-run-001-batch-{batch_index:03d}-overlay.jpg"
+        )
+        _draw_boxes(
+            image_path,
+            batch_overlay_path,
+            [("C", batch_entries, "blue")],
+        )
+        batch_result = client.locate_cross_anchored_questions(
+            str(batch_overlay_path),
+            batch,
+            subject_hint,
+        )
+        anchored_items.extend(batch_result.items)
+    first_run = CrossAnchoredQuestionResult(items=anchored_items)
+    llm2_runs.append(first_run)
+    _write_json(
+        experiment_dir / "llm2-anchored-questions-run-001.json",
+        first_run,
+    )
+    first_assignment_audit = audit_cross_anchor_assignments(
+        first_run,
+        [anchor["cross_id"] for anchor in anchors],
+    )
+    assignment_audits.append(first_assignment_audit)
+    _write_json(
+        experiment_dir / "llm2-cross-assignment-audit-run-001.json",
+        first_assignment_audit,
+    )
+    if not first_assignment_audit["valid"]:
+        raise ValueError("cross anchor assignment audit failed")
+    first_geometry_audit = audit_anchored_question_geometry(
+        first_run,
+        anchors,
+        max_area_ratio=float(config["cross_anchor_question_max_area_ratio"]),
+        max_gap_ratio=float(config["cross_anchor_question_max_gap_ratio"]),
+    )
+    geometry_audits.append(first_geometry_audit)
+    _write_json(
+        experiment_dir / "question-geometry-audit-run-001.json",
+        first_geometry_audit,
+    )
+    timings_ms["llm2_localization_run_001"] = round(
+        (time.perf_counter() - run_started) * 1000,
+        2,
+    )
+
+    retry_selection = select_llm2_retry_anchors(
+        first_run,
+        anchors,
+        first_geometry_audit,
+        min_center_gap_ratio=float(
+            config["cross_anchor_llm2_retry_min_center_gap_ratio"]
+        ),
+    )
+    _write_json(experiment_dir / "llm2-retry-selection.json", retry_selection)
+    retry_request_count = 0
+    if llm2_run_count >= 2:
+        retry_started = time.perf_counter()
+        retry_items = []
+        for anchor in retry_selection["anchors"]:
+            retry_request_count += 1
             llm2_batch_count += 1
-            batch = anchors[start : start + batch_size]
-            batch_entries = [
-                {"mark_id": anchor["cross_id"], "bbox": anchor["bbox"]}
-                for anchor in batch
-            ]
-            batch_overlay_path = experiment_dir / (
-                f"llm2-run-{run_index:03d}-batch-{batch_index:03d}-overlay.jpg"
-            )
-            _draw_boxes(
+            cross_id = anchor["cross_id"]
+            retry_image_path = experiment_dir / f"llm2-retry-cross-{cross_id:03d}.jpg"
+            crop = write_cross_anchor_retry_crop(
                 image_path,
-                batch_overlay_path,
-                [("C", batch_entries, "blue")],
+                retry_image_path,
+                anchor,
+                padding_ratio=float(
+                    config["cross_anchor_llm2_retry_crop_padding_ratio"]
+                ),
             )
-            batch_result = client.locate_cross_anchored_questions(
-                str(batch_overlay_path),
-                batch,
+            _write_json(
+                experiment_dir / f"llm2-retry-cross-{cross_id:03d}-crop.json",
+                crop,
+            )
+            local_result = client.locate_cross_anchored_questions(
+                str(retry_image_path),
+                [crop["anchor"]],
                 subject_hint,
             )
-            anchored_items.extend(batch_result.items)
-        run_result = CrossAnchoredQuestionResult(items=anchored_items)
-        llm2_runs.append(run_result)
+            _write_json(
+                experiment_dir / f"llm2-retry-cross-{cross_id:03d}-local.json",
+                local_result,
+            )
+            mapped_result = map_retry_result_to_source(
+                local_result,
+                crop["source_crop_bbox"],
+            )
+            retry_items.extend(mapped_result.items)
+        retry_run = CrossAnchoredQuestionResult(items=retry_items)
+        llm2_runs.append(retry_run)
         _write_json(
-            experiment_dir
-            / f"llm2-anchored-questions-run-{run_index:03d}.json",
-            run_result,
+            experiment_dir / "llm2-anchored-questions-run-002.json",
+            retry_run,
         )
-        run_assignment_audit = audit_cross_anchor_assignments(
-            run_result,
-            [anchor["cross_id"] for anchor in anchors],
+        retry_anchor_ids = [
+            anchor["cross_id"] for anchor in retry_selection["anchors"]
+        ]
+        retry_assignment_audit = audit_cross_anchor_assignments(
+            retry_run,
+            retry_anchor_ids,
         )
-        assignment_audits.append(run_assignment_audit)
+        assignment_audits.append(retry_assignment_audit)
         _write_json(
-            experiment_dir
-            / f"llm2-cross-assignment-audit-run-{run_index:03d}.json",
-            run_assignment_audit,
+            experiment_dir / "llm2-cross-assignment-audit-run-002.json",
+            retry_assignment_audit,
         )
-        if not run_assignment_audit["valid"]:
-            raise ValueError("cross anchor assignment audit failed")
-        run_geometry_audit = audit_anchored_question_geometry(
-            run_result,
-            anchors,
+        if not retry_assignment_audit["valid"]:
+            raise ValueError("cross anchor retry assignment audit failed")
+        retry_geometry_audit = audit_anchored_question_geometry(
+            retry_run,
+            retry_selection["anchors"],
             max_area_ratio=float(config["cross_anchor_question_max_area_ratio"]),
             max_gap_ratio=float(config["cross_anchor_question_max_gap_ratio"]),
         )
-        geometry_audits.append(run_geometry_audit)
+        geometry_audits.append(retry_geometry_audit)
         _write_json(
-            experiment_dir / f"question-geometry-audit-run-{run_index:03d}.json",
-            run_geometry_audit,
+            experiment_dir / "question-geometry-audit-run-002.json",
+            retry_geometry_audit,
         )
-        timings_ms[f"llm2_localization_run_{run_index:03d}"] = round(
-            (time.perf_counter() - run_started) * 1000,
+        timings_ms["llm2_localization_run_002"] = round(
+            (time.perf_counter() - retry_started) * 1000,
             2,
         )
     timings_ms["llm2_localization"] = round(
@@ -2978,7 +3244,7 @@ def run_cross_anchor_experiment(
         assignment_audit,
     )
     geometry_audit = {
-        "run_count": llm2_run_count,
+        "run_count": len(llm2_runs),
         "violations": [
             {"run_index": run_index, **violation}
             for run_index, audit in enumerate(geometry_audits, 1)
@@ -3046,6 +3312,8 @@ def run_cross_anchor_experiment(
     llm2_pass_benefit["second_pass_elapsed_ms"] = timings_ms.get(
         "llm2_localization_run_002"
     )
+    llm2_pass_benefit["retry_trigger_count"] = retry_selection["trigger_count"]
+    llm2_pass_benefit["retry_request_count"] = retry_request_count
     llm2_pass_benefit["total_llm2_elapsed_ms"] = timings_ms[
         "llm2_localization"
     ]
@@ -3116,7 +3384,9 @@ def run_cross_anchor_experiment(
         "llm2_unmatched_cross_count": len(anchored_questions.items)
         - len(matched_questions),
         "llm2_assignment_audit_valid": assignment_audit["valid"],
-        "llm2_localization_run_count": llm2_run_count,
+        "llm2_localization_run_count": len(llm2_runs),
+        "llm2_retry_trigger_count": retry_selection["trigger_count"],
+        "llm2_retry_request_count": retry_request_count,
         "geometry_violation_count": len(geometry_audit["violations"]),
         "duplicate_question_candidate_count": len(
             duplicate_question_audit["duplicate_candidates"]
@@ -3143,10 +3413,10 @@ def run_cross_anchor_experiment(
             first_pass_stable_truth_comparison["false_event_ids"]
         ),
         "stable_question_event_count": stable_question_events["event_count"],
-        "stable_truth_matched_count": stable_truth_comparison[
-            "matched_truth_count"
+        "stable_truth_matched_count": llm2_pass_benefit[
+            "union_matched_truth_count"
         ],
-        "stable_truth_recall": stable_truth_comparison["truth_recall"],
+        "stable_truth_recall": llm2_pass_benefit["union_truth_recall"],
         "stable_false_event_count": len(
             stable_truth_comparison["false_event_ids"]
         ),
@@ -3226,6 +3496,8 @@ def load_cross_cv_inputs(
         "cross_anchor_duplicate_question_iou_threshold",
         "cross_anchor_llm1_verification_runs",
         "cross_anchor_llm2_localization_runs",
+        "cross_anchor_llm2_retry_min_center_gap_ratio",
+        "cross_anchor_llm2_retry_crop_padding_ratio",
         "cross_anchor_fallback_generates_anchors",
         "cross_anchor_retain_uncertain_candidates",
         "cross_anchor_retain_rejected_candidates",
@@ -3258,6 +3530,8 @@ def load_cross_cv_inputs(
     for name in positive_integer_fields:
         if int(config[name]) <= 0:
             raise ValueError(f"{name} must be positive")
+    if int(config["cross_anchor_llm2_localization_runs"]) > 2:
+        raise ValueError("cross_anchor_llm2_localization_runs must be 1 or 2")
     boolean_fields = {
         "cross_anchor_retain_uncertain_candidates",
         "cross_anchor_retain_rejected_candidates",
@@ -3402,14 +3676,14 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
             "",
             "> 稳定错题事件由LLM2原始错题框做审计性聚类得到，不改写模型原始返回；目标是稳定真值召回为1.0，允许存在误报事件。",
             "",
-            "| 图片 | LLM1核验次数 | 不稳定CV候选 | 保留LLM1拒绝CV | fallback uncertain审计 | fallback生成锚点 | LLM2定位次数 | 第一次真值召回 | 第一次最小真值覆盖 | 第二次新增找回 | 第二次新增误报 | 稳定错题事件 | 合并真值命中 | 合并真值召回 | 合并最小真值覆盖 | 合并误报事件 | 新方案LLM请求 |",
-            "|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 图片 | LLM1核验次数 | 不稳定CV候选 | 保留LLM1拒绝CV | fallback uncertain审计 | fallback生成锚点 | LLM2定位次数 | 定向复查触发 | 定向复查请求 | 第一次真值召回 | 第一次最小真值覆盖 | 定向复查新增找回 | 定向复查新增误报 | 稳定错题事件 | 合并真值命中 | 合并真值召回 | 合并最小真值覆盖 | 合并误报事件 | 新方案LLM请求 |",
+            "|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for summary in summaries:
         item = summary["checkpoints"]
         lines.append(
-            "| {label} | {runs} | {unstable} | {rejected} | {fallback_uncertain} | {fallback_generates} | {llm2_runs} | {first_recall} | {first_coverage} | {recovered} | {additional_false} | {events} | {matched} | {recall} | {union_coverage} | {false_events} | {requests} |".format(
+            "| {label} | {runs} | {unstable} | {rejected} | {fallback_uncertain} | {fallback_generates} | {llm2_runs} | {retry_triggers} | {retry_requests} | {first_recall} | {first_coverage} | {recovered} | {additional_false} | {events} | {matched} | {recall} | {union_coverage} | {false_events} | {requests} |".format(
                 label=summary["label"],
                 runs=item["cross_anchor_llm1_verification_run_count"],
                 unstable=item["cross_anchor_llm1_unstable_candidate_count"],
@@ -3421,6 +3695,8 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
                     "cross_anchor_fallback_generates_anchors"
                 ],
                 llm2_runs=item["cross_anchor_llm2_localization_run_count"],
+                retry_triggers=item["cross_anchor_llm2_retry_trigger_count"],
+                retry_requests=item["cross_anchor_llm2_retry_request_count"],
                 first_recall=item[
                     "cross_anchor_first_pass_stable_truth_recall"
                 ],
@@ -3454,15 +3730,15 @@ def _write_timing_report(output_dir: Path, summaries: list[dict]) -> None:
         "",
         "> 单位均为毫秒。旧生产流程、旧stable实验和新cross-anchor实验在同一轮中串行执行；整页总耗时包含本地CV、文件输出及所有启用实验。",
         "",
-        "| 图片 | 整页总耗时 | 红色证据CV | 红叉候选CV | 旧生产流程 | 旧stable实验 | 新方案总耗时 | LLM1核验次数 | 新方案LLM请求 | LLM1候选核验 | 独立漏检扫描 | fallback复核 | LLM2定位总计 | LLM2第二次 | 后置审计 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 整页总耗时 | 红色证据CV | 红叉候选CV | 旧生产流程 | 旧stable实验 | 新方案总耗时 | LLM1核验次数 | 新方案LLM请求 | 定向复查触发 | 定向复查请求 | LLM1候选核验 | 独立漏检扫描 | fallback复核 | LLM2定位总计 | 定向复查耗时 | 后置审计 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for summary in summaries:
         case_timings = summary.get("timings_ms") or {}
         checkpoints = summary["checkpoints"]
         stage_timings = checkpoints.get("cross_anchor_stage_timings_ms") or {}
         lines.append(
-            "| {label} | {total} | {red_cv} | {cross_cv} | {production} | {stable} | {cross_anchor} | {runs} | {requests} | {verify} | {scan} | {fallback} | {llm2} | {llm2_second} | {audit} |".format(
+            "| {label} | {total} | {red_cv} | {cross_cv} | {production} | {stable} | {cross_anchor} | {runs} | {requests} | {retry_triggers} | {retry_requests} | {verify} | {scan} | {fallback} | {llm2} | {llm2_second} | {audit} |".format(
                 label=summary["label"],
                 total=case_timings.get("total"),
                 red_cv=case_timings.get("red_evidence_cv"),
@@ -3474,6 +3750,12 @@ def _write_timing_report(output_dir: Path, summaries: list[dict]) -> None:
                     "cross_anchor_llm1_verification_run_count"
                 ),
                 requests=checkpoints.get("cross_anchor_llm_request_count"),
+                retry_triggers=checkpoints.get(
+                    "cross_anchor_llm2_retry_trigger_count"
+                ),
+                retry_requests=checkpoints.get(
+                    "cross_anchor_llm2_retry_request_count"
+                ),
                 verify=stage_timings.get("llm1_candidate_verification"),
                 scan=stage_timings.get("independent_cross_scan"),
                 fallback=stage_timings.get(
