@@ -419,6 +419,14 @@ def test_load_cross_cv_inputs_requires_config_and_truth_for_every_label(tmp_path
         diagnostic.load_cross_cv_inputs(config_path, truth_path, ["page33"])
 
 
+def test_committed_cross_anchor_config_uses_single_llm2_pass():
+    config_path = Path(__file__).resolve().parents[2] / "scripts" / "cv_cross_experiment_config.json"
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert config["cross_anchor_llm2_localization_runs"] == 1
+
+
 def test_load_cross_cv_inputs_requires_cross_anchor_evaluation_thresholds(tmp_path):
     diagnostic = _load_script_module()
     config_path = tmp_path / "config.json"

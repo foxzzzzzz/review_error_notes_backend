@@ -1,0 +1,10 @@
+{
+  "_descriptions": {
+    "schema_version": "双分支视觉基准产物协议版本；比较工具只合并相同版本。",
+    "question_truth_min_iou": "预测错题框与人工真值框视为命中的最低IoU；仅用于测试评估，不影响识别结果。",
+    "cross_cv_config_path": "main单轮方案使用的CV与LLM实验配置文件；相对路径以本文件目录为基准。"
+  },
+  "schema_version": 1,
+  "question_truth_min_iou": 0.2,
+  "cross_cv_config_path": "cv_cross_experiment_config.json"
+}
