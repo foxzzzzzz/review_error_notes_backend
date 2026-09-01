@@ -18,6 +18,22 @@ def _load_script_module():
     return module
 
 
+def _new_cross_experiment_config_fields():
+    config_path = BACKEND_ROOT / "scripts" / "cv_cross_experiment_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    prefixes = (
+        "cross_anchor_rescue_",
+        "cross_anchor_preserve_",
+        "cross_anchor_context_",
+        "cross_anchor_spatial_",
+    )
+    return {
+        key: value
+        for key, value in config.items()
+        if key.startswith(prefixes)
+    }
+
+
 def test_write_cv_artifacts_records_components_groups_and_overlay(tmp_path):
     diagnostic = _load_script_module()
     source = tmp_path / "page.jpg"
@@ -340,6 +356,7 @@ def test_load_cross_cv_inputs_requires_config_and_truth_for_every_label(tmp_path
                 "cross_anchor_cv_dedupe_center_distance_ratio": 0.015,
                 "cross_anchor_fallback_merge_iou_threshold": 0.2,
                 "cross_anchor_fallback_merge_center_distance_ratio": 0.04,
+                **_new_cross_experiment_config_fields(),
                 "cross_anchor_montage_full_page_max_edge": 1400,
                 "cross_anchor_montage_tile_edge": 320,
                 "cross_anchor_montage_columns": 3,
@@ -427,6 +444,118 @@ def test_committed_cross_anchor_config_uses_single_llm2_pass():
     assert config["cross_anchor_llm2_localization_runs"] == 1
 
 
+def _independent_rescue_config():
+    return {
+        "red_min_channel": 60,
+        "red_min_excess": 6,
+        "cross_anchor_fallback_merge_iou_threshold": 0.2,
+        "cross_anchor_fallback_merge_center_distance_ratio": 0.04,
+        "cross_anchor_rescue_min_scan_confidence": 0.9,
+        "cross_anchor_rescue_min_red_pixel_ratio": 0.05,
+        "cross_anchor_rescue_min_bbox_area_ratio": 0.01,
+        "cross_anchor_rescue_max_bbox_area_ratio": 0.1,
+        "cross_anchor_rescue_edge_margin_ratio": 0.01,
+    }
+
+
+def test_independent_scan_rescues_unmatched_strong_red_evidence_even_if_rejected(
+    tmp_path,
+):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.png"
+    image = Image.new("RGB", (100, 100), "white")
+    ImageDraw.Draw(image).rectangle((20, 20, 39, 39), fill=(220, 30, 30))
+    image.save(source)
+
+    rescued, audit = diagnostic.select_independent_rescue_crosses(
+        existing_anchors=[],
+        independent_scan=diagnostic.IndependentCrossScanResult.model_validate(
+            {"crosses": [{"bbox": [0.2, 0.2, 0.4, 0.4], "confidence": 0.95}]}
+        ),
+        fallback_verification=(
+            diagnostic.CrossCandidateVerificationResult.model_validate(
+                {
+                    "verdicts": [
+                        {
+                            "candidate_id": 0,
+                            "disposition": "rejected",
+                            "confidence": 0.8,
+                        }
+                    ]
+                }
+            )
+        ),
+        image_path=source,
+        config=_independent_rescue_config(),
+    )
+
+    assert [cross.bbox for cross in rescued.crosses] == [[0.2, 0.2, 0.4, 0.4]]
+    assert audit["rescued_count"] == 1
+    assert audit["entries"][0]["fallback_disposition"] == "rejected"
+    assert audit["entries"][0]["decision"] == "independent_scan_rescue"
+    assert audit["entries"][0]["reasons"] == []
+
+
+def test_independent_scan_does_not_rescue_low_red_evidence(tmp_path):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(source)
+
+    rescued, audit = diagnostic.select_independent_rescue_crosses(
+        existing_anchors=[],
+        independent_scan=diagnostic.IndependentCrossScanResult.model_validate(
+            {"crosses": [{"bbox": [0.2, 0.2, 0.4, 0.4], "confidence": 0.95}]}
+        ),
+        fallback_verification=diagnostic.CrossCandidateVerificationResult.model_validate(
+            {"verdicts": []}
+        ),
+        image_path=source,
+        config=_independent_rescue_config(),
+    )
+
+    assert rescued.crosses == []
+    assert audit["rescued_count"] == 0
+    assert audit["entries"][0]["decision"] == "audit_only"
+    assert audit["entries"][0]["reasons"] == ["red_pixel_ratio_below_minimum"]
+
+
+def test_independent_scan_matching_existing_anchor_only_records_support(tmp_path):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.png"
+    image = Image.new("RGB", (100, 100), "white")
+    ImageDraw.Draw(image).rectangle((20, 20, 39, 39), fill=(220, 30, 30))
+    image.save(source)
+    anchors = [
+        {
+            "cross_id": 7,
+            "source": "cv_confirmed",
+            "source_candidate_ids": [3],
+            "bbox": [0.2, 0.2, 0.4, 0.4],
+            "confidence": 0.9,
+            "independent_scan_supported": False,
+            "merge_reason": None,
+        }
+    ]
+
+    rescued, audit = diagnostic.select_independent_rescue_crosses(
+        existing_anchors=anchors,
+        independent_scan=diagnostic.IndependentCrossScanResult.model_validate(
+            {"crosses": [{"bbox": [0.21, 0.21, 0.39, 0.39], "confidence": 0.95}]}
+        ),
+        fallback_verification=diagnostic.CrossCandidateVerificationResult.model_validate(
+            {"verdicts": []}
+        ),
+        image_path=source,
+        config=_independent_rescue_config(),
+    )
+
+    assert rescued.crosses == []
+    assert anchors[0]["independent_scan_supported"] is True
+    assert audit["supported_existing_count"] == 1
+    assert audit["entries"][0]["decision"] == "supports_existing_anchor"
+    assert audit["entries"][0]["matched_cross_id"] == 7
+
+
 def test_load_cross_cv_inputs_requires_cross_anchor_evaluation_thresholds(tmp_path):
     diagnostic = _load_script_module()
     config_path = tmp_path / "config.json"
@@ -451,9 +580,10 @@ def test_load_cross_cv_inputs_requires_cross_anchor_evaluation_thresholds(tmp_pa
                 "cross_anchor_retain_uncertain_candidates": True,
                 "cross_anchor_high_cv_min_arm_density": 0.25,
                 "cross_anchor_high_cv_min_center_density": 0.7,
-                "cross_anchor_fallback_merge_iou_threshold": 0.2,
-                "cross_anchor_fallback_merge_center_distance_ratio": 0.04,
-                "cross_anchor_montage_full_page_max_edge": 1400,
+                        "cross_anchor_fallback_merge_iou_threshold": 0.2,
+                        "cross_anchor_fallback_merge_center_distance_ratio": 0.04,
+                        **_new_cross_experiment_config_fields(),
+                        "cross_anchor_montage_full_page_max_edge": 1400,
                 "cross_anchor_montage_tile_edge": 320,
                 "cross_anchor_montage_columns": 3,
                 "cross_anchor_montage_crop_padding_ratio": 0.03,
@@ -3266,7 +3396,18 @@ def test_timing_report_compares_old_and_new_flows_with_stage_costs(tmp_path):
         cv={"raw_component_count": 18, "evidence_group_count": 8},
         pipeline=None,
         cross_anchor_experiment={
+            "profile": "spatial-grouped",
             "llm1_verification_run_count": 3,
+            "llm1_independent_rescue_count": 2,
+            "llm2_batch_error_count": 1,
+            "anchor_preservation_confirmed_count": 4,
+            "anchor_preservation_needs_review_count": 1,
+            "anchor_preservation_confirmed_truth_recall": 0.8,
+            "anchor_preservation_union_truth_recall": 1.0,
+            "spatial_group_request_count": 3,
+            "spatial_question_event_count": 5,
+            "spatial_truth_recall": 1.0,
+            "spatial_false_event_count": 1,
             "llm2_retry_trigger_count": 2,
             "llm2_retry_request_count": 2,
             "llm_request_count": 8,
@@ -3290,6 +3431,7 @@ def test_timing_report_compares_old_and_new_flows_with_stage_costs(tmp_path):
     }
 
     diagnostic._write_timing_report(tmp_path, [summary])
+    diagnostic._write_report(tmp_path, [summary])
 
     report = (tmp_path / "timing-report.md").read_text("utf-8")
     assert "旧生产流程" in report
@@ -3298,6 +3440,10 @@ def test_timing_report_compares_old_and_new_flows_with_stage_costs(tmp_path):
     assert "定向复查耗时" in report
     assert "定向复查请求" in report
     assert "| page35 | 5000.0 | 20.0 | 30.0 | 1000.0 | 1100.0 | 2800.0 | 3 | 8 |" in report
+    comparison_report = (tmp_path / "comparison-report.md").read_text("utf-8")
+    assert "## 独立实验 Profile" in comparison_report
+    assert "| page35 | spatial-grouped | 2 | 1 | 4 | 1 | 0.8 | 1.0 | 3 | 5 | 1.0 | 1 |" in comparison_report
+    assert "空间分组请求" in report
 
 
 def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
@@ -3345,10 +3491,11 @@ def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
                     "cross_anchor_high_cv_min_arm_density": 0.25,
                     "cross_anchor_high_cv_min_center_density": 0.7,
                     "cross_anchor_cv_dedupe_iou_threshold": 0.5,
-                    "cross_anchor_cv_dedupe_center_distance_ratio": 0.015,
-                    "cross_anchor_fallback_merge_iou_threshold": 0.2,
-                    "cross_anchor_fallback_merge_center_distance_ratio": 0.04,
-                    "cross_anchor_montage_full_page_max_edge": 1400,
+                        "cross_anchor_cv_dedupe_center_distance_ratio": 0.015,
+                        "cross_anchor_fallback_merge_iou_threshold": 0.2,
+                        "cross_anchor_fallback_merge_center_distance_ratio": 0.04,
+                        **_new_cross_experiment_config_fields(),
+                        "cross_anchor_montage_full_page_max_edge": 1400,
                     "cross_anchor_montage_tile_edge": 320,
                         "cross_anchor_montage_columns": 3,
                         "cross_anchor_montage_crop_padding_ratio": 0.03,
@@ -3406,6 +3553,8 @@ def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
             "--expected",
             "sample=1",
             "--compare-cross-anchor",
+            "--cross-anchor-profile",
+            "anchor-preserving",
             "--cross-cv-config",
             str(config_path),
             "--truth-regions",
@@ -3417,11 +3566,641 @@ def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
 
     assert diagnostic.main() == 0
     assert received[0]["compare_cross_anchor"] is True
+    assert received[0]["cross_anchor_profile"] == "anchor-preserving"
     assert received[0]["cross_cv_config"]["question_truth_min_iou"] == 0.2
     assert received[0]["truth_regions"][0]["truth_id"] == "T1"
     manifest = json.loads((output / "manifest.json").read_text("utf-8"))
     assert manifest["compare_cross_anchor"] is True
+    assert manifest["cross_anchor_profile"] == "anchor-preserving"
 
+
+def _anchor_preservation_config():
+    return {
+        "red_min_channel": 60,
+        "red_min_excess": 6,
+        "cross_anchor_preserve_strong_sources": ["cv_confirmed"],
+        "cross_anchor_preserve_min_confidence": 0.8,
+        "cross_anchor_preserve_min_red_pixel_ratio": 0.05,
+        "cross_anchor_context_horizontal_padding_ratio": 0.1,
+        "cross_anchor_context_vertical_padding_ratio": 0.1,
+        "cross_anchor_context_min_width_ratio": 0.2,
+        "cross_anchor_context_min_height_ratio": 0.2,
+        "cross_anchor_context_max_area_ratio": 0.5,
+    }
+
+
+def _preservation_anchor(source="cv_confirmed", confidence=0.9):
+    return {
+        "cross_id": 0,
+        "source": source,
+        "source_candidate_ids": [0],
+        "bbox": [0.2, 0.2, 0.4, 0.4],
+        "confidence": confidence,
+        "independent_scan_supported": False,
+        "merge_reason": None,
+    }
+
+
+def _red_anchor_image(tmp_path):
+    source = tmp_path / "anchor.png"
+    image = Image.new("RGB", (100, 100), "white")
+    ImageDraw.Draw(image).rectangle((20, 20, 39, 39), fill=(220, 30, 30))
+    image.save(source)
+    return source
+
+
+def test_anchor_preservation_keeps_valid_llm_question_as_confirmed(tmp_path):
+    diagnostic = _load_script_module()
+    result = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": True,
+                    "question_bbox": [0.1, 0.1, 0.5, 0.5],
+                    "unmatched_reason": None,
+                    "confidence": 0.95,
+                }
+            ]
+        }
+    )
+
+    preserved = diagnostic.build_anchor_preservation_events(
+        anchors=[_preservation_anchor()],
+        result=result,
+        geometry_audit={"violations": []},
+        batch_errors=[],
+        image_path=_red_anchor_image(tmp_path),
+        config=_anchor_preservation_config(),
+    )
+
+    assert preserved["events"][0]["status"] == "confirmed"
+    assert preserved["events"][0]["bbox_source"] == "llm2"
+    assert preserved["events"][0]["question_bboxes"] == [[0.1, 0.1, 0.5, 0.5]]
+
+
+def test_anchor_preservation_creates_needs_review_for_strong_unmatched(tmp_path):
+    diagnostic = _load_script_module()
+    result = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": False,
+                    "question_bbox": None,
+                    "unmatched_reason": "无法唯一定位",
+                    "confidence": 0.7,
+                }
+            ]
+        }
+    )
+
+    preserved = diagnostic.build_anchor_preservation_events(
+        anchors=[_preservation_anchor()],
+        result=result,
+        geometry_audit={"violations": []},
+        batch_errors=[],
+        image_path=_red_anchor_image(tmp_path),
+        config=_anchor_preservation_config(),
+    )
+
+    assert preserved["events"][0]["status"] == "needs_review"
+    assert preserved["events"][0]["bbox_source"] == "local_anchor_context"
+    assert preserved["events"][0]["question_bboxes"] == [[0.1, 0.1, 0.5, 0.5]]
+    assert preserved["audit"][0]["reasons"] == ["llm2_unmatched"]
+
+
+def test_anchor_preservation_rejects_weak_unmatched_without_event(tmp_path):
+    diagnostic = _load_script_module()
+    result = diagnostic.CrossAnchoredQuestionResult.model_validate(
+        {
+            "items": [
+                {
+                    "cross_id": 0,
+                    "matched": False,
+                    "question_bbox": None,
+                    "unmatched_reason": "不是红叉",
+                    "confidence": 0.9,
+                }
+            ]
+        }
+    )
+
+    preserved = diagnostic.build_anchor_preservation_events(
+        anchors=[_preservation_anchor("cv_rejected_retained", 0.5)],
+        result=result,
+        geometry_audit={"violations": []},
+        batch_errors=[],
+        image_path=_red_anchor_image(tmp_path),
+        config=_anchor_preservation_config(),
+    )
+
+    assert preserved["events"] == []
+    assert preserved["audit"][0]["status"] == "rejected"
+
+
+def test_anchor_preservation_keeps_each_strong_anchor_from_failed_batch(tmp_path):
+    diagnostic = _load_script_module()
+
+    preserved = diagnostic.build_anchor_preservation_events(
+        anchors=[_preservation_anchor()],
+        result=diagnostic.CrossAnchoredQuestionResult(items=[]),
+        geometry_audit={"violations": []},
+        batch_errors=[{"batch_index": 1, "cross_ids": [0], "message": "timeout"}],
+        image_path=_red_anchor_image(tmp_path),
+        config=_anchor_preservation_config(),
+    )
+
+    assert preserved["events"][0]["status"] == "needs_review"
+    assert preserved["audit"][0]["reasons"] == ["llm2_batch_failed"]
+
+
+def _spatial_grouping_config():
+    return {
+        "cross_anchor_spatial_row_distance_ratio": 0.08,
+        "cross_anchor_spatial_horizontal_gap_ratio": 0.25,
+        "cross_anchor_spatial_max_anchors_per_group": 2,
+        "cross_anchor_spatial_crop_padding_ratio": 0.05,
+        "cross_anchor_spatial_max_crop_area_ratio": 0.5,
+    }
+
+
+def _spatial_anchor(cross_id, bbox, source="cv_confirmed"):
+    return {
+        "cross_id": cross_id,
+        "source": source,
+        "source_candidate_ids": [cross_id],
+        "bbox": bbox,
+        "confidence": 0.9,
+        "independent_scan_supported": False,
+        "merge_reason": None,
+    }
+
+
+def test_spatial_grouping_is_deterministic_and_assigns_each_cross_once():
+    diagnostic = _load_script_module()
+    anchors = [
+        _spatial_anchor(3, [0.1, 0.5, 0.2, 0.6]),
+        _spatial_anchor(1, [0.3, 0.12, 0.4, 0.22]),
+        _spatial_anchor(0, [0.1, 0.1, 0.2, 0.2]),
+        _spatial_anchor(2, [0.8, 0.15, 0.9, 0.25]),
+    ]
+
+    groups = diagnostic.group_cross_anchors_spatially(
+        anchors, _spatial_grouping_config()
+    )
+
+    assert [group["group_id"] for group in groups] == [0, 1, 2]
+    assert [[item["cross_id"] for item in group["anchors"]] for group in groups] == [
+        [0, 1],
+        [2],
+        [3],
+    ]
+    assert [
+        cross_id
+        for group in groups
+        for cross_id in [item["cross_id"] for item in group["anchors"]]
+    ] == [0, 1, 2, 3]
+    assert groups[0]["crop_bbox"] == [0.05, 0.05, 0.45, 0.27]
+
+
+def test_spatial_group_membership_rejects_missing_duplicate_and_unknown_ids():
+    diagnostic = _load_script_module()
+    result = diagnostic.SpatialQuestionGroupResult.model_validate(
+        {
+            "groups": [
+                {
+                    "group_id": 0,
+                    "cross_ids": [0, 0],
+                    "question_bbox": [0.1, 0.1, 0.5, 0.5],
+                    "confidence": 0.9,
+                }
+            ],
+            "unmatched": [
+                {"cross_id": 3, "reason": "不是红叉", "confidence": 0.8}
+            ],
+        }
+    )
+
+    audit = diagnostic.audit_spatial_group_membership(result, [0, 1])
+
+    assert audit["valid"] is False
+    assert audit["missing_cross_ids"] == [1]
+    assert audit["duplicate_cross_ids"] == [0]
+    assert audit["unknown_cross_ids"] == [3]
+
+
+def test_spatial_group_bbox_maps_from_crop_to_page_coordinates():
+    diagnostic = _load_script_module()
+    result = diagnostic.SpatialQuestionGroupResult.model_validate(
+        {
+            "groups": [
+                {
+                    "group_id": 0,
+                    "cross_ids": [0, 1],
+                    "question_bbox": [0.25, 0.25, 0.75, 0.75],
+                    "confidence": 0.9,
+                }
+            ],
+            "unmatched": [],
+        }
+    )
+
+    mapped = diagnostic.map_spatial_group_result_to_source(
+        result, [0.2, 0.4, 0.6, 0.8]
+    )
+
+    assert mapped.groups[0].question_bbox == [0.3, 0.5, 0.5, 0.7]
+
+
+def test_spatial_event_dedup_merges_same_question_but_keeps_adjacent_sibling():
+    diagnostic = _load_script_module()
+    anchors = [
+        _spatial_anchor(0, [0.2, 0.2, 0.25, 0.25]),
+        _spatial_anchor(1, [0.25, 0.22, 0.3, 0.27]),
+        _spatial_anchor(2, [0.5, 0.2, 0.55, 0.25]),
+    ]
+    events = [
+        {
+            "event_id": 0,
+            "cross_ids": [0],
+            "question_bboxes": [[0.1, 0.1, 0.4, 0.4]],
+            "confidence": 0.9,
+            "status": "confirmed",
+            "bbox_source": "spatial_llm2",
+        },
+        {
+            "event_id": 1,
+            "cross_ids": [1],
+            "question_bboxes": [[0.12, 0.12, 0.39, 0.39]],
+            "confidence": 0.95,
+            "status": "confirmed",
+            "bbox_source": "spatial_llm2",
+        },
+        {
+            "event_id": 2,
+            "cross_ids": [2],
+            "question_bboxes": [[0.42, 0.1, 0.65, 0.4]],
+            "confidence": 0.85,
+            "status": "needs_review",
+            "bbox_source": "local_anchor_context",
+        },
+    ]
+    config = {
+        "cross_anchor_spatial_dedupe_iou_threshold": 0.7,
+        "cross_anchor_spatial_dedupe_containment_threshold": 0.8,
+        "cross_anchor_spatial_dedupe_max_anchor_distance_ratio": 0.2,
+    }
+
+    deduped = diagnostic.deduplicate_spatial_question_events(
+        events, anchors, config
+    )
+
+    assert deduped["event_count"] == 2
+    assert deduped["events"][0]["cross_ids"] == [0, 1]
+    assert deduped["events"][0]["question_bboxes"] == [
+        [0.1, 0.1, 0.4, 0.4],
+        [0.12, 0.12, 0.39, 0.39],
+    ]
+    assert deduped["events"][0]["confidence"] == 0.95
+    assert deduped["events"][1]["cross_ids"] == [2]
+    assert deduped["events"][1]["status"] == "needs_review"
+    assert deduped["audit"][0]["decision"] == "merged"
+
+
+def test_write_spatial_anchor_group_crop_maps_anchor_coordinates(tmp_path):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(source)
+    output = tmp_path / "group.jpg"
+    group = {
+        "group_id": 0,
+        "crop_bbox": [0.1, 0.2, 0.5, 0.6],
+        "anchors": [_spatial_anchor(0, [0.2, 0.3, 0.3, 0.4])],
+    }
+
+    mapping = diagnostic.write_spatial_anchor_group_crop(source, output, group)
+
+    assert output.is_file()
+    assert mapping["source_crop_bbox"] == [0.1, 0.2, 0.5, 0.6]
+    assert mapping["anchors"][0]["bbox"] == [0.25, 0.25, 0.5, 0.5]
+    assert mapping["anchors"][0]["image_scope"] == "spatial_group_crop"
+
+
+def test_run_spatial_group_localization_maps_results_and_records_membership(tmp_path):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(source)
+    experiment_dir = tmp_path / "experiment"
+    experiment_dir.mkdir()
+    groups = [
+        {
+            "group_id": 0,
+            "crop_bbox": [0.1, 0.2, 0.5, 0.6],
+            "anchors": [_spatial_anchor(0, [0.2, 0.3, 0.3, 0.4])],
+        }
+    ]
+
+    class FakeClient:
+        def locate_spatial_cross_groups(self, image_path, anchors, subject_hint):
+            assert Path(image_path).name == "spatial-group-000.jpg"
+            assert anchors[0]["bbox"] == [0.25, 0.25, 0.5, 0.5]
+            assert subject_hint == "chinese"
+            return diagnostic.SpatialQuestionGroupResult.model_validate(
+                {
+                    "groups": [
+                        {
+                            "group_id": 0,
+                            "cross_ids": [0],
+                            "question_bbox": [0.0, 0.0, 1.0, 1.0],
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "unmatched": [],
+                }
+            )
+
+    result = diagnostic.run_spatial_group_localization(
+        image_path=source,
+        experiment_dir=experiment_dir,
+        client=FakeClient(),
+        groups=groups,
+        subject_hint="chinese",
+    )
+
+    assert result["result"].groups[0].question_bbox == [0.1, 0.2, 0.5, 0.6]
+    assert result["membership_audit"]["valid"] is True
+    assert result["request_count"] == 1
+    assert result["errors"] == []
+    assert (experiment_dir / "spatial-group-000-mapping.json").is_file()
+    assert (experiment_dir / "spatial-group-000-result-local.json").is_file()
+
+
+def test_spatial_question_events_keep_model_groups_and_unmatched_review_fallback():
+    diagnostic = _load_script_module()
+    spatial_result = diagnostic.SpatialQuestionGroupResult.model_validate(
+        {
+            "groups": [
+                {
+                    "group_id": 0,
+                    "cross_ids": [0, 1],
+                    "question_bbox": [0.1, 0.1, 0.5, 0.5],
+                    "confidence": 0.9,
+                }
+            ],
+            "unmatched": [
+                {"cross_id": 2, "reason": "无法定位", "confidence": 0.7}
+            ],
+        }
+    )
+    preservation = {
+        "events": [
+            {
+                "event_id": 0,
+                "cross_ids": [0],
+                "question_bboxes": [[0.1, 0.1, 0.5, 0.5]],
+                "confidence": 0.9,
+                "status": "confirmed",
+                "bbox_source": "llm2",
+            },
+            {
+                "event_id": 1,
+                "cross_ids": [1],
+                "question_bboxes": [[0.1, 0.1, 0.5, 0.5]],
+                "confidence": 0.9,
+                "status": "confirmed",
+                "bbox_source": "llm2",
+            },
+            {
+                "event_id": 2,
+                "cross_ids": [2],
+                "question_bboxes": [[0.6, 0.1, 0.9, 0.4]],
+                "confidence": 0.85,
+                "status": "needs_review",
+                "bbox_source": "local_anchor_context",
+            },
+        ]
+    }
+
+    events = diagnostic.build_spatial_question_events(
+        spatial_result, preservation
+    )
+
+    assert events["event_count"] == 2
+    assert events["events"][0]["cross_ids"] == [0, 1]
+    assert events["events"][0]["status"] == "confirmed"
+    assert events["events"][1]["cross_ids"] == [2]
+    assert events["events"][1]["status"] == "needs_review"
+
+
+def test_load_cross_cv_inputs_validates_new_experiment_config_boundaries(tmp_path):
+    diagnostic = _load_script_module()
+    committed_config = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "cv_cross_experiment_config.json"
+        ).read_text("utf-8")
+    )
+    truth_path = tmp_path / "truth.json"
+    truth_path.write_text(
+        json.dumps(
+            {
+                "pages": {
+                    "sample": {
+                        "regions": [
+                            {
+                                "truth_id": "T1",
+                                "source_bbox_normalized": [0.1, 0.1, 0.4, 0.4],
+                            }
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.json"
+
+    missing = dict(committed_config)
+    missing.pop("cross_anchor_rescue_min_scan_confidence")
+    config_path.write_text(json.dumps(missing), encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match="cross_anchor_rescue_min_scan_confidence",
+    ):
+        diagnostic.load_cross_cv_inputs(config_path, truth_path, ["sample"])
+
+    empty_sources = dict(committed_config)
+    empty_sources["cross_anchor_preserve_strong_sources"] = []
+    config_path.write_text(json.dumps(empty_sources), encoding="utf-8")
+    with pytest.raises(ValueError, match="strong sources must not be empty"):
+        diagnostic.load_cross_cv_inputs(config_path, truth_path, ["sample"])
+
+    invalid_group_limit = dict(committed_config)
+    invalid_group_limit["cross_anchor_spatial_max_anchors_per_group"] = 0
+    config_path.write_text(json.dumps(invalid_group_limit), encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match="cross_anchor_spatial_max_anchors_per_group must be positive",
+    ):
+        diagnostic.load_cross_cv_inputs(config_path, truth_path, ["sample"])
+
+
+def test_anchor_preserving_profile_converts_llm2_batch_error_to_review_event(tmp_path):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.jpg"
+    image = Image.new("RGB", (100, 100), "white")
+    ImageDraw.Draw(image).rectangle((20, 20, 39, 39), fill=(220, 30, 30))
+    image.save(source)
+    overlay = tmp_path / "overlay.jpg"
+    image.save(overlay)
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    config = json.loads(
+        (BACKEND_ROOT / "scripts" / "cv_cross_experiment_config.json").read_text(
+            "utf-8"
+        )
+    )
+
+    class FakeClient:
+        def verify_cross_candidates(self, _image_path, _candidates):
+            return diagnostic.CrossCandidateVerificationResult.model_validate(
+                {
+                    "verdicts": [
+                        {
+                            "candidate_id": 0,
+                            "disposition": "confirmed",
+                            "confidence": 0.95,
+                        }
+                    ]
+                }
+            )
+
+        def scan_independent_crosses(self, _image_path):
+            return diagnostic.IndependentCrossScanResult(crosses=[])
+
+        def locate_cross_anchored_questions(self, *_args):
+            raise RuntimeError("simulated timeout")
+
+    summary = diagnostic.run_cross_anchor_experiment(
+        image_path=source,
+        case_dir=case_dir,
+        client=FakeClient(),
+        cv_candidates=[
+            {
+                "candidate_id": 0,
+                "bbox": [0.2, 0.2, 0.4, 0.4],
+                "center": [0.3, 0.3],
+                "min_arm_density": 0.4,
+                "center_density": 0.9,
+            }
+        ],
+        candidate_overlay_path=overlay,
+        truth_regions=[
+            {
+                "truth_id": "T1",
+                "source_bbox_normalized": [0.05, 0.05, 0.55, 0.55],
+            }
+        ],
+        config=config,
+        subject_hint="chinese",
+        profile="anchor-preserving",
+    )
+
+    assert summary["llm2_batch_error_count"] == 1
+    assert summary["anchor_preservation_needs_review_count"] == 1
+    preserved = json.loads(
+        (
+            case_dir
+            / "cross-anchor-experiment"
+            / "anchor-preservation-events.json"
+        ).read_text("utf-8")
+    )
+    assert preserved["events"][0]["status"] == "needs_review"
+
+
+def test_spatial_grouped_profile_uses_group_request_and_deduplicated_events(tmp_path):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.jpg"
+    image = Image.new("RGB", (100, 100), "white")
+    ImageDraw.Draw(image).rectangle((20, 20, 39, 39), fill=(220, 30, 30))
+    image.save(source)
+    overlay = tmp_path / "overlay.jpg"
+    image.save(overlay)
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    config = json.loads(
+        (BACKEND_ROOT / "scripts" / "cv_cross_experiment_config.json").read_text(
+            "utf-8"
+        )
+    )
+
+    class FakeClient:
+        def verify_cross_candidates(self, _image_path, _candidates):
+            return diagnostic.CrossCandidateVerificationResult.model_validate(
+                {
+                    "verdicts": [
+                        {
+                            "candidate_id": 0,
+                            "disposition": "confirmed",
+                            "confidence": 0.95,
+                        }
+                    ]
+                }
+            )
+
+        def scan_independent_crosses(self, _image_path):
+            return diagnostic.IndependentCrossScanResult(crosses=[])
+
+        def locate_spatial_cross_groups(self, _image_path, anchors, _subject_hint):
+            return diagnostic.SpatialQuestionGroupResult.model_validate(
+                {
+                    "groups": [
+                        {
+                            "group_id": 0,
+                            "cross_ids": [anchors[0]["cross_id"]],
+                            "question_bbox": [0.0, 0.0, 1.0, 1.0],
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "unmatched": [],
+                }
+            )
+
+    summary = diagnostic.run_cross_anchor_experiment(
+        image_path=source,
+        case_dir=case_dir,
+        client=FakeClient(),
+        cv_candidates=[
+            {
+                "candidate_id": 0,
+                "bbox": [0.2, 0.2, 0.4, 0.4],
+                "center": [0.3, 0.3],
+                "min_arm_density": 0.4,
+                "center_density": 0.9,
+            }
+        ],
+        candidate_overlay_path=overlay,
+        truth_regions=[
+            {
+                "truth_id": "T1",
+                "source_bbox_normalized": [0.05, 0.05, 0.55, 0.55],
+            }
+        ],
+        config=config,
+        subject_hint="chinese",
+        profile="spatial-grouped",
+    )
+
+    assert summary["spatial_group_request_count"] == 1
+    assert summary["spatial_question_event_count"] == 1
+    assert summary["spatial_truth_recall"] == 1.0
+    experiment = case_dir / "cross-anchor-experiment"
+    assert (experiment / "spatial-anchor-groups.json").is_file()
+    assert (experiment / "group-membership-audit.json").is_file()
+    assert (experiment / "deduplicated-question-events.json").is_file()
+    assert (experiment / "deduplication-audit.json").is_file()
 
 def test_stable_event_experiment_runs_independent_detection_before_cv_audit(tmp_path):
     diagnostic = _load_script_module()

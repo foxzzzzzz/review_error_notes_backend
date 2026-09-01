@@ -40,6 +40,14 @@ from app.services.vision_recognition import (
 )
 
 
+CROSS_ANCHOR_PROFILES = (
+    "baseline",
+    "independent-rescue",
+    "anchor-preserving",
+    "spatial-grouped",
+)
+
+
 STABLE_EVENT_CONSOLIDATION_PROMPT = """你是小学作业红色批改事件归并器。图片是在原始整页作业上叠加了 P0、P1... 编号框的红色几何标记候选；输入 JSON 同时给出每个 primitive 的类型和整页坐标。
 
 目标：把属于同一次判错的邻近红圈和红叉归并为一个稳定事件，确保一个真实圈叉组合只产生一个 event_id。
@@ -139,6 +147,24 @@ CROSS_ANCHORED_QUESTION_PROMPT = """你是小学作业红叉锚定错题区域�
 返回格式：{"items":[{"cross_id":0,"matched":true,"question_bbox":[0.1,0.2,0.4,0.5],"unmatched_reason":null,"confidence":0.95},{"cross_id":1,"matched":false,"question_bbox":null,"unmatched_reason":"不是明确红叉","confidence":0.8}]}。
 
 输入 cross anchors：__CROSSES__
+"""
+
+
+SPATIAL_CROSS_GROUP_PROMPT = """你是小学作业红叉锚定错题空间归组器。当前图片是原始作业的一个局部裁图，蓝色 C 编号框和输入 JSON 标出需要核验的红叉锚点。
+
+目标：把每个真实红叉归属到当前裁图中的最小独立错题作答单元；同一道题存在多个红叉时，用一个 group 返回全部对应 cross_ids。
+
+要求：
+1. 每个输入 cross_id 必须且只能出现一次：要么属于一个 groups[].cross_ids，要么属于 unmatched；不得新增、遗漏、重复或跨 group 使用同一 ID。
+2. question_bbox 覆盖完整最小作答单元，可参考红叉附近红圈来确认边界，但红圈和教师批注不能单独创建错题。
+3. 相邻兄弟题必须拆分；只有明确属于同一作答单元的多个红叉才能放入同一 group。
+4. 无法确认是红叉或无法唯一定位作答单元时放入 unmatched，不得猜测。
+5. question_bbox 使用当前局部裁图归一化坐标，不得返回整页坐标。
+6. group_id 从0开始连续。只返回严格 JSON，不要解释或 Markdown。
+
+返回格式：{"groups":[{"group_id":0,"cross_ids":[0,1],"question_bbox":[0.1,0.2,0.8,0.7],"confidence":0.9}],"unmatched":[{"cross_id":2,"reason":"不是明确红叉","confidence":0.8}]}。
+
+输入 anchors：__CROSSES__
 """
 
 
@@ -291,9 +317,39 @@ class CrossAnchoredQuestionResult(BaseModel):
     items: list[CrossAnchoredQuestion] = Field(default_factory=list)
 
 
+class SpatialQuestionGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    group_id: int = Field(ge=0)
+    cross_ids: list[int] = Field(min_length=1)
+    question_bbox: list[float]
+    confidence: float = Field(ge=0, le=1)
+
+    @field_validator("question_bbox")
+    @classmethod
+    def bbox_must_be_normalized(cls, value):
+        return validate_normalized_bbox(value)
+
+
+class SpatialUnmatchedCross(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    cross_id: int = Field(ge=0)
+    reason: str = Field(min_length=1)
+    confidence: float = Field(ge=0, le=1)
+
+
+class SpatialQuestionGroupResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    groups: list[SpatialQuestionGroup] = Field(default_factory=list)
+    unmatched: list[SpatialUnmatchedCross] = Field(default_factory=list)
+
+
 CrossCandidateVerificationResult.model_rebuild(_types_namespace=globals())
 IndependentCrossScanResult.model_rebuild(_types_namespace=globals())
 CrossAnchoredQuestionResult.model_rebuild(_types_namespace=globals())
+SpatialQuestionGroupResult.model_rebuild(_types_namespace=globals())
 
 
 def _json_value(value: Any) -> Any:
@@ -1167,6 +1223,641 @@ def mark_existing_anchor_scan_support(
             for cross in independent_scan.crosses
         ):
             anchor["independent_scan_supported"] = True
+
+
+def measure_bbox_red_support(
+    image_path: Path,
+    bbox: list[float],
+    config: dict,
+) -> dict:
+    with Image.open(image_path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+    left, top, right, bottom = _pixel_bbox(bbox, image.width, image.height)
+    left = max(0, min(left, image.width - 1))
+    top = max(0, min(top, image.height - 1))
+    right = max(left + 1, min(right, image.width))
+    bottom = max(top + 1, min(bottom, image.height))
+    pixels = np.asarray(image, dtype=np.int16)[top:bottom, left:right]
+    red = pixels[:, :, 0]
+    green = pixels[:, :, 1]
+    blue = pixels[:, :, 2]
+    mask = (red >= int(config["red_min_channel"])) & (
+        red - np.maximum(green, blue) >= int(config["red_min_excess"])
+    )
+    return {
+        "red_pixel_count": int(mask.sum()),
+        "pixel_count": int(mask.size),
+        "red_pixel_ratio": round(float(mask.mean()), 6),
+    }
+
+
+def select_independent_rescue_crosses(
+    *,
+    existing_anchors: list[dict],
+    independent_scan: IndependentCrossScanResult,
+    fallback_verification: CrossCandidateVerificationResult,
+    image_path: Path,
+    config: dict,
+) -> tuple[IndependentCrossScanResult, dict]:
+    verdict_by_id = {
+        verdict.candidate_id: verdict for verdict in fallback_verification.verdicts
+    }
+    rescued = []
+    entries = []
+    supported_existing_count = 0
+    for scan_index, cross in enumerate(independent_scan.crosses):
+        matching_anchor = next(
+            (
+                anchor
+                for anchor in existing_anchors
+                if _bbox_iou(anchor["bbox"], cross.bbox)
+                >= float(config["cross_anchor_fallback_merge_iou_threshold"])
+                or _bbox_center_distance(anchor["bbox"], cross.bbox)
+                <= float(
+                    config["cross_anchor_fallback_merge_center_distance_ratio"]
+                )
+            ),
+            None,
+        )
+        support = measure_bbox_red_support(image_path, cross.bbox, config)
+        area_ratio = _bbox_area(cross.bbox)
+        edge_margin = float(config["cross_anchor_rescue_edge_margin_ratio"])
+        edge_complete = (
+            cross.bbox[0] >= edge_margin
+            and cross.bbox[1] >= edge_margin
+            and cross.bbox[2] <= 1 - edge_margin
+            and cross.bbox[3] <= 1 - edge_margin
+        )
+        verdict = verdict_by_id.get(scan_index)
+        reasons = []
+        if cross.confidence < float(config["cross_anchor_rescue_min_scan_confidence"]):
+            reasons.append("scan_confidence_below_minimum")
+        if support["red_pixel_ratio"] < float(
+            config["cross_anchor_rescue_min_red_pixel_ratio"]
+        ):
+            reasons.append("red_pixel_ratio_below_minimum")
+        if area_ratio < float(config["cross_anchor_rescue_min_bbox_area_ratio"]):
+            reasons.append("bbox_area_below_minimum")
+        if area_ratio > float(config["cross_anchor_rescue_max_bbox_area_ratio"]):
+            reasons.append("bbox_area_above_maximum")
+        if not edge_complete:
+            reasons.append("bbox_touches_page_edge")
+
+        if matching_anchor is not None:
+            matching_anchor["independent_scan_supported"] = True
+            supported_existing_count += 1
+            decision = "supports_existing_anchor"
+        elif not reasons:
+            rescued.append(cross)
+            decision = "independent_scan_rescue"
+        else:
+            decision = "audit_only"
+        entries.append(
+            {
+                "scan_index": scan_index,
+                "bbox": list(cross.bbox),
+                "scan_confidence": cross.confidence,
+                "fallback_disposition": (
+                    verdict.disposition if verdict is not None else None
+                ),
+                "fallback_confidence": (
+                    verdict.confidence if verdict is not None else None
+                ),
+                **support,
+                "bbox_area_ratio": round(area_ratio, 6),
+                "edge_complete": edge_complete,
+                "matched_cross_id": (
+                    matching_anchor["cross_id"] if matching_anchor is not None else None
+                ),
+                "decision": decision,
+                "reasons": reasons,
+            }
+        )
+    return IndependentCrossScanResult(crosses=rescued), {
+        "scan_count": len(independent_scan.crosses),
+        "rescued_count": len(rescued),
+        "supported_existing_count": supported_existing_count,
+        "entries": entries,
+        "policy": "Truth-blind confidence, red-pixel, area, edge, and geometry gates.",
+    }
+
+
+def build_local_anchor_context_bbox(
+    anchor_bbox: list[float],
+    config: dict,
+) -> list[float]:
+    horizontal_padding = float(
+        config["cross_anchor_context_horizontal_padding_ratio"]
+    )
+    vertical_padding = float(config["cross_anchor_context_vertical_padding_ratio"])
+    left = max(0.0, anchor_bbox[0] - horizontal_padding)
+    top = max(0.0, anchor_bbox[1] - vertical_padding)
+    right = min(1.0, anchor_bbox[2] + horizontal_padding)
+    bottom = min(1.0, anchor_bbox[3] + vertical_padding)
+    center_x = (left + right) / 2
+    center_y = (top + bottom) / 2
+    width = max(
+        right - left,
+        float(config["cross_anchor_context_min_width_ratio"]),
+    )
+    height = max(
+        bottom - top,
+        float(config["cross_anchor_context_min_height_ratio"]),
+    )
+    max_area = float(config["cross_anchor_context_max_area_ratio"])
+    if width * height > max_area:
+        scale = math.sqrt(max_area / (width * height))
+        width *= scale
+        height *= scale
+    left = max(0.0, min(center_x - width / 2, 1 - width))
+    top = max(0.0, min(center_y - height / 2, 1 - height))
+    return [
+        round(left, 6),
+        round(top, 6),
+        round(left + width, 6),
+        round(top + height, 6),
+    ]
+
+
+def build_anchor_preservation_events(
+    *,
+    anchors: list[dict],
+    result: CrossAnchoredQuestionResult,
+    geometry_audit: dict,
+    batch_errors: list[dict],
+    image_path: Path,
+    config: dict,
+) -> dict:
+    item_by_id = {item.cross_id: item for item in result.items}
+    geometry_violation_ids = {
+        violation["cross_id"] for violation in geometry_audit["violations"]
+    }
+    failed_ids = {
+        cross_id for error in batch_errors for cross_id in error["cross_ids"]
+    }
+    strong_sources = set(config["cross_anchor_preserve_strong_sources"])
+    events = []
+    audit = []
+    for anchor in sorted(anchors, key=lambda item: item["cross_id"]):
+        cross_id = anchor["cross_id"]
+        item = item_by_id.get(cross_id)
+        red_support = measure_bbox_red_support(image_path, anchor["bbox"], config)
+        strong_evidence = (
+            (
+                anchor["source"] in strong_sources
+                or anchor["independent_scan_supported"]
+            )
+            and float(anchor.get("confidence") or 0)
+            >= float(config["cross_anchor_preserve_min_confidence"])
+            and red_support["red_pixel_ratio"]
+            >= float(config["cross_anchor_preserve_min_red_pixel_ratio"])
+        )
+        reasons = []
+        if cross_id in failed_ids:
+            reasons.append("llm2_batch_failed")
+        elif item is None:
+            reasons.append("llm2_result_missing")
+        elif cross_id in geometry_violation_ids:
+            reasons.append("llm2_geometry_invalid")
+        elif not item.matched:
+            reasons.append("llm2_unmatched")
+
+        if item is not None and item.matched and not reasons:
+            status = "confirmed"
+            bbox_source = "llm2"
+            question_bbox = list(item.question_bbox)
+            confidence = item.confidence
+        elif strong_evidence:
+            status = "needs_review"
+            bbox_source = "local_anchor_context"
+            question_bbox = build_local_anchor_context_bbox(anchor["bbox"], config)
+            confidence = float(anchor.get("confidence") or 0)
+        else:
+            status = "rejected"
+            bbox_source = None
+            question_bbox = None
+            confidence = float(anchor.get("confidence") or 0)
+        if status != "rejected":
+            events.append(
+                {
+                    "event_id": len(events),
+                    "cross_ids": [cross_id],
+                    "representative_cross_id": cross_id,
+                    "question_bboxes": [question_bbox],
+                    "confidence": confidence,
+                    "status": status,
+                    "bbox_source": bbox_source,
+                }
+            )
+        audit.append(
+            {
+                "cross_id": cross_id,
+                "status": status,
+                "strong_evidence": strong_evidence,
+                "source": anchor["source"],
+                "independent_scan_supported": anchor["independent_scan_supported"],
+                "red_pixel_ratio": red_support["red_pixel_ratio"],
+                "reasons": reasons,
+            }
+        )
+    return {
+        "event_count": len(events),
+        "events": events,
+        "audit": audit,
+        "policy": "Confirmed and local needs_review events remain separate.",
+    }
+
+
+def group_cross_anchors_spatially(
+    anchors: list[dict],
+    config: dict,
+) -> list[dict]:
+    row_distance = float(config["cross_anchor_spatial_row_distance_ratio"])
+    horizontal_gap = float(config["cross_anchor_spatial_horizontal_gap_ratio"])
+    max_anchors = int(config["cross_anchor_spatial_max_anchors_per_group"])
+    padding = float(config["cross_anchor_spatial_crop_padding_ratio"])
+    max_crop_area = float(config["cross_anchor_spatial_max_crop_area_ratio"])
+    ordered = sorted(
+        anchors,
+        key=lambda item: (
+            (item["bbox"][1] + item["bbox"][3]) / 2,
+            (item["bbox"][0] + item["bbox"][2]) / 2,
+            item["cross_id"],
+        ),
+    )
+    rows = []
+    for anchor in ordered:
+        center_y = (anchor["bbox"][1] + anchor["bbox"][3]) / 2
+        matching_row = next(
+            (
+                row
+                for row in rows
+                if abs(center_y - row["center_y"]) <= row_distance
+            ),
+            None,
+        )
+        if matching_row is None:
+            rows.append({"center_y": center_y, "anchors": [anchor]})
+        else:
+            matching_row["anchors"].append(anchor)
+            matching_row["center_y"] = sum(
+                (item["bbox"][1] + item["bbox"][3]) / 2
+                for item in matching_row["anchors"]
+            ) / len(matching_row["anchors"])
+
+    groups = []
+    for row in rows:
+        current = []
+        for anchor in sorted(
+            row["anchors"],
+            key=lambda item: (
+                (item["bbox"][0] + item["bbox"][2]) / 2,
+                item["cross_id"],
+            ),
+        ):
+            proposed = current + [anchor]
+            union = list(proposed[0]["bbox"])
+            for item in proposed[1:]:
+                union = _bbox_union(union, item["bbox"])
+            crop_bbox = [
+                max(0.0, union[0] - padding),
+                max(0.0, union[1] - padding),
+                min(1.0, union[2] + padding),
+                min(1.0, union[3] + padding),
+            ]
+            split = bool(current) and (
+                len(current) >= max_anchors
+                or anchor["bbox"][0] - current[-1]["bbox"][2] > horizontal_gap
+                or _bbox_area(crop_bbox) > max_crop_area
+            )
+            if split:
+                groups.append(current)
+                current = [anchor]
+            else:
+                current = proposed
+        if current:
+            groups.append(current)
+
+    payload = []
+    for group_id, group_anchors in enumerate(groups):
+        union = list(group_anchors[0]["bbox"])
+        for anchor in group_anchors[1:]:
+            union = _bbox_union(union, anchor["bbox"])
+        crop_bbox = [
+            round(max(0.0, union[0] - padding), 6),
+            round(max(0.0, union[1] - padding), 6),
+            round(min(1.0, union[2] + padding), 6),
+            round(min(1.0, union[3] + padding), 6),
+        ]
+        payload.append(
+            {
+                "group_id": group_id,
+                "crop_bbox": crop_bbox,
+                "anchors": group_anchors,
+            }
+        )
+    return payload
+
+
+def audit_spatial_group_membership(
+    result: SpatialQuestionGroupResult,
+    cross_ids: list[int],
+) -> dict:
+    returned_ids = [
+        cross_id for group in result.groups for cross_id in group.cross_ids
+    ] + [item.cross_id for item in result.unmatched]
+    expected = set(cross_ids)
+    returned = set(returned_ids)
+    duplicate_ids = sorted(
+        cross_id for cross_id in returned if returned_ids.count(cross_id) > 1
+    )
+    missing_ids = sorted(expected - returned)
+    unknown_ids = sorted(returned - expected)
+    return {
+        "valid": not (duplicate_ids or missing_ids or unknown_ids),
+        "input_cross_ids": sorted(cross_ids),
+        "missing_cross_ids": missing_ids,
+        "duplicate_cross_ids": duplicate_ids,
+        "unknown_cross_ids": unknown_ids,
+        "policy": "Every input cross_id appears exactly once in groups or unmatched.",
+    }
+
+
+def map_spatial_group_result_to_source(
+    result: SpatialQuestionGroupResult,
+    source_crop_bbox: list[float],
+) -> SpatialQuestionGroupResult:
+    return SpatialQuestionGroupResult.model_validate(
+        {
+            "groups": [
+                {
+                    **group.model_dump(),
+                    "question_bbox": [
+                        round(value, 6)
+                        for value in _map_bbox_from_crop(
+                            group.question_bbox, source_crop_bbox
+                        )
+                    ],
+                }
+                for group in result.groups
+            ],
+            "unmatched": [item.model_dump() for item in result.unmatched],
+        }
+    )
+
+
+def write_spatial_anchor_group_crop(
+    image_path: Path,
+    output_path: Path,
+    group: dict,
+) -> dict:
+    crop_bbox = group["crop_bbox"]
+    with Image.open(image_path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+    pixel_bbox = _pixel_bbox(crop_bbox, image.width, image.height)
+    crop = image.crop(pixel_bbox)
+    mapped_anchors = [
+        {
+            **anchor,
+            "bbox": [
+                round(value, 6)
+                for value in _map_bbox_to_crop(anchor["bbox"], crop_bbox)
+            ],
+            "image_scope": "spatial_group_crop",
+        }
+        for anchor in group["anchors"]
+    ]
+    draw = ImageDraw.Draw(crop)
+    for anchor in mapped_anchors:
+        left, top, right, bottom = _pixel_bbox(
+            anchor["bbox"], crop.width, crop.height
+        )
+        draw.rectangle((left, top, right, bottom), outline="blue", width=2)
+        draw.text((left + 2, top + 2), f"C{anchor['cross_id']}", fill="blue")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    crop.save(output_path, format="JPEG", quality=92)
+    return {
+        "group_id": group["group_id"],
+        "source_crop_bbox": crop_bbox,
+        "anchors": mapped_anchors,
+    }
+
+
+def run_spatial_group_localization(
+    *,
+    image_path: Path,
+    experiment_dir: Path,
+    client,
+    groups: list[dict],
+    subject_hint: str | None,
+) -> dict:
+    mapped_groups = []
+    unmatched = []
+    errors = []
+    request_count = 0
+    next_group_id = 0
+    expected_ids = [
+        anchor["cross_id"] for group in groups for anchor in group["anchors"]
+    ]
+    for group in groups:
+        request_count += 1
+        group_id = group["group_id"]
+        image_output = experiment_dir / f"spatial-group-{group_id:03d}.jpg"
+        mapping = write_spatial_anchor_group_crop(image_path, image_output, group)
+        _write_json(
+            experiment_dir / f"spatial-group-{group_id:03d}-mapping.json",
+            mapping,
+        )
+        group_cross_ids = [anchor["cross_id"] for anchor in group["anchors"]]
+        try:
+            local_result = client.locate_spatial_cross_groups(
+                str(image_output), mapping["anchors"], subject_hint
+            )
+            _write_json(
+                experiment_dir / f"spatial-group-{group_id:03d}-result-local.json",
+                local_result,
+            )
+            membership = audit_spatial_group_membership(
+                local_result, group_cross_ids
+            )
+            _write_json(
+                experiment_dir
+                / f"spatial-group-{group_id:03d}-membership-audit.json",
+                membership,
+            )
+            if not membership["valid"]:
+                raise ValueError("spatial group membership audit failed")
+            mapped = map_spatial_group_result_to_source(
+                local_result, mapping["source_crop_bbox"]
+            )
+            for question_group in mapped.groups:
+                mapped_groups.append(
+                    SpatialQuestionGroup(
+                        group_id=next_group_id,
+                        cross_ids=question_group.cross_ids,
+                        question_bbox=question_group.question_bbox,
+                        confidence=question_group.confidence,
+                    )
+                )
+                next_group_id += 1
+            unmatched.extend(mapped.unmatched)
+        except Exception as exc:
+            errors.append(
+                {
+                    "spatial_group_id": group_id,
+                    "cross_ids": group_cross_ids,
+                    "type": type(exc).__name__,
+                    "code": getattr(exc, "code", None),
+                    "message": str(exc),
+                }
+            )
+            unmatched.extend(
+                SpatialUnmatchedCross(
+                    cross_id=cross_id,
+                    reason="spatial LLM2 group request failed",
+                    confidence=0.0,
+                )
+                for cross_id in group_cross_ids
+            )
+    result = SpatialQuestionGroupResult(groups=mapped_groups, unmatched=unmatched)
+    membership_audit = audit_spatial_group_membership(result, expected_ids)
+    return {
+        "result": result,
+        "membership_audit": membership_audit,
+        "errors": errors,
+        "request_count": request_count,
+    }
+
+
+def build_spatial_question_events(
+    spatial_result: SpatialQuestionGroupResult,
+    anchor_preservation: dict,
+) -> dict:
+    grouped_cross_ids = {
+        cross_id for group in spatial_result.groups for cross_id in group.cross_ids
+    }
+    events = [
+        {
+            "event_id": event_id,
+            "cross_ids": sorted(group.cross_ids),
+            "representative_cross_id": min(group.cross_ids),
+            "question_bboxes": [list(group.question_bbox)],
+            "confidence": group.confidence,
+            "status": "confirmed",
+            "bbox_source": "spatial_llm2",
+        }
+        for event_id, group in enumerate(spatial_result.groups)
+    ]
+    for preserved in anchor_preservation["events"]:
+        if preserved["status"] != "needs_review":
+            continue
+        if any(cross_id in grouped_cross_ids for cross_id in preserved["cross_ids"]):
+            continue
+        events.append({**preserved, "event_id": len(events)})
+    return {
+        "event_count": len(events),
+        "events": events,
+        "policy": "Model groups are primary; unmatched strong anchors keep local review events.",
+    }
+
+
+def deduplicate_spatial_question_events(
+    events: list[dict],
+    anchors: list[dict],
+    config: dict,
+) -> dict:
+    anchor_by_id = {anchor["cross_id"]: anchor for anchor in anchors}
+    parent = list(range(len(events)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first: int, second: int) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parent[second_root] = first_root
+
+    decisions = []
+    for first_index, first in enumerate(events):
+        for second_index in range(first_index + 1, len(events)):
+            second = events[second_index]
+            first_bbox = first["question_bboxes"][0]
+            second_bbox = second["question_bboxes"][0]
+            intersection = _bbox_intersection_area(first_bbox, second_bbox)
+            smaller_area = min(_bbox_area(first_bbox), _bbox_area(second_bbox))
+            containment = intersection / smaller_area if smaller_area else 0.0
+            iou = _bbox_iou(first_bbox, second_bbox)
+            anchor_distance = min(
+                _bbox_center_distance(
+                    anchor_by_id[first_id]["bbox"],
+                    anchor_by_id[second_id]["bbox"],
+                )
+                for first_id in first["cross_ids"]
+                for second_id in second["cross_ids"]
+            )
+            should_merge = (
+                iou >= float(config["cross_anchor_spatial_dedupe_iou_threshold"])
+                or containment
+                >= float(
+                    config["cross_anchor_spatial_dedupe_containment_threshold"]
+                )
+            ) and anchor_distance <= float(
+                config["cross_anchor_spatial_dedupe_max_anchor_distance_ratio"]
+            )
+            if should_merge:
+                union(first_index, second_index)
+            decisions.append(
+                {
+                    "event_ids": [first["event_id"], second["event_id"]],
+                    "question_bbox_iou": round(iou, 6),
+                    "containment": round(containment, 6),
+                    "anchor_distance": round(anchor_distance, 6),
+                    "decision": "merged" if should_merge else "kept_separate",
+                }
+            )
+
+    clusters = {}
+    for index, event in enumerate(events):
+        clusters.setdefault(find(index), []).append(event)
+    deduped = []
+    for cluster in clusters.values():
+        representative = min(
+            cluster,
+            key=lambda event: (-float(event["confidence"]), event["event_id"]),
+        )
+        deduped.append(
+            {
+                "event_id": len(deduped),
+                "cross_ids": sorted(
+                    {cross_id for event in cluster for cross_id in event["cross_ids"]}
+                ),
+                "representative_cross_id": representative.get(
+                    "representative_cross_id",
+                    representative["cross_ids"][0],
+                ),
+                "question_bboxes": [
+                    bbox for event in cluster for bbox in event["question_bboxes"]
+                ],
+                "confidence": representative["confidence"],
+                "status": (
+                    "confirmed"
+                    if any(event["status"] == "confirmed" for event in cluster)
+                    else "needs_review"
+                ),
+                "bbox_source": representative["bbox_source"],
+                "source_event_ids": [event["event_id"] for event in cluster],
+            }
+        )
+    return {
+        "event_count": len(deduped),
+        "events": deduped,
+        "audit": decisions,
+        "policy": "High-overlap local merges retain every cross and source bbox.",
+    }
 
 
 def audit_cross_anchor_assignments(
@@ -2552,6 +3243,40 @@ class RecordingVisionClient:
                 diagnostic,
             ),
         )
+
+    def locate_spatial_cross_groups(
+        self,
+        image_path: str,
+        anchors: list[dict],
+        subject_hint: str | None,
+    ) -> SpatialQuestionGroupResult:
+        prompt = SPATIAL_CROSS_GROUP_PROMPT.replace(
+            "__CROSSES__",
+            json.dumps(anchors, ensure_ascii=False, indent=2),
+        )
+        diagnostic = {
+            "operation": "spatial_cross_group_localization",
+            "cross_count": len(anchors),
+        }
+        image_url = prepare_image_data_url(
+            image_path,
+            self.client.max_edge,
+            self.client.jpeg_quality,
+            diagnostic,
+        )
+        return self._call(
+            "spatial_cross_group_localization",
+            image_path,
+            {
+                "cross_ids": [anchor["cross_id"] for anchor in anchors],
+                "subject_hint": subject_hint,
+            },
+            lambda: self.client._request(
+                {"prompt": prompt, "image_url": image_url},
+                SpatialQuestionGroupResult,
+                diagnostic,
+            ),
+        )
     def detect_marks_in_regions(self, image_path, region_ids, correction=None):
         return self._call(
             "regional_mark_detection",
@@ -2822,6 +3547,37 @@ def build_summary(
         "cross_anchor_fallback_generates_anchors": (
             cross_anchor_experiment or {}
         ).get("llm1_fallback_generates_anchors"),
+        "cross_anchor_profile": (cross_anchor_experiment or {}).get("profile"),
+        "cross_anchor_independent_rescue_count": (
+            cross_anchor_experiment or {}
+        ).get("llm1_independent_rescue_count"),
+        "cross_anchor_llm2_batch_error_count": (
+            cross_anchor_experiment or {}
+        ).get("llm2_batch_error_count"),
+        "cross_anchor_preservation_confirmed_count": (
+            cross_anchor_experiment or {}
+        ).get("anchor_preservation_confirmed_count"),
+        "cross_anchor_preservation_needs_review_count": (
+            cross_anchor_experiment or {}
+        ).get("anchor_preservation_needs_review_count"),
+        "cross_anchor_preservation_confirmed_truth_recall": (
+            cross_anchor_experiment or {}
+        ).get("anchor_preservation_confirmed_truth_recall"),
+        "cross_anchor_preservation_union_truth_recall": (
+            cross_anchor_experiment or {}
+        ).get("anchor_preservation_union_truth_recall"),
+        "cross_anchor_spatial_group_request_count": (
+            cross_anchor_experiment or {}
+        ).get("spatial_group_request_count"),
+        "cross_anchor_spatial_question_event_count": (
+            cross_anchor_experiment or {}
+        ).get("spatial_question_event_count"),
+        "cross_anchor_spatial_truth_recall": (
+            cross_anchor_experiment or {}
+        ).get("spatial_truth_recall"),
+        "cross_anchor_spatial_false_event_count": (
+            cross_anchor_experiment or {}
+        ).get("spatial_false_event_count"),
         "cross_anchor_llm1_verification_run_count": (
             cross_anchor_experiment or {}
         ).get("llm1_verification_run_count"),
@@ -3012,6 +3768,7 @@ def run_case(
     truth_regions: list[dict] | None = None,
     compare_stable_events: bool = False,
     compare_cross_anchor: bool = False,
+    cross_anchor_profile: str = "baseline",
     primitive_duplicate_containment_threshold: float | None = None,
     cross_circle_max_center_distance: float | None = None,
 ) -> dict:
@@ -3167,6 +3924,7 @@ def run_case(
                     truth_regions=truth_regions,
                     config=cross_cv_config,
                     subject_hint=subject_hint,
+                    profile=cross_anchor_profile,
                 )
             except Exception as exc:
                 cross_anchor_experiment_error = {
@@ -3213,7 +3971,10 @@ def run_cross_anchor_experiment(
     truth_regions: list[dict],
     config: dict,
     subject_hint: str | None,
+    profile: str = "baseline",
 ) -> dict:
+    if profile not in CROSS_ANCHOR_PROFILES:
+        raise ValueError(f"unknown cross-anchor profile: {profile}")
     experiment_started = time.perf_counter()
     timings_ms = {}
     experiment_dir = case_dir / "cross-anchor-experiment"
@@ -3374,22 +4135,46 @@ def run_cross_anchor_experiment(
             if candidate_id in retained_fallback_ids
         ]
     )
-    verified_independent_scan = IndependentCrossScanResult(
-        crosses=(
-            retained_independent_scan.crosses
-            if fallback_generates_anchors
-            else []
+    rescue_audit = None
+    if profile == "baseline":
+        verified_independent_scan = IndependentCrossScanResult(
+            crosses=(
+                retained_independent_scan.crosses
+                if fallback_generates_anchors
+                else []
+            )
         )
-    )
+    else:
+        preliminary_anchors = build_cross_anchors(
+            verification,
+            IndependentCrossScanResult(crosses=[]),
+            cv_candidates,
+            config,
+        )
+        verified_independent_scan, rescue_audit = select_independent_rescue_crosses(
+            existing_anchors=preliminary_anchors,
+            independent_scan=independent_scan,
+            fallback_verification=fallback_verification,
+            image_path=image_path,
+            config=config,
+        )
+        _write_json(
+            experiment_dir / "independent-rescue-audit.json",
+            rescue_audit,
+        )
     anchors = build_cross_anchors(
         verification,
         verified_independent_scan,
         cv_candidates,
         config,
     )
+    if profile != "baseline":
+        for anchor in anchors:
+            if anchor["source"] == "llm_fallback":
+                anchor["source"] = "independent_scan_rescue"
     mark_existing_anchor_scan_support(
         anchors,
-        retained_independent_scan,
+        retained_independent_scan if profile == "baseline" else independent_scan,
         min_iou=float(config["cross_anchor_fallback_merge_iou_threshold"]),
         max_center_distance_ratio=float(
             config["cross_anchor_fallback_merge_center_distance_ratio"]
@@ -3498,27 +4283,117 @@ def run_cross_anchor_experiment(
     geometry_audits = []
     run_started = time.perf_counter()
     anchored_items = []
-    for batch_index, start in enumerate(range(0, len(anchors), batch_size), 1):
-        llm2_batch_count += 1
-        batch = anchors[start : start + batch_size]
-        batch_entries = [
-            {"mark_id": anchor["cross_id"], "bbox": anchor["bbox"]}
-            for anchor in batch
+    llm2_batch_errors = []
+    spatial_localization = None
+    if profile == "spatial-grouped":
+        spatial_groups = group_cross_anchors_spatially(anchors, config)
+        _write_json(
+            experiment_dir / "spatial-anchor-groups.json",
+            spatial_groups,
+        )
+        spatial_localization = run_spatial_group_localization(
+            image_path=image_path,
+            experiment_dir=experiment_dir,
+            client=client,
+            groups=spatial_groups,
+            subject_hint=subject_hint,
+        )
+        spatial_result = spatial_localization["result"]
+        llm2_batch_count = spatial_localization["request_count"]
+        llm2_batch_errors = [
+            {
+                "batch_index": error["spatial_group_id"] + 1,
+                "cross_ids": error["cross_ids"],
+                "type": error["type"],
+                "code": error["code"],
+                "message": error["message"],
+            }
+            for error in spatial_localization["errors"]
         ]
-        batch_overlay_path = experiment_dir / (
-            f"llm2-run-001-batch-{batch_index:03d}-overlay.jpg"
+        _write_json(
+            experiment_dir / "spatial-group-result.json",
+            spatial_result,
         )
-        _draw_boxes(
-            image_path,
-            batch_overlay_path,
-            [("C", batch_entries, "blue")],
+        _write_json(
+            experiment_dir / "group-membership-audit.json",
+            spatial_localization["membership_audit"],
         )
-        batch_result = client.locate_cross_anchored_questions(
-            str(batch_overlay_path),
-            batch,
-            subject_hint,
+        _write_json(
+            experiment_dir / "spatial-group-errors.json",
+            {"errors": spatial_localization["errors"]},
         )
-        anchored_items.extend(batch_result.items)
+        for question_group in spatial_result.groups:
+            anchored_items.extend(
+                CrossAnchoredQuestion(
+                    cross_id=cross_id,
+                    matched=True,
+                    question_bbox=question_group.question_bbox,
+                    unmatched_reason=None,
+                    confidence=question_group.confidence,
+                )
+                for cross_id in question_group.cross_ids
+            )
+        anchored_items.extend(
+            CrossAnchoredQuestion(
+                cross_id=item.cross_id,
+                matched=False,
+                question_bbox=None,
+                unmatched_reason=item.reason,
+                confidence=item.confidence,
+            )
+            for item in spatial_result.unmatched
+        )
+    else:
+        for batch_index, start in enumerate(range(0, len(anchors), batch_size), 1):
+            llm2_batch_count += 1
+            batch = anchors[start : start + batch_size]
+            batch_entries = [
+                {"mark_id": anchor["cross_id"], "bbox": anchor["bbox"]}
+                for anchor in batch
+            ]
+            batch_overlay_path = experiment_dir / (
+                f"llm2-run-001-batch-{batch_index:03d}-overlay.jpg"
+            )
+            _draw_boxes(
+                image_path,
+                batch_overlay_path,
+                [("C", batch_entries, "blue")],
+            )
+            try:
+                batch_result = client.locate_cross_anchored_questions(
+                    str(batch_overlay_path),
+                    batch,
+                    subject_hint,
+                )
+            except Exception as exc:
+                if profile != "anchor-preserving":
+                    raise
+                llm2_batch_errors.append(
+                    {
+                        "batch_index": batch_index,
+                        "cross_ids": [anchor["cross_id"] for anchor in batch],
+                        "type": type(exc).__name__,
+                        "code": getattr(exc, "code", None),
+                        "message": str(exc),
+                    }
+                )
+                batch_result = CrossAnchoredQuestionResult(
+                    items=[
+                        CrossAnchoredQuestion(
+                            cross_id=anchor["cross_id"],
+                            matched=False,
+                            question_bbox=None,
+                            unmatched_reason="LLM2 batch request failed",
+                            confidence=0.0,
+                        )
+                        for anchor in batch
+                    ]
+                )
+            anchored_items.extend(batch_result.items)
+    _write_json(
+        experiment_dir / "llm2-batch-errors.json",
+        {"errors": llm2_batch_errors},
+    )
     first_run = CrossAnchoredQuestionResult(items=anchored_items)
     llm2_runs.append(first_run)
     _write_json(
@@ -3547,6 +4422,99 @@ def run_cross_anchor_experiment(
         experiment_dir / "question-geometry-audit-run-001.json",
         first_geometry_audit,
     )
+    anchor_preservation = None
+    anchor_preservation_truth = None
+    anchor_preservation_confirmed_truth = None
+    spatial_deduplicated_events = None
+    spatial_truth_comparison = None
+    if profile in ("anchor-preserving", "spatial-grouped"):
+        anchor_preservation = build_anchor_preservation_events(
+            anchors=anchors,
+            result=first_run,
+            geometry_audit=first_geometry_audit,
+            batch_errors=llm2_batch_errors,
+            image_path=image_path,
+            config=config,
+        )
+        preservation_events = {
+            "event_count": anchor_preservation["event_count"],
+            "events": anchor_preservation["events"],
+            "policy": anchor_preservation["policy"],
+        }
+        _write_json(
+            experiment_dir / "anchor-preservation-events.json",
+            preservation_events,
+        )
+        _write_json(
+            experiment_dir / "anchor-preservation-audit.json",
+            {
+                "items": anchor_preservation["audit"],
+                "batch_errors": llm2_batch_errors,
+            },
+        )
+        anchor_preservation_truth = compare_question_events_to_truth(
+            preservation_events,
+            truth_regions,
+            min_iou=float(config["question_truth_min_iou"]),
+        )
+        _write_json(
+            experiment_dir / "anchor-preservation-truth-comparison.json",
+            anchor_preservation_truth,
+        )
+        confirmed_events = [
+            event
+            for event in anchor_preservation["events"]
+            if event["status"] == "confirmed"
+        ]
+        confirmed_event_result = {
+            "event_count": len(confirmed_events),
+            "events": confirmed_events,
+        }
+        anchor_preservation_confirmed_truth = compare_question_events_to_truth(
+            confirmed_event_result,
+            truth_regions,
+            min_iou=float(config["question_truth_min_iou"]),
+        )
+        _write_json(
+            experiment_dir
+            / "anchor-preservation-confirmed-truth-comparison.json",
+            anchor_preservation_confirmed_truth,
+        )
+    if profile == "spatial-grouped":
+        spatial_question_events = build_spatial_question_events(
+            spatial_result,
+            anchor_preservation,
+        )
+        _write_json(
+            experiment_dir / "spatial-question-events.json",
+            spatial_question_events,
+        )
+        spatial_deduplicated_events = deduplicate_spatial_question_events(
+            spatial_question_events["events"],
+            anchors,
+            config,
+        )
+        _write_json(
+            experiment_dir / "deduplicated-question-events.json",
+            {
+                "event_count": spatial_deduplicated_events["event_count"],
+                "events": spatial_deduplicated_events["events"],
+                "policy": spatial_deduplicated_events["policy"],
+            },
+        )
+        _write_json(
+            experiment_dir / "deduplication-audit.json",
+            {"decisions": spatial_deduplicated_events["audit"]},
+        )
+        spatial_truth_comparison = compare_question_events_to_truth(
+            spatial_deduplicated_events,
+            truth_regions,
+            min_iou=float(config["question_truth_min_iou"]),
+        )
+        _write_json(
+            experiment_dir / "spatial-question-events-truth-comparison.json",
+            spatial_truth_comparison,
+        )
     timings_ms["llm2_localization_run_001"] = round(
         (time.perf_counter() - run_started) * 1000,
         2,
@@ -3819,6 +4787,7 @@ def run_cross_anchor_experiment(
     }
 
     summary = {
+        "profile": profile,
         "cv_candidate_count": len(cv_candidates),
         "llm1_verification_run_count": verification_run_count,
         "llm1_unstable_candidate_count": len(
@@ -3843,6 +4812,9 @@ def run_cross_anchor_experiment(
         "llm1_fallback_verified_count": len(confirmed_fallback_ids),
         "llm1_fallback_uncertain_retained_count": len(uncertain_fallback_ids),
         "llm1_fallback_generates_anchors": fallback_generates_anchors,
+        "llm1_independent_rescue_count": (
+            rescue_audit["rescued_count"] if rescue_audit is not None else 0
+        ),
         "llm1_independent_scan_count": len(independent_scan.crosses),
         "llm1_independent_supported_count": sum(
             anchor["independent_scan_supported"] for anchor in anchors
@@ -3870,6 +4842,53 @@ def run_cross_anchor_experiment(
         "llm2_matched_question_count": len(matched_questions),
         "llm2_unmatched_cross_count": len(anchored_questions.items)
         - len(matched_questions),
+        "llm2_batch_error_count": len(llm2_batch_errors),
+        "anchor_preservation_confirmed_count": (
+            sum(
+                event["status"] == "confirmed"
+                for event in anchor_preservation["events"]
+            )
+            if anchor_preservation is not None
+            else None
+        ),
+        "anchor_preservation_needs_review_count": (
+            sum(
+                event["status"] == "needs_review"
+                for event in anchor_preservation["events"]
+            )
+            if anchor_preservation is not None
+            else None
+        ),
+        "anchor_preservation_confirmed_truth_recall": (
+            anchor_preservation_confirmed_truth["truth_recall"]
+            if anchor_preservation_confirmed_truth is not None
+            else None
+        ),
+        "anchor_preservation_union_truth_recall": (
+            anchor_preservation_truth["truth_recall"]
+            if anchor_preservation_truth is not None
+            else None
+        ),
+        "spatial_group_request_count": (
+            spatial_localization["request_count"]
+            if spatial_localization is not None
+            else None
+        ),
+        "spatial_question_event_count": (
+            spatial_deduplicated_events["event_count"]
+            if spatial_deduplicated_events is not None
+            else None
+        ),
+        "spatial_truth_recall": (
+            spatial_truth_comparison["truth_recall"]
+            if spatial_truth_comparison is not None
+            else None
+        ),
+        "spatial_false_event_count": (
+            len(spatial_truth_comparison["false_event_ids"])
+            if spatial_truth_comparison is not None
+            else None
+        ),
         "llm2_assignment_audit_valid": assignment_audit["valid"],
         "llm2_localization_run_count": len(llm2_runs),
         "llm2_retry_trigger_count": retry_selection["trigger_count"],
@@ -4013,6 +5032,27 @@ def load_cross_cv_inputs(
         "cross_anchor_cv_dedupe_center_distance_ratio",
         "cross_anchor_fallback_merge_iou_threshold",
         "cross_anchor_fallback_merge_center_distance_ratio",
+        "cross_anchor_rescue_min_scan_confidence",
+        "cross_anchor_rescue_min_red_pixel_ratio",
+        "cross_anchor_rescue_min_bbox_area_ratio",
+        "cross_anchor_rescue_max_bbox_area_ratio",
+        "cross_anchor_rescue_edge_margin_ratio",
+        "cross_anchor_preserve_strong_sources",
+        "cross_anchor_preserve_min_confidence",
+        "cross_anchor_preserve_min_red_pixel_ratio",
+        "cross_anchor_context_horizontal_padding_ratio",
+        "cross_anchor_context_vertical_padding_ratio",
+        "cross_anchor_context_min_width_ratio",
+        "cross_anchor_context_min_height_ratio",
+        "cross_anchor_context_max_area_ratio",
+        "cross_anchor_spatial_row_distance_ratio",
+        "cross_anchor_spatial_horizontal_gap_ratio",
+        "cross_anchor_spatial_max_anchors_per_group",
+        "cross_anchor_spatial_crop_padding_ratio",
+        "cross_anchor_spatial_max_crop_area_ratio",
+        "cross_anchor_spatial_dedupe_iou_threshold",
+        "cross_anchor_spatial_dedupe_containment_threshold",
+        "cross_anchor_spatial_dedupe_max_anchor_distance_ratio",
         "cross_anchor_montage_full_page_max_edge",
         "cross_anchor_montage_tile_edge",
         "cross_anchor_montage_columns",
@@ -4033,6 +5073,7 @@ def load_cross_cv_inputs(
         "cross_anchor_llm2_localization_runs",
         "cross_anchor_llm2_retry_shared_question_min_group_size",
         "cross_anchor_llm2_retry_max_requests_per_page",
+        "cross_anchor_spatial_max_anchors_per_group",
     }
     for name in positive_integer_fields:
         if int(config[name]) <= 0:
@@ -4058,6 +5099,7 @@ def load_cross_cv_inputs(
         "cross_anchor_llm2_retry_first_pass_min_question_cross_area_ratio",
         "cross_anchor_llm2_retry_min_question_cross_area_ratio",
         *boolean_fields,
+        "cross_anchor_preserve_strong_sources",
     }
     for name in ratio_fields:
         if not 0 <= float(config[name]) <= 1:
@@ -4072,6 +5114,25 @@ def load_cross_cv_inputs(
         config["arm_outer_radius_ratio"]
     ):
         raise ValueError("arm inner radius must be smaller than outer radius")
+    strong_sources = config["cross_anchor_preserve_strong_sources"]
+    if not isinstance(strong_sources, list) or not strong_sources:
+        raise ValueError("cross anchor preserve strong sources must not be empty")
+    allowed_sources = {
+        "cv_confirmed",
+        "cv_uncertain",
+        "cv_high_score_retained",
+        "cv_rejected_retained",
+        "independent_scan_rescue",
+    }
+    if any(
+        not isinstance(source, str) or source not in allowed_sources
+        for source in strong_sources
+    ):
+        raise ValueError("cross anchor preserve strong sources contain invalid value")
+    if float(config["cross_anchor_rescue_min_bbox_area_ratio"]) > float(
+        config["cross_anchor_rescue_max_bbox_area_ratio"]
+    ):
+        raise ValueError("cross anchor rescue minimum area exceeds maximum")
 
     truth_payload = json.loads(truth_path.read_text(encoding="utf-8"))
     pages = truth_payload.get("pages")
@@ -4249,6 +5310,45 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
                 requests=item["cross_anchor_llm_request_count"],
             )
         )
+    lines.extend(
+        [
+            "",
+            "## 独立实验 Profile",
+            "",
+            "> confirmed 与 needs_review 分开统计；空间分组结果只代表当前显式 profile，不覆盖 baseline 字段。",
+            "",
+            "| 图片 | Profile | 独立补锚 | LLM2批次异常 | confirmed | needs_review | confirmed召回 | 含保底召回 | 空间分组请求 | 去重后事件 | 空间结果召回 | 空间误报事件 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for summary in summaries:
+        item = summary["checkpoints"]
+        lines.append(
+            "| {label} | {profile} | {rescue} | {batch_errors} | {confirmed} | {needs_review} | {confirmed_recall} | {union_recall} | {spatial_requests} | {spatial_events} | {spatial_recall} | {spatial_false} |".format(
+                label=summary["label"],
+                profile=item["cross_anchor_profile"],
+                rescue=item["cross_anchor_independent_rescue_count"],
+                batch_errors=item["cross_anchor_llm2_batch_error_count"],
+                confirmed=item["cross_anchor_preservation_confirmed_count"],
+                needs_review=item[
+                    "cross_anchor_preservation_needs_review_count"
+                ],
+                confirmed_recall=item[
+                    "cross_anchor_preservation_confirmed_truth_recall"
+                ],
+                union_recall=item[
+                    "cross_anchor_preservation_union_truth_recall"
+                ],
+                spatial_requests=item[
+                    "cross_anchor_spatial_group_request_count"
+                ],
+                spatial_events=item[
+                    "cross_anchor_spatial_question_event_count"
+                ],
+                spatial_recall=item["cross_anchor_spatial_truth_recall"],
+                spatial_false=item["cross_anchor_spatial_false_event_count"],
+            )
+        )
     (output_dir / "comparison-report.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )
@@ -4260,15 +5360,15 @@ def _write_timing_report(output_dir: Path, summaries: list[dict]) -> None:
         "",
         "> 单位均为毫秒。旧生产流程、旧stable实验和新cross-anchor实验在同一轮中串行执行；整页总耗时包含本地CV、文件输出及所有启用实验。",
         "",
-        "| 图片 | 整页总耗时 | 红色证据CV | 红叉候选CV | 旧生产流程 | 旧stable实验 | 新方案总耗时 | LLM1核验次数 | 新方案LLM请求 | 定向复查触发 | 定向复查请求 | LLM1候选核验 | 独立漏检扫描 | fallback复核 | LLM2定位总计 | 定向复查耗时 | 后置审计 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 整页总耗时 | 红色证据CV | 红叉候选CV | 旧生产流程 | 旧stable实验 | 新方案总耗时 | LLM1核验次数 | 新方案LLM请求 | 定向复查触发 | 定向复查请求 | LLM1候选核验 | 独立漏检扫描 | fallback复核 | LLM2定位总计 | 定向复查耗时 | 后置审计 | Profile | 空间分组请求 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
     for summary in summaries:
         case_timings = summary.get("timings_ms") or {}
         checkpoints = summary["checkpoints"]
         stage_timings = checkpoints.get("cross_anchor_stage_timings_ms") or {}
         lines.append(
-            "| {label} | {total} | {red_cv} | {cross_cv} | {production} | {stable} | {cross_anchor} | {runs} | {requests} | {retry_triggers} | {retry_requests} | {verify} | {scan} | {fallback} | {llm2} | {llm2_second} | {audit} |".format(
+            "| {label} | {total} | {red_cv} | {cross_cv} | {production} | {stable} | {cross_anchor} | {runs} | {requests} | {retry_triggers} | {retry_requests} | {verify} | {scan} | {fallback} | {llm2} | {llm2_second} | {audit} | {profile} | {spatial_requests} |".format(
                 label=summary["label"],
                 total=case_timings.get("total"),
                 red_cv=case_timings.get("red_evidence_cv"),
@@ -4296,6 +5396,10 @@ def _write_timing_report(output_dir: Path, summaries: list[dict]) -> None:
                     "llm2_localization_run_002"
                 ),
                 audit=stage_timings.get("post_llm2_audit"),
+                profile=checkpoints.get("cross_anchor_profile"),
+                spatial_requests=checkpoints.get(
+                    "cross_anchor_spatial_group_request_count"
+                ),
             )
         )
     (output_dir / "timing-report.md").write_text(
@@ -4340,6 +5444,17 @@ def main() -> int:
             "also run CV candidate verification, independently reverify fallback "
             "crosses, and batch cross-anchored question localization"
         ),
+    )
+    parser.add_argument(
+        "--cross-anchor-profile",
+        choices=(
+            "baseline",
+            "independent-rescue",
+            "anchor-preserving",
+            "spatial-grouped",
+        ),
+        default="baseline",
+        help="select an isolated cross-anchor diagnostic experiment profile",
     )
     parser.add_argument(
         "--stable-primitive-duplicate-containment-threshold",
@@ -4414,6 +5529,7 @@ def main() -> int:
             "cv_cross_only": args.cv_cross_only,
             "compare_stable_events": args.compare_stable_events,
             "compare_cross_anchor": args.compare_cross_anchor,
+            "cross_anchor_profile": args.cross_anchor_profile,
             "stable_primitive_duplicate_containment_threshold": (
                 args.stable_primitive_duplicate_containment_threshold
             ),
@@ -4435,6 +5551,7 @@ def main() -> int:
             truth_regions=truth_by_label.get(label),
             compare_stable_events=args.compare_stable_events,
             compare_cross_anchor=args.compare_cross_anchor,
+            cross_anchor_profile=args.cross_anchor_profile,
             primitive_duplicate_containment_threshold=(
                 args.stable_primitive_duplicate_containment_threshold
             ),
