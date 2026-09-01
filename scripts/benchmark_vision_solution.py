@@ -321,6 +321,69 @@ def run_old_solution_page(
     }
 
 
+def run_old_solution_page_safely(
+    *,
+    image_path: Path,
+    subject: str,
+    client,
+    mark_confidence_threshold: float,
+    red_pixel_min_ratio: float,
+    red_pixel_expansion_ratio: float,
+    localization_threshold: float = 0.0,
+    localization_max_area_ratio: float = 1.0,
+    crop_context_padding_ratio: float = 0.0,
+) -> dict:
+    page_started = time.perf_counter()
+    first_record = len(getattr(client, "benchmark_request_records", []))
+    try:
+        result = run_old_solution_page(
+            image_path=image_path,
+            subject=subject,
+            client=client,
+            mark_confidence_threshold=mark_confidence_threshold,
+            red_pixel_min_ratio=red_pixel_min_ratio,
+            red_pixel_expansion_ratio=red_pixel_expansion_ratio,
+            localization_threshold=localization_threshold,
+            localization_max_area_ratio=localization_max_area_ratio,
+            crop_context_padding_ratio=crop_context_padding_ratio,
+        )
+    except Exception as exc:
+        diagnostic = getattr(exc, "diagnostic", None) or {}
+        request_records = list(
+            getattr(client, "benchmark_request_records", [])[first_record:]
+        )
+        return {
+            "solution_id": SOLUTION_ID,
+            "page_status": "failed",
+            "failed_stage": diagnostic.get("operation") or "unknown",
+            "error": {
+                "type": type(exc).__name__,
+                "code": getattr(exc, "code", None),
+                "message": str(exc),
+                "diagnostic": diagnostic,
+            },
+            "predictions": [],
+            "llm_request_count": len(request_records),
+            "request_records": request_records,
+            "timing_ms": {
+                "core_total": round(
+                    (time.perf_counter() - page_started) * 1000, 2
+                ),
+                "recognition": None,
+                "mark_filter_cv": None,
+                "localization": None,
+                "post_audit": None,
+                "ocr": 0,
+            },
+            "recognition": None,
+            "valid_error_mark_ids": [],
+            "rejected_error_mark_ids": [],
+            "error_mark_validation": [],
+            "localization": None,
+        }
+    return {**result, "page_status": "completed", "failed_stage": None, "error": None}
+
+
 def _write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -360,8 +423,8 @@ def _write_reports(output_dir: Path, page_results: list[dict]) -> None:
     comparison_lines = [
         "# 视觉方案基准报告",
         "",
-        "| 图片 | 真值 | 预测 | 命中 | 召回 | 误报 | 重复归属 | LLM请求 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 状态 | 失败阶段 | 真值 | 预测 | 命中 | 召回 | 误报 | 重复归属 | LLM请求 |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     timing_lines = [
         "# 视觉方案耗时报告",
@@ -375,7 +438,8 @@ def _write_reports(output_dir: Path, page_results: list[dict]) -> None:
         audit = result["truth_audit"]
         timing = result["timing_ms"]
         comparison_lines.append(
-            f"| {result['label']} | {audit['truth_count']} | {audit['prediction_count']} | "
+            f"| {result['label']} | {result['page_status']} | {result['failed_stage'] or '-'} | "
+            f"{audit['truth_count']} | {audit['prediction_count']} | "
             f"{audit['matched_truth_count']} | {audit['truth_recall']} | "
             f"{len(audit['false_prediction_ids'])} | {len(audit['duplicate_truth_assignments'])} | "
             f"{result['llm_request_count']} |"
@@ -431,7 +495,7 @@ def main(arguments: Iterable[str] | None = None) -> int:
         page_dir = args.output / "pages" / label
         raw_dir = page_dir / "raw-llm-calls"
         raw_dir.mkdir(parents=True)
-        result = run_old_solution_page(
+        result = run_old_solution_page_safely(
             image_path=image_path,
             subject=args.subject,
             client=client,
@@ -471,6 +535,18 @@ def main(arguments: Iterable[str] | None = None) -> int:
         "truth_sha256": _sha256(args.truth_regions),
         "image_sha256_by_label": image_hashes,
         "all_truth_recalled": total_matched == total_truth,
+        "failed_page_count": sum(
+            item["page_status"] == "failed" for item in page_results
+        ),
+        "failed_pages": [
+            {
+                "label": item["label"],
+                "failed_stage": item["failed_stage"],
+                "error": item["error"],
+            }
+            for item in page_results
+            if item["page_status"] == "failed"
+        ],
         "truth_count": total_truth,
         "matched_truth_count": total_matched,
         "truth_recall": round(total_matched / total_truth, 6),
@@ -480,6 +556,9 @@ def main(arguments: Iterable[str] | None = None) -> int:
         "pages": [
             {
                 "label": item["label"],
+                "page_status": item["page_status"],
+                "failed_stage": item["failed_stage"],
+                "error": item["error"],
                 "truth_audit": item["truth_audit"],
                 "llm_request_count": item["llm_request_count"],
                 "timing_ms": item["timing_ms"],

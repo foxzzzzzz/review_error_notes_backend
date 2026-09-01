@@ -9,6 +9,7 @@ from app.services.vision_recognition import (
     LocalizationItem,
     LocalizationResult,
     VisionItem,
+    VisionRecognitionError,
     VisionResult,
 )
 
@@ -138,6 +139,25 @@ class RejectedMarkClient(FakeOldClient):
         raise AssertionError("localization must not run when every detected mark is rejected")
 
 
+class InvalidRecognitionClient:
+    def __init__(self):
+        self.benchmark_request_records = []
+
+    def recognize(self, image_path, subject_hint=None):
+        self.benchmark_request_records.append(
+            {
+                "request_index": 1,
+                "operation": "recognition",
+                "raw_response": {"content": "invalid model output"},
+            }
+        )
+        raise VisionRecognitionError(
+            "vision_response_schema_invalid",
+            "识别结果格式不完整，请稍后重试",
+            {"operation": "recognition"},
+        )
+
+
 def test_old_solution_runs_recognition_filter_and_localization_once(tmp_path):
     benchmark = _load_module()
     image_path = tmp_path / "page.jpg"
@@ -185,3 +205,27 @@ def test_old_solution_skips_localization_when_all_detected_marks_are_rejected(
     assert result["predictions"] == []
     assert result["llm_request_count"] == 1
     assert [call[0] for call in client.calls] == ["recognize"]
+
+
+def test_old_solution_records_page_failure_and_preserves_raw_call(tmp_path):
+    benchmark = _load_module()
+    image_path = tmp_path / "page.jpg"
+    Image.new("RGB", (200, 200), "white").save(image_path)
+
+    result = benchmark.run_old_solution_page_safely(
+        image_path=image_path,
+        subject="chinese",
+        client=InvalidRecognitionClient(),
+        mark_confidence_threshold=0.85,
+        red_pixel_min_ratio=0.005,
+        red_pixel_expansion_ratio=0.08,
+    )
+
+    assert result["page_status"] == "failed"
+    assert result["failed_stage"] == "recognition"
+    assert result["predictions"] == []
+    assert result["llm_request_count"] == 1
+    assert result["request_records"][0]["raw_response"] == {
+        "content": "invalid model output"
+    }
+    assert result["error"]["code"] == "vision_response_schema_invalid"
