@@ -57,6 +57,17 @@ def _config():
         "montage_tile_height": 240,
         "montage_label_height": 28,
         "montage_jpeg_quality": 90,
+        "anchor_montage_columns": 3,
+        "anchor_montage_tile_width": 320,
+        "anchor_montage_tile_height": 240,
+        "anchor_montage_label_height": 28,
+        "anchor_montage_crop_padding_ratio": 0.02,
+        "local_recheck_red_min_channel": 100,
+        "local_recheck_red_min_excess": 20,
+        "local_recheck_center_window_ratio": 0.08,
+        "local_recheck_min_center_red_ratio": 0.05,
+        "local_recheck_bottom_page_number_min_y_ratio": 0.9,
+        "local_recheck_page_number_max_distance_ratio": 0.04,
     }
 
 
@@ -257,3 +268,183 @@ def test_selector_prompt_forbids_coordinates_and_allows_circle_as_auxiliary():
     assert "不得返回或生成任何 bbox" in diagnostic.NUMBERED_SELECTION_PROMPT
     assert "红圈" in diagnostic.NUMBERED_SELECTION_PROMPT
     assert "selected_candidate_id" in diagnostic.NUMBERED_SELECTION_PROMPT
+
+
+def test_local_recheck_rejects_empty_center_but_preserves_centered_cross(tmp_path):
+    diagnostic = _load_script_module()
+    image_path = tmp_path / "anchors.jpg"
+    image = Image.new("RGB", (300, 150), "white")
+    draw = ImageDraw.Draw(image)
+    draw.line((35, 35, 115, 115), fill=(220, 20, 20), width=8)
+    draw.line((115, 35, 35, 115), fill=(220, 20, 20), width=8)
+    draw.ellipse((185, 35, 265, 115), outline=(220, 20, 20), width=8)
+    image.save(image_path)
+    anchors = [
+        {"cross_id": 0, "bbox": [0.0, 0.0, 0.5, 1.0]},
+        {"cross_id": 1, "bbox": [0.5, 0.0, 1.0, 1.0]},
+    ]
+
+    assessments = diagnostic.assess_local_anchor_geometry(
+        image_path=image_path,
+        anchors=anchors,
+        ocr_lines=[],
+        config=_config(),
+    )
+
+    assert assessments == [
+        {
+            "cross_id": 0,
+            "decision": "keep",
+            "reason": "center_red_supported",
+            "center_red_ratio": assessments[0]["center_red_ratio"],
+            "page_number_text": None,
+        },
+        {
+            "cross_id": 1,
+            "decision": "reject",
+            "reason": "insufficient_center_red",
+            "center_red_ratio": 0.0,
+            "page_number_text": None,
+        },
+    ]
+
+
+def test_local_recheck_rejects_bottom_numeric_page_marker(tmp_path):
+    diagnostic = _load_script_module()
+    image_path = tmp_path / "page.jpg"
+    image = Image.new("RGB", (200, 200), "white")
+    draw = ImageDraw.Draw(image)
+    draw.line((85, 175, 115, 195), fill=(220, 20, 20), width=6)
+    draw.line((115, 175, 85, 195), fill=(220, 20, 20), width=6)
+    image.save(image_path)
+    anchors = [{"cross_id": 3, "bbox": [0.4, 0.84, 0.6, 1.0]}]
+    ocr_lines = [{"text": "35", "bbox": [0.46, 0.91, 0.54, 0.97], "confidence": 0.99}]
+
+    assessments = diagnostic.assess_local_anchor_geometry(
+        image_path=image_path,
+        anchors=anchors,
+        ocr_lines=ocr_lines,
+        config=_config(),
+    )
+
+    assert assessments[0]["decision"] == "reject"
+    assert assessments[0]["reason"] == "bottom_page_number"
+    assert assessments[0]["page_number_text"] == "35"
+
+
+def test_consensus_filter_rejects_only_when_local_and_llm_agree():
+    diagnostic = _load_script_module()
+    assessments = [
+        {"cross_id": 0, "decision": "reject"},
+        {"cross_id": 1, "decision": "reject"},
+        {"cross_id": 2, "decision": "keep"},
+    ]
+    verifications = [
+        {"cross_id": 0, "decision": "not_cross"},
+        {"cross_id": 1, "decision": "uncertain"},
+        {"cross_id": 2, "decision": "not_cross"},
+    ]
+
+    result = diagnostic.consensus_anchor_filter(
+        anchor_ids=[0, 1, 2],
+        local_assessments=assessments,
+        llm_verifications=verifications,
+    )
+
+    assert result == {
+        "kept_cross_ids": [1, 2],
+        "rejected_cross_ids": [0],
+    }
+
+
+def test_deterministic_events_prefer_standard_candidate_and_deduplicate():
+    diagnostic = _load_script_module()
+    anchors = [
+        {"cross_id": 0, "confidence": 0.8},
+        {"cross_id": 1, "confidence": 0.9},
+    ]
+    candidates = [
+        {
+            "candidate_id": "Q0",
+            "boundary_variant": "compact",
+            "question_bbox": [0.2, 0.2, 0.4, 0.4],
+        },
+        {
+            "candidate_id": "Q1",
+            "boundary_variant": "standard",
+            "question_bbox": [0.1, 0.1, 0.5, 0.5],
+        },
+    ]
+    allowed = {0: ["Q0", "Q1"], 1: ["Q0", "Q1"]}
+
+    events = diagnostic.build_deterministic_events(
+        anchors=anchors,
+        candidates=candidates,
+        allowed=allowed,
+        kept_cross_ids=[0, 1],
+    )
+
+    assert events == [
+        {
+            "event_id": 0,
+            "candidate_id": "Q1",
+            "cross_ids": [0, 1],
+            "question_bbox": [0.1, 0.1, 0.5, 0.5],
+            "confidence": 0.9,
+        }
+    ]
+
+
+def test_anchor_verification_audit_rejects_inconsistent_visual_evidence():
+    diagnostic = _load_script_module()
+    verifications = [
+        {
+            "cross_id": 0,
+            "decision": "real_cross",
+            "visual_evidence": "circle_or_oval",
+            "confidence": 0.9,
+        },
+        {
+            "cross_id": 1,
+            "decision": "not_cross",
+            "visual_evidence": "printed_grid_or_text",
+            "confidence": 0.8,
+        },
+    ]
+
+    audit = diagnostic.audit_anchor_verifications(verifications, [0, 1])
+
+    assert audit["valid"] is False
+    assert audit["accepted"] == [verifications[1]]
+    assert audit["violations"] == [
+        {"cross_id": 0, "reason": "real_cross_without_cross_evidence"}
+    ]
+
+
+def test_anchor_montage_has_one_labeled_tile_per_anchor(tmp_path):
+    diagnostic = _load_script_module()
+    image_path = tmp_path / "page.jpg"
+    output_path = tmp_path / "montage.jpg"
+    Image.new("RGB", (200, 200), "white").save(image_path)
+    anchors = [
+        {"cross_id": 2, "bbox": [0.1, 0.1, 0.3, 0.3]},
+        {"cross_id": 7, "bbox": [0.6, 0.6, 0.8, 0.8]},
+    ]
+
+    diagnostic.write_anchor_verification_montage(
+        image_path=image_path,
+        output_path=output_path,
+        anchors=anchors,
+        config=_config(),
+    )
+
+    with Image.open(output_path) as montage:
+        assert montage.size == (960, 240)
+
+
+def test_anchor_prompt_does_not_ask_model_to_select_question_candidates():
+    diagnostic = _load_script_module()
+
+    assert "禁止默认全部确认" in diagnostic.ANCHOR_VERIFICATION_PROMPT
+    assert "two_intersecting_red_diagonal_strokes" in diagnostic.ANCHOR_VERIFICATION_PROMPT
+    assert "selected_candidate_id" not in diagnostic.ANCHOR_VERIFICATION_PROMPT

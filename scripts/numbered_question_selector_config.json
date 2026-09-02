@@ -36,7 +36,18 @@
     "montage_tile_width": "编号候选拼图中每个局部上下文块的宽度像素。",
     "montage_tile_height": "编号候选拼图中每个局部上下文块的高度像素。",
     "montage_label_height": "编号候选拼图中每个局部块顶部标签栏高度像素。",
-    "montage_jpeg_quality": "编号候选拼图JPEG保存质量。"
+    "montage_jpeg_quality": "诊断拼图JPEG保存质量。",
+    "anchor_montage_columns": "纯红叉真假核验拼图的列数。",
+    "anchor_montage_tile_width": "纯红叉真假核验拼图中每个局部块的宽度像素。",
+    "anchor_montage_tile_height": "纯红叉真假核验拼图中每个局部块的高度像素。",
+    "anchor_montage_label_height": "纯红叉真假核验拼图中每个局部块顶部标签栏高度像素。",
+    "anchor_montage_crop_padding_ratio": "纯红叉真假核验局部图在锚点框四周扩张的整页比例。",
+    "local_recheck_red_min_channel": "本地保守复检中红色像素的最低R通道值。",
+    "local_recheck_red_min_excess": "本地保守复检中R通道高于G/B通道的最小差值。",
+    "local_recheck_center_window_ratio": "本地复检计算交点红色支持时中心窗口半宽高相对锚点框的比例。",
+    "local_recheck_min_center_red_ratio": "锚点中心窗口最低红色像素占比；低于该值才作为高确定性非红叉拒绝。",
+    "local_recheck_bottom_page_number_min_y_ratio": "仅在锚点中心低于该页面纵向位置时启用页码数字排除。",
+    "local_recheck_page_number_max_distance_ratio": "页底锚点中心与纯数字OCR中心视为同一页码标记的最大归一化距离。"
   },
   "ocr_full_page_max_edge": 1600,
   "ocr_line_confidence_threshold": 0.45,
@@ -74,5 +85,16 @@
   "montage_tile_width": 420,
   "montage_tile_height": 320,
   "montage_label_height": 32,
-  "montage_jpeg_quality": 90
+  "montage_jpeg_quality": 90,
+  "anchor_montage_columns": 3,
+  "anchor_montage_tile_width": 480,
+  "anchor_montage_tile_height": 360,
+  "anchor_montage_label_height": 36,
+  "anchor_montage_crop_padding_ratio": 0.02,
+  "local_recheck_red_min_channel": 60,
+  "local_recheck_red_min_excess": 6,
+  "local_recheck_center_window_ratio": 0.08,
+  "local_recheck_min_center_red_ratio": 0.05,
+  "local_recheck_bottom_page_number_min_y_ratio": 0.9,
+  "local_recheck_page_number_max_distance_ratio": 0.04
 }

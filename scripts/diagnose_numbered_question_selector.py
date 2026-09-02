@@ -1,7 +1,7 @@
-"""Diagnose deterministic OCR/layout candidates with one numbered LLM selection per page.
+"""Diagnose deterministic question boundaries and conservative anchor filtering.
 
-The experiment replays existing CV + LLM1 anchors. The model may select only a
-candidate ID or reject an anchor; it never generates question geometry.
+The experiment replays existing CV + LLM1 anchors. Local rules select question
+geometry; one optional LLM request per page only classifies anchor shapes.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 import time
@@ -58,6 +59,26 @@ NUMBERED_SELECTION_PROMPT = """你是小学作业错题候选选择器。当前�
 """
 
 
+ANCHOR_VERIFICATION_PROMPT = """你是小学作业批改红叉核验器。图片是红色标记局部放大拼图，每块顶部标有C编号，蓝框只是本地算法给出的待核验区域，不代表其中一定有红叉。
+
+你的唯一任务是逐个判断蓝框内的主要红色形状，不判断题目内容，不选择题目区域。
+
+判定标准：
+1. real_cross：必须能直接看到两条方向相反、彼此相交的红色斜笔画，整体构成清晰X。只有这种情况才能选择real_cross。
+2. not_cross：红圈或椭圆、页码圆圈、单条斜线、下划线、老师批注、文字笔画、印刷红色方格，或者蓝框内没有清晰X。
+3. uncertain：图片确实模糊、笔画被遮挡或只能看到红叉的一部分，无法可靠区分real_cross与not_cross。不得为了完成任务而猜测。
+4. 蓝框是候选提示而不是答案；页面中可以大多数都不是红叉，也可以全部都是红叉。必须独立检查每个C编号，禁止默认全部确认。
+5. 红圈只能帮助理解上下文，红圈本身不是红叉。红圈与单条斜线相邻也不能算X。
+6. 每个输入cross_id必须且只能返回一次，不得新增、遗漏、合并或重排。
+7. visual_evidence必须选择实际观察到的形状：two_intersecting_red_diagonal_strokes、circle_or_oval、single_or_nonintersecting_stroke、printed_grid_or_text、insufficient_detail、other_red_mark。
+8. 不返回题目内容、候选编号、bbox或坐标。只返回严格JSON，不要解释或Markdown。
+
+返回格式：{"verifications":[{"cross_id":0,"decision":"real_cross","visual_evidence":"two_intersecting_red_diagonal_strokes","confidence":0.95},{"cross_id":1,"decision":"not_cross","visual_evidence":"circle_or_oval","confidence":0.9}]}。
+
+输入锚点：__ANCHORS__
+"""
+
+
 class NumberedSelection(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -71,6 +92,28 @@ class NumberedSelectionResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     selections: list[NumberedSelection]
+
+
+class AnchorVerification(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    cross_id: int
+    decision: Literal["real_cross", "not_cross", "uncertain"]
+    visual_evidence: Literal[
+        "two_intersecting_red_diagonal_strokes",
+        "circle_or_oval",
+        "single_or_nonintersecting_stroke",
+        "printed_grid_or_text",
+        "insufficient_detail",
+        "other_red_mark",
+    ]
+    confidence: float = Field(ge=0, le=1)
+
+
+class AnchorVerificationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    verifications: list[AnchorVerification]
 
 
 def _write_json(path: Path, value) -> None:
@@ -163,6 +206,15 @@ def load_config(path: Path) -> dict:
         "truth_match_min_iou",
         "truth_match_min_coverage",
         "sibling_intrusion_min_coverage",
+    ):
+        if not 0 <= float(config[name]) <= 1:
+            raise ValueError(f"{name} must be between zero and one")
+    for name in (
+        "local_recheck_center_window_ratio",
+        "local_recheck_min_center_red_ratio",
+        "local_recheck_bottom_page_number_min_y_ratio",
+        "local_recheck_page_number_max_distance_ratio",
+        "anchor_montage_crop_padding_ratio",
     ):
         if not 0 <= float(config[name]) <= 1:
             raise ValueError(f"{name} must be between zero and one")
@@ -432,6 +484,164 @@ def build_numbered_candidates(
     }
 
 
+def _numeric_ocr_near_anchor(
+    anchor_bbox: list[float], ocr_lines: list[dict], max_distance: float
+) -> str | None:
+    anchor_x = (anchor_bbox[0] + anchor_bbox[2]) / 2
+    anchor_y = (anchor_bbox[1] + anchor_bbox[3]) / 2
+    for line in ocr_lines:
+        text = re.sub(r"\s+", "", str(line.get("text", "")))
+        if not re.fullmatch(r"\d{1,3}", text):
+            continue
+        bbox = _validate_bbox(line.get("bbox"))
+        line_x = (bbox[0] + bbox[2]) / 2
+        line_y = (bbox[1] + bbox[3]) / 2
+        if math.hypot(line_x - anchor_x, line_y - anchor_y) <= max_distance:
+            return text
+    return None
+
+
+def assess_local_anchor_geometry(
+    *, image_path: Path, anchors: list[dict], ocr_lines: list[dict], config: dict
+) -> list[dict]:
+    with Image.open(image_path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+    pixels = np.asarray(image, dtype=np.int16)
+    red = pixels[:, :, 0]
+    green = pixels[:, :, 1]
+    blue = pixels[:, :, 2]
+    red_mask = (red >= int(config["local_recheck_red_min_channel"])) & (
+        red - np.maximum(green, blue) >= int(config["local_recheck_red_min_excess"])
+    )
+    center_ratio = float(config["local_recheck_center_window_ratio"])
+    min_center_red = float(config["local_recheck_min_center_red_ratio"])
+    bottom_y = float(config["local_recheck_bottom_page_number_min_y_ratio"])
+    page_number_distance = float(
+        config["local_recheck_page_number_max_distance_ratio"]
+    )
+    assessments = []
+    for anchor in sorted(anchors, key=lambda item: int(item["cross_id"])):
+        bbox = _validate_bbox(anchor["bbox"])
+        center_x = (bbox[0] + bbox[2]) / 2
+        center_y = (bbox[1] + bbox[3]) / 2
+        half_width = max((bbox[2] - bbox[0]) * center_ratio, 1 / image.width)
+        half_height = max((bbox[3] - bbox[1]) * center_ratio, 1 / image.height)
+        left = max(0, round((center_x - half_width) * image.width))
+        top = max(0, round((center_y - half_height) * image.height))
+        right = min(image.width, round((center_x + half_width) * image.width) + 1)
+        bottom = min(image.height, round((center_y + half_height) * image.height) + 1)
+        center_red_ratio = float(red_mask[top:bottom, left:right].mean())
+        page_number_text = None
+        if center_y >= bottom_y:
+            page_number_text = _numeric_ocr_near_anchor(
+                bbox, ocr_lines, page_number_distance
+            )
+        if page_number_text is not None:
+            decision = "reject"
+            reason = "bottom_page_number"
+        elif center_red_ratio < min_center_red:
+            decision = "reject"
+            reason = "insufficient_center_red"
+        else:
+            decision = "keep"
+            reason = "center_red_supported"
+        assessments.append(
+            {
+                "cross_id": int(anchor["cross_id"]),
+                "decision": decision,
+                "reason": reason,
+                "center_red_ratio": round(center_red_ratio, 6),
+                "page_number_text": page_number_text,
+            }
+        )
+    return assessments
+
+
+def audit_anchor_verifications(
+    verifications: list[dict], anchor_ids: list[int]
+) -> dict:
+    expected = set(anchor_ids)
+    counts = {cross_id: 0 for cross_id in anchor_ids}
+    accepted = []
+    violations = []
+    for verification in verifications:
+        cross_id = int(verification["cross_id"])
+        if cross_id not in expected:
+            violations.append({"cross_id": cross_id, "reason": "unknown_anchor"})
+            continue
+        counts[cross_id] += 1
+        if (
+            verification["decision"] == "real_cross"
+            and verification["visual_evidence"]
+            != "two_intersecting_red_diagonal_strokes"
+        ):
+            violations.append(
+                {"cross_id": cross_id, "reason": "real_cross_without_cross_evidence"}
+            )
+            continue
+        accepted.append(verification)
+    for cross_id in anchor_ids:
+        if counts[cross_id] == 0:
+            violations.append({"cross_id": cross_id, "reason": "missing_anchor"})
+        elif counts[cross_id] > 1:
+            violations.append({"cross_id": cross_id, "reason": "duplicate_anchor"})
+    return {"valid": not violations, "accepted": accepted, "violations": violations}
+
+
+def consensus_anchor_filter(
+    *, anchor_ids: list[int], local_assessments: list[dict],
+    llm_verifications: list[dict]
+) -> dict:
+    local_by_id = {int(item["cross_id"]): item for item in local_assessments}
+    llm_by_id = {int(item["cross_id"]): item for item in llm_verifications}
+    rejected = [
+        cross_id
+        for cross_id in anchor_ids
+        if local_by_id.get(cross_id, {}).get("decision") == "reject"
+        and llm_by_id.get(cross_id, {}).get("decision") == "not_cross"
+    ]
+    return {
+        "kept_cross_ids": [cross_id for cross_id in anchor_ids if cross_id not in rejected],
+        "rejected_cross_ids": rejected,
+    }
+
+
+def build_deterministic_events(
+    *, anchors: list[dict], candidates: list[dict], allowed: dict[int, list[str]],
+    kept_cross_ids: list[int]
+) -> list[dict]:
+    anchor_by_id = {int(anchor["cross_id"]): anchor for anchor in anchors}
+    candidate_by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
+    grouped: dict[str, list[int]] = {}
+    for cross_id in kept_cross_ids:
+        candidate_ids = allowed[cross_id]
+        candidate_id = next(
+            (
+                item
+                for item in candidate_ids
+                if candidate_by_id[item]["boundary_variant"] == "standard"
+            ),
+            candidate_ids[0],
+        )
+        grouped.setdefault(candidate_id, []).append(cross_id)
+    events = []
+    for candidate_id, cross_ids in grouped.items():
+        candidate = candidate_by_id[candidate_id]
+        events.append(
+            {
+                "event_id": len(events),
+                "candidate_id": candidate_id,
+                "cross_ids": sorted(cross_ids),
+                "question_bbox": list(candidate["question_bbox"]),
+                "confidence": max(
+                    float(anchor_by_id[cross_id].get("confidence", 0))
+                    for cross_id in cross_ids
+                ),
+            }
+        )
+    return events
+
+
 def audit_selections(selections: list[dict], allowed: dict[int, list[str]]) -> dict:
     known_candidates = {
         candidate_id for candidate_ids in allowed.values() for candidate_id in candidate_ids
@@ -645,6 +855,57 @@ def write_candidate_montage(
     montage.save(output_path, quality=int(config["montage_jpeg_quality"]))
 
 
+def write_anchor_verification_montage(
+    *, image_path: Path, output_path: Path, anchors: list[dict], config: dict
+) -> None:
+    with Image.open(image_path) as source:
+        page = ImageOps.exif_transpose(source).convert("RGB")
+    tile_width = int(config["anchor_montage_tile_width"])
+    tile_height = int(config["anchor_montage_tile_height"])
+    label_height = int(config["anchor_montage_label_height"])
+    columns = int(config["anchor_montage_columns"])
+    padding = float(config["anchor_montage_crop_padding_ratio"])
+    rows = max(1, math.ceil(len(anchors) / columns))
+    montage = Image.new("RGB", (columns * tile_width, rows * tile_height), "white")
+    font = ImageFont.load_default()
+    for index, anchor in enumerate(sorted(anchors, key=lambda item: int(item["cross_id"]))):
+        bbox = _validate_bbox(anchor["bbox"])
+        context = [
+            max(0.0, bbox[0] - padding),
+            max(0.0, bbox[1] - padding),
+            min(1.0, bbox[2] + padding),
+            min(1.0, bbox[3] + padding),
+        ]
+        pixel_context = (
+            round(context[0] * page.width),
+            round(context[1] * page.height),
+            round(context[2] * page.width),
+            round(context[3] * page.height),
+        )
+        crop = page.crop(pixel_context)
+        context_width = max(context[2] - context[0], 1e-9)
+        context_height = max(context[3] - context[1], 1e-9)
+        local_bbox = (
+            round((bbox[0] - context[0]) / context_width * crop.width),
+            round((bbox[1] - context[1]) / context_height * crop.height),
+            round((bbox[2] - context[0]) / context_width * crop.width),
+            round((bbox[3] - context[1]) / context_height * crop.height),
+        )
+        ImageDraw.Draw(crop).rectangle(local_bbox, outline="blue", width=5)
+        available_height = tile_height - label_height
+        crop.thumbnail((tile_width, available_height), Image.Resampling.LANCZOS)
+        tile = Image.new("RGB", (tile_width, tile_height), "white")
+        tile.paste(
+            crop,
+            ((tile_width - crop.width) // 2, label_height + (available_height - crop.height) // 2),
+        )
+        tile_draw = ImageDraw.Draw(tile)
+        tile_draw.rectangle((0, 0, tile_width - 1, tile_height - 1), outline="black")
+        tile_draw.text((8, 8), f"C{int(anchor['cross_id'])}", fill="black", font=font)
+        montage.paste(tile, ((index % columns) * tile_width, (index // columns) * tile_height))
+    montage.save(output_path, quality=int(config["montage_jpeg_quality"]))
+
+
 def _resolve_anchor_path(root: Path, label: str) -> Path:
     candidates = (
         root / label / "cross-anchor-experiment" / "confirmed-crosses.json",
@@ -700,22 +961,24 @@ def _ocr_verifier() -> RapidOCRVerifier:
 
 def _write_report(path: Path, summaries: list[dict]) -> None:
     lines = [
-        "# 编号候选选择型LLM2诊断",
+        "# 本地确定性边界与红叉保守复检诊断",
         "",
-        "> LLM只能选择本地确定性窄框编号或返回none/uncertain，不生成坐标。",
+        "> 题目边界由本地规则确定；MiniMax每页只核验一次红叉真假，不选择候选、不生成坐标。",
         "",
-        "| 图片 | 真值 | 锚点 | 编号候选 | 候选上限命中 | 候选上限召回 | 已选锚点 | none | uncertain | 去重事件 | LLM选择命中 | LLM选择召回 | 误报事件 | 兄弟题侵入 | 语义异常 | OCR耗时(ms) | 版面耗时(ms) | LLM耗时(ms) | 总耗时(ms) | LLM请求 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 真值 | 锚点 | 候选上限召回 | 本地拒绝锚点 | LLM真叉 | LLM拒绝 | LLM不确定 | 全保留召回 | 全保留误报 | 本地召回 | 本地误报 | LLM单独召回 | LLM单独误报 | 一致拒绝召回 | 一致拒绝误报 | 语义异常 | OCR耗时(ms) | 版面耗时(ms) | 本地复检(ms) | LLM耗时(ms) | 总耗时(ms) | LLM请求 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for item in summaries:
         lines.append(
-            "| {label} | {truth_count} | {anchor_count} | {candidate_count} | "
-            "{candidate_oracle_matched_truth_count} | {candidate_oracle_truth_recall} | "
-            "{selected_anchor_count} | {none_count} | {uncertain_count} | "
-            "{event_count} | {matched_truth_count} | {truth_recall} | "
-            "{false_event_count} | {sibling_intrusion_event_count} | "
-            "{semantic_violation_count} | {ocr_ms} | {layout_ms} | {llm_ms} | "
-            "{total_ms} | {llm_request_count} |".format(**item)
+            "| {label} | {truth_count} | {anchor_count} | {candidate_oracle_truth_recall} | "
+            "{local_rejected_anchor_count} | {llm_real_cross_count} | "
+            "{llm_not_cross_count} | {llm_uncertain_count} | "
+            "{all_truth_recall} | {all_false_event_count} | "
+            "{local_truth_recall} | {local_false_event_count} | "
+            "{llm_truth_recall} | {llm_false_event_count} | "
+            "{consensus_truth_recall} | {consensus_false_event_count} | "
+            "{semantic_violation_count} | {ocr_ms} | {layout_ms} | "
+            "{local_recheck_ms} | {llm_ms} | {total_ms} | {llm_request_count} |".format(**item)
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -753,29 +1016,41 @@ def run_page(
         config=config,
     )
     allowed = proposal["anchor_candidates"]
+    anchor_ids = [int(anchor["cross_id"]) for anchor in anchors]
+    local_started = time.perf_counter()
+    local_assessments = assess_local_anchor_geometry(
+        image_path=image_path,
+        anchors=anchors,
+        ocr_lines=ocr_lines,
+        config=config,
+    )
+    local_recheck_ms = (time.perf_counter() - local_started) * 1000
+    _write_json(page_dir / "local-anchor-assessments.json", local_assessments)
+    anchor_montage_path = page_dir / "anchor-verification-montage.jpg"
+    write_anchor_verification_montage(
+        image_path=image_path,
+        output_path=anchor_montage_path,
+        anchors=anchors,
+        config=config,
+    )
     llm_ms = 0.0
     llm_request_count = 0
-    selections = []
+    verifications = []
     llm_error = None
     if not offline_only and anchors:
         payload = [
-            {
-                "cross_id": cross_id,
-                "allowed_candidate_ids": candidate_ids,
-                "subject_hint": subject,
-            }
-            for cross_id, candidate_ids in allowed.items()
+            {"cross_id": cross_id, "subject_hint": subject}
+            for cross_id in anchor_ids
         ]
-        prompt = NUMBERED_SELECTION_PROMPT.replace(
-            "__CANDIDATES__", json.dumps(payload, ensure_ascii=False, indent=2)
+        prompt = ANCHOR_VERIFICATION_PROMPT.replace(
+            "__ANCHORS__", json.dumps(payload, ensure_ascii=False, indent=2)
         )
-        events = []
+        llm_events = []
         client = MiniMaxVisionClient.from_settings()
-        client.diagnostic_event_sink = events.append
+        client.diagnostic_event_sink = llm_events.append
         diagnostic = {
-            "operation": "numbered_question_candidate_selection",
+            "operation": "anchor_shape_verification",
             "anchor_count": len(anchors),
-            "candidate_count": len(proposal["candidates"]),
         }
         llm_started = time.perf_counter()
         llm_request_count = 1
@@ -784,13 +1059,18 @@ def run_page(
                 {
                     "prompt": prompt,
                     "image_url": prepare_image_data_url(
-                        str(montage_path), client.max_edge, client.jpeg_quality, diagnostic
+                        str(anchor_montage_path),
+                        client.max_edge,
+                        client.jpeg_quality,
+                        diagnostic,
                     ),
                 },
-                NumberedSelectionResult,
+                AnchorVerificationResult,
                 diagnostic,
             )
-            selections = [item.model_dump(mode="json") for item in result.selections]
+            verifications = [
+                item.model_dump(mode="json") for item in result.verifications
+            ]
         except Exception as exc:
             llm_error = {
                 "type": type(exc).__name__,
@@ -799,49 +1079,123 @@ def run_page(
                 "diagnostic": getattr(exc, "diagnostic", None),
             }
         llm_ms = (time.perf_counter() - llm_started) * 1000
-        _write_json(page_dir / "llm-events.json", events)
+        _write_json(page_dir / "llm-events.json", llm_events)
         _write_json(page_dir / "llm-error.json", llm_error)
-    _write_json(page_dir / "llm-selections.json", selections)
-    audit = audit_selections(selections, allowed) if not offline_only else {
-        "valid": True, "accepted": [], "violations": []
-    }
-    events = build_selected_events(audit["accepted"], proposal["candidates"])
+    _write_json(page_dir / "llm-anchor-verifications.json", verifications)
+    audit = (
+        audit_anchor_verifications(verifications, anchor_ids)
+        if not offline_only
+        else {"valid": True, "accepted": [], "violations": []}
+    )
+    _write_json(page_dir / "llm-anchor-audit.json", audit)
+    local_kept_ids = [
+        item["cross_id"]
+        for item in local_assessments
+        if item["decision"] == "keep"
+    ]
+    llm_by_id = {int(item["cross_id"]): item for item in audit["accepted"]}
+    llm_kept_ids = [
+        cross_id
+        for cross_id in anchor_ids
+        if llm_by_id.get(cross_id, {}).get("decision") != "not_cross"
+    ]
+    consensus = consensus_anchor_filter(
+        anchor_ids=anchor_ids,
+        local_assessments=local_assessments,
+        llm_verifications=audit["accepted"],
+    )
+    all_events = build_deterministic_events(
+        anchors=anchors,
+        candidates=proposal["candidates"],
+        allowed=allowed,
+        kept_cross_ids=anchor_ids,
+    )
+    local_events = build_deterministic_events(
+        anchors=anchors,
+        candidates=proposal["candidates"],
+        allowed=allowed,
+        kept_cross_ids=local_kept_ids,
+    )
+    llm_events = build_deterministic_events(
+        anchors=anchors,
+        candidates=proposal["candidates"],
+        allowed=allowed,
+        kept_cross_ids=llm_kept_ids,
+    )
+    consensus_events = build_deterministic_events(
+        anchors=anchors,
+        candidates=proposal["candidates"],
+        allowed=allowed,
+        kept_cross_ids=consensus["kept_cross_ids"],
+    )
     candidate_oracle = compare_selected_events_to_truth(
         anchors=anchors,
         events=build_candidate_oracle_events(proposal["candidates"]),
         truth_regions=truth_regions,
         config=config,
     )
-    comparison = compare_selected_events_to_truth(
-        anchors=anchors, events=events, truth_regions=truth_regions, config=config
-    )
-    _write_json(page_dir / "selection-audit.json", audit)
-    _write_json(page_dir / "selected-events.json", events)
+    comparisons = {
+        name: compare_selected_events_to_truth(
+            anchors=anchors,
+            events=events,
+            truth_regions=truth_regions,
+            config=config,
+        )
+        for name, events in (
+            ("all", all_events),
+            ("local", local_events),
+            ("llm", llm_events),
+            ("consensus", consensus_events),
+        )
+    }
+    _write_json(page_dir / "all-anchor-events.json", all_events)
+    _write_json(page_dir / "local-filtered-events.json", local_events)
+    _write_json(page_dir / "llm-filtered-events.json", llm_events)
+    _write_json(page_dir / "consensus-filtered-events.json", consensus_events)
+    _write_json(page_dir / "anchor-filter-consensus.json", consensus)
     _write_json(page_dir / "candidate-oracle-comparison.json", candidate_oracle)
-    _write_json(page_dir / "oracle-comparison.json", comparison)
-    selected = [item for item in audit["accepted"] if item["decision"] == "selected"]
+    for name, comparison in comparisons.items():
+        _write_json(page_dir / f"{name}-comparison.json", comparison)
     summary = {
         "label": label,
         "status": "offline_only" if offline_only else ("llm_error" if llm_error else "completed"),
         "anchor_count": len(anchors),
         "candidate_count": len(proposal["candidates"]),
-        "selected_anchor_count": len(selected),
-        "none_count": sum(item["decision"] == "none" for item in audit["accepted"]),
-        "uncertain_count": sum(item["decision"] == "uncertain" for item in audit["accepted"]),
-        "event_count": len(events),
         "candidate_oracle_matched_truth_count": candidate_oracle["matched_truth_count"],
         "candidate_oracle_truth_recall": candidate_oracle["truth_recall"],
         "candidate_oracle_missed_truth_ids": candidate_oracle["missed_truth_ids"],
-        "false_event_count": len(comparison["false_event_ids"]),
-        "sibling_intrusion_event_count": len(comparison["sibling_intrusion_event_ids"]),
+        "local_rejected_anchor_count": len(anchor_ids) - len(local_kept_ids),
+        "llm_real_cross_count": sum(
+            item["decision"] == "real_cross" for item in audit["accepted"]
+        ),
+        "llm_not_cross_count": sum(
+            item["decision"] == "not_cross" for item in audit["accepted"]
+        ),
+        "llm_uncertain_count": sum(
+            item["decision"] == "uncertain" for item in audit["accepted"]
+        ),
         "semantic_violation_count": len(audit["violations"]),
         "ocr_ms": round(ocr_ms, 2),
         "layout_ms": round(layout_ms, 2),
+        "local_recheck_ms": round(local_recheck_ms, 2),
         "llm_ms": round(llm_ms, 2),
         "total_ms": round((time.perf_counter() - started) * 1000, 2),
         "llm_request_count": llm_request_count,
-        **comparison,
+        "truth_count": len(truth_regions),
     }
+    for name, comparison in comparisons.items():
+        summary[f"{name}_matched_truth_count"] = comparison["matched_truth_count"]
+        summary[f"{name}_truth_recall"] = comparison["truth_recall"]
+        summary[f"{name}_missed_truth_ids"] = comparison["missed_truth_ids"]
+        summary[f"{name}_false_event_count"] = len(comparison["false_event_ids"])
+        summary[f"{name}_event_count"] = len(
+            {
+                "all": all_events,
+                "local": local_events,
+                "llm": llm_events,
+                "consensus": consensus_events,
+            }[name]
+        )
     _write_json(page_dir / "summary.json", summary)
     return summary
 
@@ -892,23 +1246,31 @@ def main(arguments=None) -> int:
             summaries.append(
                 {
                     "label": label, "status": "page_error", "truth_count": len(truth[label]),
-                    "anchor_count": 0, "candidate_count": 0, "selected_anchor_count": 0,
-                    "none_count": 0, "uncertain_count": 0, "event_count": 0,
+                    "anchor_count": 0, "candidate_count": 0,
                     "candidate_oracle_matched_truth_count": 0,
                     "candidate_oracle_truth_recall": 0.0,
-                    "matched_truth_count": 0, "truth_recall": 0.0,
-                    "false_event_count": 0, "sibling_intrusion_event_count": 0,
-                    "semantic_violation_count": 0, "ocr_ms": 0.0, "layout_ms": 0.0,
+                    "local_rejected_anchor_count": 0, "llm_real_cross_count": 0,
+                    "llm_not_cross_count": 0, "llm_uncertain_count": 0,
+                    "all_truth_recall": 0.0, "all_false_event_count": 0,
+                    "local_truth_recall": 0.0, "local_false_event_count": 0,
+                    "llm_truth_recall": 0.0, "llm_false_event_count": 0,
+                    "consensus_truth_recall": 0.0,
+                    "consensus_false_event_count": 0,
+                    "semantic_violation_count": 0, "ocr_ms": 0.0,
+                    "layout_ms": 0.0, "local_recheck_ms": 0.0,
                     "llm_ms": 0.0, "total_ms": 0.0, "llm_request_count": 0,
+                    "consensus_matched_truth_count": 0,
                 }
             )
     aggregate = {
-        "experiment": "numbered_question_candidate_selection",
+        "experiment": "deterministic_boundary_conservative_anchor_filter",
         "offline_only": args.offline_only,
         "labels": labels,
         "llm_request_count": sum(item["llm_request_count"] for item in summaries),
         "truth_count": sum(item["truth_count"] for item in summaries),
-        "matched_truth_count": sum(item["matched_truth_count"] for item in summaries),
+        "matched_truth_count": sum(
+            item["consensus_matched_truth_count"] for item in summaries
+        ),
         "page_summaries": summaries,
     }
     aggregate["truth_recall"] = round(
