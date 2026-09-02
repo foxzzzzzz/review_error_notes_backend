@@ -2,8 +2,8 @@
 
 ## 状态
 
-- 日期：2026-09-01
-- 状态：已实施（诊断代码待服务器实测）
+- 日期：2026-09-02
+- 状态：服务器首轮实测后修订（固定输入配对实验待复测）
 - 范围：仅诊断脚本、诊断配置、离线回放工具和对应单元测试
 - 非范围：生产识别服务、API、数据模型、数据库、部署配置
 
@@ -19,6 +19,12 @@
 
 当前六页已经参与分析，只能作为开发/回归集，不能证明泛化。所有实验规则必须与
 页面名称、truth_id、人工框坐标及图片固定尺寸无关；truth 只能在输出完成后审计。
+
+2026-09-02 四 profile 在线实测表明：各 profile 独立调用 LLM1 会把模型随机性混入
+策略差异；空间分组产生的请求数高于相同锚点的固定 batch 基线，且 page20 在锚点
+11/11 时仍被空间 LLM2 降到 8/11。因此后续实验必须复用同一份 LLM1 快照，并在
+同一次空间 profile 中先运行同锚点 baseline LLM2；空间请求超出 baseline batch 数时
+直接判定预算失败，不发送空间 LLM 请求。
 
 ## 目标
 
@@ -92,12 +98,12 @@
 ### 状态模型
 
 - `confirmed`：LLM2 返回 matched=true，题框通过现有几何审计。
-- `needs_review`：强证据锚点 matched=false、返回框无效或所在请求批次失败。
-- `rejected`：低证据锚点 matched=false；仅保留审计记录，不生成题目事件。
+- `needs_review`：任意锚点 matched=false、返回框无效或所在请求批次失败；所有此类
+  锚点都保留本地上下文框，并通过 `evidence_tier=strong|weak` 区分风险。
 
 强证据由来源风险、独立扫描支持、本地红像素支持和配置阈值共同决定，不读取 truth。
-请求批次失败时，批次内每个输入锚点分别落入 `needs_review` 或 `rejected`，同时保留
-批次错误和原始响应；禁止因一个批次异常而静默丢弃全部锚点。
+证据等级只影响复核优先级，不再决定锚点是否消失。请求批次失败时，批次内每个输入
+锚点分别落入 `needs_review`，同时保留批次错误和原始响应。
 
 ### 本地保底区域
 
@@ -117,7 +123,11 @@
 
 ## 实验 3：空间分组 LLM2 与确定性去重
 
-实验 3 继承实验 1 的候选联合和实验 2 的证据保留，只替换 LLM2 组织方式与事件归并。
+实验 3 继承实验 1 的候选联合和实验 2 的证据保留。在同一 profile、同一锚点集合中
+先执行固定 batch baseline，再评估空间分组；空间分组不再替换或覆盖 baseline 结果。
+
+空间组数必须小于等于 `ceil(anchor_count / cross_anchor_llm2_batch_size)`。超出时写入
+`spatial-request-budget-audit.json` 并标记 `budget_rejected`，不得发送空间 LLM2 请求。
 
 ### 空间分组
 
@@ -178,6 +188,9 @@ LLM2 返回 question groups，而非独立事件列表：
 - `spatial-grouped`：实验 1 + 实验 2 + 实验 3。
 
 服务器测试必须按该顺序运行和比较，不能只跑最终 profile 后反推收益。
+第一次 live baseline 作为 LLM1 快照源；后续 profile 通过
+`--cross-anchor-replay-from <baseline输出目录>` 复用 candidate verification、独立扫描和
+fallback verification。快照来源与三份 JSON 的 SHA-256 必须写入新归档。
 
 ## 配置边界
 
@@ -197,12 +210,13 @@ LLM2 返回 question groups，而非独立事件列表：
 
 1. 独立扫描未匹配且证据达标时新增锚点；不达标时只审计。
 2. 补锚与现有 CV 锚点正确去重，cross_id 稳定且连续。
-3. matched=false 的强锚点生成 needs_review；低证据锚点不生成事件。
+3. 所有 matched=false/缺失/几何异常锚点生成 needs_review，强弱证据只改变等级。
 4. 本地保底框归一化、面积受限、边界裁剪并保留来源。
 5. 空间分组不丢失、不重复 cross_id，且相邻锚点优先同组。
 6. LLM2 group membership 对缺失、重复和未知 ID 明确失败。
 7. 跨组去重合并明显同题框，不合并相邻兄弟题。
-8. baseline profile 的现有测试和产物语义保持不变。
+8. replay 模式不调用任何 LLM1 接口，并校验快照 candidate_id 完整性。
+9. 空间 profile 先执行同锚点 baseline；空间组数超预算时零空间请求并明确失败。
 
 ### 离线回归
 

@@ -10,6 +10,17 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-01-evidence-preserving-spatial-llm2-experiment-design.md`
 
+## 2026-09-02 Server-result amendment
+
+- Reuse the first live baseline's three LLM1 artifacts through
+  `--cross-anchor-replay-from`; record their source and SHA-256 values.
+- Preserve every invalid, missing, unmatched, or batch-failed anchor as
+  `needs_review`; use `evidence_tier` for risk instead of silently dropping weak
+  evidence.
+- In `spatial-grouped`, run the fixed-batch baseline on the exact same anchors
+  first. Run spatial LLM2 only when its group count does not exceed the baseline
+  batch count, and report the two timings separately.
+
 ## Global Constraints
 
 - Modify only `scripts/`, `tests/unit/`, and `docs/superpowers/`; do not modify `app/`.

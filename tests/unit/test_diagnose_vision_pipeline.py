@@ -3395,16 +3395,23 @@ def test_timing_report_compares_old_and_new_flows_with_stage_costs(tmp_path):
         expected_count=5,
         cv={"raw_component_count": 18, "evidence_group_count": 8},
         pipeline=None,
-        cross_anchor_experiment={
-            "profile": "spatial-grouped",
-            "llm1_verification_run_count": 3,
+            cross_anchor_experiment={
+                "profile": "spatial-grouped",
+                "llm1_input_mode": "replay",
+                "llm1_verification_run_count": 3,
             "llm1_independent_rescue_count": 2,
             "llm2_batch_error_count": 1,
             "anchor_preservation_confirmed_count": 4,
             "anchor_preservation_needs_review_count": 1,
             "anchor_preservation_confirmed_truth_recall": 0.8,
-            "anchor_preservation_union_truth_recall": 1.0,
-            "spatial_group_request_count": 3,
+                "anchor_preservation_union_truth_recall": 1.0,
+                "anchor_preservation_silently_dropped_count": 0,
+                "baseline_group_request_count": 3,
+                "spatial_request_budget_eligible": True,
+                "spatial_request_budget": 3,
+                "spatial_experiment_status": "completed",
+                "spatial_group_request_count": 3,
+                "spatial_group_error_count": 0,
             "spatial_question_event_count": 5,
             "spatial_truth_recall": 1.0,
             "spatial_false_event_count": 1,
@@ -3414,7 +3421,9 @@ def test_timing_report_compares_old_and_new_flows_with_stage_costs(tmp_path):
             "timings_ms": {
                 "llm1_candidate_verification": 1200.0,
                 "independent_cross_scan": 300.0,
-                "fallback_montage_and_verification": 400.0,
+                    "fallback_montage_and_verification": 400.0,
+                    "baseline_llm2_localization": 500.0,
+                    "spatial_llm2_localization": 400.0,
                 "llm2_localization": 900.0,
                 "llm2_localization_run_002": 450.0,
                 "post_llm2_audit": 10.0,
@@ -3439,10 +3448,10 @@ def test_timing_report_compares_old_and_new_flows_with_stage_costs(tmp_path):
     assert "新方案总耗时" in report
     assert "定向复查耗时" in report
     assert "定向复查请求" in report
-    assert "| page35 | 5000.0 | 20.0 | 30.0 | 1000.0 | 1100.0 | 2800.0 | 3 | 8 |" in report
+    assert "| page35 | 5000.0 | 20.0 | 30.0 | 1000.0 | 1100.0 | 2800.0 | replay | 3 | 8 |" in report
     comparison_report = (tmp_path / "comparison-report.md").read_text("utf-8")
     assert "## 独立实验 Profile" in comparison_report
-    assert "| page35 | spatial-grouped | 2 | 1 | 4 | 1 | 0.8 | 1.0 | 3 | 5 | 1.0 | 1 |" in comparison_report
+    assert "| page35 | spatial-grouped | replay | 2 | 3 | True | completed | 3 | 0 | 1 | 4 | 1 | 0 | 0.8 | 1.0 | 5 | 1.0 | 1 |" in comparison_report
     assert "空间分组请求" in report
 
 
@@ -3524,6 +3533,8 @@ def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
         encoding="utf-8",
     )
     output = tmp_path / "output"
+    replay_root = tmp_path / "baseline-run"
+    (replay_root / "sample" / "cross-anchor-experiment").mkdir(parents=True)
     received = []
 
     def fake_run_case(**kwargs):
@@ -3555,6 +3566,8 @@ def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
             "--compare-cross-anchor",
             "--cross-anchor-profile",
             "anchor-preserving",
+            "--cross-anchor-replay-from",
+            str(replay_root),
             "--cross-cv-config",
             str(config_path),
             "--truth-regions",
@@ -3567,11 +3580,13 @@ def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
     assert diagnostic.main() == 0
     assert received[0]["compare_cross_anchor"] is True
     assert received[0]["cross_anchor_profile"] == "anchor-preserving"
+    assert received[0]["cross_anchor_replay_from"] == replay_root.resolve()
     assert received[0]["cross_cv_config"]["question_truth_min_iou"] == 0.2
     assert received[0]["truth_regions"][0]["truth_id"] == "T1"
     manifest = json.loads((output / "manifest.json").read_text("utf-8"))
     assert manifest["compare_cross_anchor"] is True
     assert manifest["cross_anchor_profile"] == "anchor-preserving"
+    assert manifest["cross_anchor_replay_from"] == str(replay_root.resolve())
 
 
 def _anchor_preservation_config():
@@ -3670,7 +3685,7 @@ def test_anchor_preservation_creates_needs_review_for_strong_unmatched(tmp_path)
     assert preserved["audit"][0]["reasons"] == ["llm2_unmatched"]
 
 
-def test_anchor_preservation_rejects_weak_unmatched_without_event(tmp_path):
+def test_anchor_preservation_keeps_weak_unmatched_as_high_risk_review(tmp_path):
     diagnostic = _load_script_module()
     result = diagnostic.CrossAnchoredQuestionResult.model_validate(
         {
@@ -3695,8 +3710,12 @@ def test_anchor_preservation_rejects_weak_unmatched_without_event(tmp_path):
         config=_anchor_preservation_config(),
     )
 
-    assert preserved["events"] == []
-    assert preserved["audit"][0]["status"] == "rejected"
+    assert preserved["events"][0]["status"] == "needs_review"
+    assert preserved["events"][0]["evidence_tier"] == "weak"
+    assert preserved["events"][0]["bbox_source"] == "local_anchor_context"
+    assert preserved["audit"][0]["status"] == "needs_review"
+    assert preserved["audit"][0]["evidence_tier"] == "weak"
+    assert preserved["silently_dropped_anchor_count"] == 0
 
 
 def test_anchor_preservation_keeps_each_strong_anchor_from_failed_batch(tmp_path):
@@ -3762,6 +3781,41 @@ def test_spatial_grouping_is_deterministic_and_assigns_each_cross_once():
         for cross_id in [item["cross_id"] for item in group["anchors"]]
     ] == [0, 1, 2, 3]
     assert groups[0]["crop_bbox"] == [0.05, 0.05, 0.45, 0.27]
+
+
+def test_spatial_request_budget_rejects_more_groups_than_baseline_batches():
+    diagnostic = _load_script_module()
+
+    audit = diagnostic.audit_spatial_request_budget(
+        anchor_count=10,
+        baseline_batch_size=3,
+        spatial_group_count=5,
+    )
+
+    assert audit == {
+        "eligible": False,
+        "anchor_count": 10,
+        "baseline_batch_size": 3,
+        "baseline_request_budget": 4,
+        "spatial_group_count": 5,
+        "saved_request_count": -1,
+        "reason": "spatial_group_count_exceeds_baseline_budget",
+    }
+
+
+def test_spatial_request_budget_accepts_equal_or_fewer_groups():
+    diagnostic = _load_script_module()
+
+    audit = diagnostic.audit_spatial_request_budget(
+        anchor_count=10,
+        baseline_batch_size=3,
+        spatial_group_count=4,
+    )
+
+    assert audit["eligible"] is True
+    assert audit["baseline_request_budget"] == 4
+    assert audit["saved_request_count"] == 0
+    assert audit["reason"] is None
 
 
 def test_spatial_group_membership_rejects_missing_duplicate_and_unknown_ids():
@@ -3993,6 +4047,44 @@ def test_spatial_question_events_keep_model_groups_and_unmatched_review_fallback
     assert events["events"][1]["status"] == "needs_review"
 
 
+def test_spatial_question_events_do_not_confirm_geometry_invalid_group():
+    diagnostic = _load_script_module()
+    spatial_result = diagnostic.SpatialQuestionGroupResult.model_validate(
+        {
+            "groups": [
+                {
+                    "group_id": 0,
+                    "cross_ids": [0],
+                    "question_bbox": [0.0, 0.0, 1.0, 1.0],
+                    "confidence": 0.9,
+                }
+            ],
+            "unmatched": [],
+        }
+    )
+    preservation = {
+        "events": [
+            {
+                "event_id": 0,
+                "cross_ids": [0],
+                "question_bboxes": [[0.1, 0.1, 0.4, 0.4]],
+                "confidence": 0.9,
+                "status": "needs_review",
+                "evidence_tier": "strong",
+                "bbox_source": "local_anchor_context",
+            }
+        ]
+    }
+
+    events = diagnostic.build_spatial_question_events(
+        spatial_result, preservation
+    )
+
+    assert events["event_count"] == 1
+    assert events["events"][0]["status"] == "needs_review"
+    assert events["events"][0]["bbox_source"] == "local_anchor_context"
+
+
 def test_load_cross_cv_inputs_validates_new_experiment_config_boundaries(tmp_path):
     diagnostic = _load_script_module()
     committed_config = json.loads(
@@ -4120,6 +4212,114 @@ def test_anchor_preserving_profile_converts_llm2_batch_error_to_review_event(tmp
     assert preserved["events"][0]["status"] == "needs_review"
 
 
+def test_cross_anchor_profile_replays_fixed_llm1_snapshot_without_llm1_calls(
+    tmp_path,
+):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.jpg"
+    image = Image.new("RGB", (100, 100), "white")
+    ImageDraw.Draw(image).rectangle((20, 20, 39, 39), fill=(220, 30, 30))
+    image.save(source)
+    overlay = tmp_path / "overlay.jpg"
+    image.save(overlay)
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    def write_snapshot(name, value):
+        (snapshot / name).write_text(json.dumps(value), encoding="utf-8")
+
+    write_snapshot(
+        "llm1-candidate-verification.json",
+        {
+            "verdicts": [
+                {
+                    "candidate_id": 0,
+                    "disposition": "confirmed",
+                    "confidence": 0.95,
+                }
+            ]
+        },
+    )
+    write_snapshot("llm1-independent-scan.json", {"crosses": []})
+    write_snapshot(
+        "llm1-fallback-candidate-verification.json",
+        {"verdicts": []},
+    )
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    config = json.loads(
+        (BACKEND_ROOT / "scripts" / "cv_cross_experiment_config.json").read_text(
+            "utf-8"
+        )
+    )
+
+    class FakeClient:
+        def verify_cross_candidates(self, *_args):
+            raise AssertionError("LLM1 verification must come from the snapshot")
+
+        def scan_independent_crosses(self, *_args):
+            raise AssertionError("independent scan must come from the snapshot")
+
+        def verify_fallback_crosses(self, *_args):
+            raise AssertionError("fallback verification must come from the snapshot")
+
+        def locate_cross_anchored_questions(self, _image_path, anchors, _subject):
+            return diagnostic.CrossAnchoredQuestionResult.model_validate(
+                {
+                    "items": [
+                        {
+                            "cross_id": anchors[0]["cross_id"],
+                            "matched": True,
+                            "question_bbox": [0.1, 0.1, 0.5, 0.5],
+                            "unmatched_reason": None,
+                            "confidence": 0.9,
+                        }
+                    ]
+                }
+            )
+
+    summary = diagnostic.run_cross_anchor_experiment(
+        image_path=source,
+        case_dir=case_dir,
+        client=FakeClient(),
+        cv_candidates=[
+            {
+                "candidate_id": 0,
+                "bbox": [0.2, 0.2, 0.4, 0.4],
+                "center": [0.3, 0.3],
+                "min_arm_density": 0.4,
+                "center_density": 0.9,
+            }
+        ],
+        candidate_overlay_path=overlay,
+        truth_regions=[
+            {
+                "truth_id": "T1",
+                "source_bbox_normalized": [0.05, 0.05, 0.55, 0.55],
+            }
+        ],
+        config=config,
+        subject_hint="chinese",
+        profile="baseline",
+        llm1_snapshot_dir=snapshot,
+    )
+
+    assert summary["llm1_input_mode"] == "replay"
+    assert summary["llm1_snapshot_source"] == str(snapshot.resolve())
+    replay_manifest = json.loads(
+        (
+            case_dir
+            / "cross-anchor-experiment"
+            / "llm1-replay-source.json"
+        ).read_text("utf-8")
+    )
+    assert replay_manifest["source"] == str(snapshot.resolve())
+    assert sorted(replay_manifest["sha256"]) == [
+        "llm1-candidate-verification.json",
+        "llm1-fallback-candidate-verification.json",
+        "llm1-independent-scan.json",
+    ]
+
+
 def test_spatial_grouped_profile_uses_group_request_and_deduplicated_events(tmp_path):
     diagnostic = _load_script_module()
     source = tmp_path / "page.jpg"
@@ -4135,6 +4335,8 @@ def test_spatial_grouped_profile_uses_group_request_and_deduplicated_events(tmp_
             "utf-8"
         )
     )
+
+    calls = []
 
     class FakeClient:
         def verify_cross_candidates(self, _image_path, _candidates):
@@ -4153,18 +4355,35 @@ def test_spatial_grouped_profile_uses_group_request_and_deduplicated_events(tmp_
         def scan_independent_crosses(self, _image_path):
             return diagnostic.IndependentCrossScanResult(crosses=[])
 
-        def locate_spatial_cross_groups(self, _image_path, anchors, _subject_hint):
-            return diagnostic.SpatialQuestionGroupResult.model_validate(
+        def locate_cross_anchored_questions(self, _image_path, anchors, _subject):
+            calls.append("baseline")
+            return diagnostic.CrossAnchoredQuestionResult.model_validate(
                 {
-                    "groups": [
+                    "items": [
                         {
-                            "group_id": 0,
-                            "cross_ids": [anchors[0]["cross_id"]],
-                            "question_bbox": [0.0, 0.0, 1.0, 1.0],
+                            "cross_id": anchor["cross_id"],
+                            "matched": True,
+                            "question_bbox": [0.1, 0.1, 0.5, 0.5],
+                            "unmatched_reason": None,
                             "confidence": 0.9,
                         }
+                        for anchor in anchors
+                    ]
+                }
+            )
+
+        def locate_spatial_cross_groups(self, _image_path, anchors, _subject_hint):
+            calls.append("spatial")
+            return diagnostic.SpatialQuestionGroupResult.model_validate(
+                {
+                    "groups": [],
+                    "unmatched": [
+                        {
+                            "cross_id": anchors[0]["cross_id"],
+                            "reason": "spatial localization uncertain",
+                            "confidence": 0.6,
+                        }
                     ],
-                    "unmatched": [],
                 }
             )
 
@@ -4194,6 +4413,9 @@ def test_spatial_grouped_profile_uses_group_request_and_deduplicated_events(tmp_
     )
 
     assert summary["spatial_group_request_count"] == 1
+    assert summary["baseline_group_request_count"] == 1
+    assert summary["spatial_request_budget_eligible"] is True
+    assert calls == ["baseline", "spatial"]
     assert summary["spatial_question_event_count"] == 1
     assert summary["spatial_truth_recall"] == 1.0
     experiment = case_dir / "cross-anchor-experiment"
@@ -4201,6 +4423,114 @@ def test_spatial_grouped_profile_uses_group_request_and_deduplicated_events(tmp_
     assert (experiment / "group-membership-audit.json").is_file()
     assert (experiment / "deduplicated-question-events.json").is_file()
     assert (experiment / "deduplication-audit.json").is_file()
+    assert (experiment / "spatial-request-budget-audit.json").is_file()
+    spatial_events = json.loads(
+        (experiment / "deduplicated-question-events.json").read_text("utf-8")
+    )
+    assert spatial_events["events"][0]["status"] == "needs_review"
+
+
+def test_spatial_grouped_profile_skips_spatial_llm_when_budget_is_exceeded(
+    tmp_path,
+):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.jpg"
+    image = Image.new("RGB", (100, 100), "white")
+    for left, top in ((5, 5), (40, 5), (5, 50), (40, 50)):
+        ImageDraw.Draw(image).rectangle(
+            (left, top, left + 9, top + 9), fill=(220, 30, 30)
+        )
+    image.save(source)
+    overlay = tmp_path / "overlay.jpg"
+    image.save(overlay)
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    config = json.loads(
+        (BACKEND_ROOT / "scripts" / "cv_cross_experiment_config.json").read_text(
+            "utf-8"
+        )
+    )
+    config["cross_anchor_spatial_max_anchors_per_group"] = 1
+
+    class FakeClient:
+        def verify_cross_candidates(self, _image_path, candidates):
+            return diagnostic.CrossCandidateVerificationResult.model_validate(
+                {
+                    "verdicts": [
+                        {
+                            "candidate_id": candidate["candidate_id"],
+                            "disposition": "confirmed",
+                            "confidence": 0.95,
+                        }
+                        for candidate in candidates
+                    ]
+                }
+            )
+
+        def scan_independent_crosses(self, _image_path):
+            return diagnostic.IndependentCrossScanResult(crosses=[])
+
+        def locate_cross_anchored_questions(self, _image_path, anchors, _subject):
+            return diagnostic.CrossAnchoredQuestionResult.model_validate(
+                {
+                    "items": [
+                        {
+                            "cross_id": anchor["cross_id"],
+                            "matched": True,
+                            "question_bbox": anchor["bbox"],
+                            "unmatched_reason": None,
+                            "confidence": 0.9,
+                        }
+                        for anchor in anchors
+                    ]
+                }
+            )
+
+        def locate_spatial_cross_groups(self, *_args):
+            raise AssertionError("over-budget spatial groups must not call LLM2")
+
+    candidates = [
+        {
+            "candidate_id": index,
+            "bbox": bbox,
+            "center": [
+                (bbox[0] + bbox[2]) / 2,
+                (bbox[1] + bbox[3]) / 2,
+            ],
+            "min_arm_density": 0.4,
+            "center_density": 0.9,
+        }
+        for index, bbox in enumerate(
+            (
+                [0.05, 0.05, 0.15, 0.15],
+                [0.4, 0.05, 0.5, 0.15],
+                [0.05, 0.5, 0.15, 0.6],
+                [0.4, 0.5, 0.5, 0.6],
+            )
+        )
+    ]
+
+    summary = diagnostic.run_cross_anchor_experiment(
+        image_path=source,
+        case_dir=case_dir,
+        client=FakeClient(),
+        cv_candidates=candidates,
+        candidate_overlay_path=overlay,
+        truth_regions=[
+            {
+                "truth_id": "T1",
+                "source_bbox_normalized": [0.0, 0.0, 0.2, 0.2],
+            }
+        ],
+        config=config,
+        subject_hint="chinese",
+        profile="spatial-grouped",
+    )
+
+    assert summary["baseline_group_request_count"] == 2
+    assert summary["spatial_request_budget_eligible"] is False
+    assert summary["spatial_group_request_count"] == 0
+    assert summary["spatial_experiment_status"] == "budget_rejected"
 
 def test_stable_event_experiment_runs_independent_detection_before_cv_audit(tmp_path):
     diagnostic = _load_script_module()

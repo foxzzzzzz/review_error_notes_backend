@@ -7,6 +7,7 @@ restricted diagnostic directory and delete it after analysis.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
@@ -1251,6 +1252,48 @@ def measure_bbox_red_support(
     }
 
 
+def load_cross_anchor_llm1_snapshot(snapshot_dir: Path) -> dict:
+    snapshot_dir = snapshot_dir.resolve()
+    filenames = (
+        "llm1-candidate-verification.json",
+        "llm1-independent-scan.json",
+        "llm1-fallback-candidate-verification.json",
+    )
+    payloads = {}
+    hashes = {}
+    for filename in filenames:
+        path = snapshot_dir / filename
+        raw = path.read_bytes()
+        payloads[filename] = json.loads(raw.decode("utf-8"))
+        hashes[filename] = hashlib.sha256(raw).hexdigest()
+    return {
+        "source": str(snapshot_dir),
+        "sha256": hashes,
+        "verification": CrossCandidateVerificationResult.model_validate(
+            payloads["llm1-candidate-verification.json"]
+        ),
+        "independent_scan": IndependentCrossScanResult.model_validate(
+            payloads["llm1-independent-scan.json"]
+        ),
+        "fallback_verification": CrossCandidateVerificationResult.model_validate(
+            payloads["llm1-fallback-candidate-verification.json"]
+        ),
+    }
+
+
+def resolve_cross_anchor_snapshot_dir(root: Path, label: str) -> Path:
+    candidates = (
+        root / label / "cross-anchor-experiment",
+        root / "pages" / label / "cross-anchor-experiment",
+    )
+    matches = [candidate.resolve() for candidate in candidates if candidate.is_dir()]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected one cross-anchor snapshot directory for {label} under {root}"
+        )
+    return matches[0]
+
+
 def select_independent_rescue_crosses(
     *,
     existing_anchors: list[dict],
@@ -1422,38 +1465,35 @@ def build_anchor_preservation_events(
         elif not item.matched:
             reasons.append("llm2_unmatched")
 
+        evidence_tier = "strong" if strong_evidence else "weak"
         if item is not None and item.matched and not reasons:
             status = "confirmed"
             bbox_source = "llm2"
             question_bbox = list(item.question_bbox)
             confidence = item.confidence
-        elif strong_evidence:
+        else:
             status = "needs_review"
             bbox_source = "local_anchor_context"
             question_bbox = build_local_anchor_context_bbox(anchor["bbox"], config)
             confidence = float(anchor.get("confidence") or 0)
-        else:
-            status = "rejected"
-            bbox_source = None
-            question_bbox = None
-            confidence = float(anchor.get("confidence") or 0)
-        if status != "rejected":
-            events.append(
-                {
-                    "event_id": len(events),
-                    "cross_ids": [cross_id],
-                    "representative_cross_id": cross_id,
-                    "question_bboxes": [question_bbox],
-                    "confidence": confidence,
-                    "status": status,
-                    "bbox_source": bbox_source,
-                }
-            )
+        events.append(
+            {
+                "event_id": len(events),
+                "cross_ids": [cross_id],
+                "representative_cross_id": cross_id,
+                "question_bboxes": [question_bbox],
+                "confidence": confidence,
+                "status": status,
+                "evidence_tier": evidence_tier,
+                "bbox_source": bbox_source,
+            }
+        )
         audit.append(
             {
                 "cross_id": cross_id,
                 "status": status,
                 "strong_evidence": strong_evidence,
+                "evidence_tier": evidence_tier,
                 "source": anchor["source"],
                 "independent_scan_supported": anchor["independent_scan_supported"],
                 "red_pixel_ratio": red_support["red_pixel_ratio"],
@@ -1464,7 +1504,11 @@ def build_anchor_preservation_events(
         "event_count": len(events),
         "events": events,
         "audit": audit,
-        "policy": "Confirmed and local needs_review events remain separate.",
+        "silently_dropped_anchor_count": len(anchors) - len(events),
+        "policy": (
+            "Every anchor is retained. Valid LLM2 regions are confirmed; all "
+            "other anchors become local needs_review events with an evidence tier."
+        ),
     }
 
 
@@ -1557,6 +1601,31 @@ def group_cross_anchors_spatially(
             }
         )
     return payload
+
+
+def audit_spatial_request_budget(
+    *,
+    anchor_count: int,
+    baseline_batch_size: int,
+    spatial_group_count: int,
+) -> dict:
+    baseline_request_budget = (
+        math.ceil(anchor_count / baseline_batch_size) if anchor_count else 0
+    )
+    eligible = spatial_group_count <= baseline_request_budget
+    return {
+        "eligible": eligible,
+        "anchor_count": anchor_count,
+        "baseline_batch_size": baseline_batch_size,
+        "baseline_request_budget": baseline_request_budget,
+        "spatial_group_count": spatial_group_count,
+        "saved_request_count": baseline_request_budget - spatial_group_count,
+        "reason": (
+            None
+            if eligible
+            else "spatial_group_count_exceeds_baseline_budget"
+        ),
+    }
 
 
 def audit_spatial_group_membership(
@@ -1733,8 +1802,21 @@ def build_spatial_question_events(
     spatial_result: SpatialQuestionGroupResult,
     anchor_preservation: dict,
 ) -> dict:
+    preserved_by_cross_id = {
+        cross_id: event
+        for event in anchor_preservation["events"]
+        for cross_id in event["cross_ids"]
+    }
+    accepted_groups = [
+        group
+        for group in spatial_result.groups
+        if all(
+            preserved_by_cross_id[cross_id]["status"] == "confirmed"
+            for cross_id in group.cross_ids
+        )
+    ]
     grouped_cross_ids = {
-        cross_id for group in spatial_result.groups for cross_id in group.cross_ids
+        cross_id for group in accepted_groups for cross_id in group.cross_ids
     }
     events = [
         {
@@ -1746,18 +1828,19 @@ def build_spatial_question_events(
             "status": "confirmed",
             "bbox_source": "spatial_llm2",
         }
-        for event_id, group in enumerate(spatial_result.groups)
+        for event_id, group in enumerate(accepted_groups)
     ]
     for preserved in anchor_preservation["events"]:
-        if preserved["status"] != "needs_review":
-            continue
         if any(cross_id in grouped_cross_ids for cross_id in preserved["cross_ids"]):
             continue
         events.append({**preserved, "event_id": len(events)})
     return {
         "event_count": len(events),
         "events": events,
-        "policy": "Model groups are primary; unmatched strong anchors keep local review events.",
+        "policy": (
+            "Only geometry-valid model groups are primary; every other anchor "
+            "keeps its individual preserved event."
+        ),
     }
 
 
@@ -3548,6 +3631,9 @@ def build_summary(
             cross_anchor_experiment or {}
         ).get("llm1_fallback_generates_anchors"),
         "cross_anchor_profile": (cross_anchor_experiment or {}).get("profile"),
+        "cross_anchor_llm1_input_mode": (cross_anchor_experiment or {}).get(
+            "llm1_input_mode"
+        ),
         "cross_anchor_independent_rescue_count": (
             cross_anchor_experiment or {}
         ).get("llm1_independent_rescue_count"),
@@ -3566,9 +3652,27 @@ def build_summary(
         "cross_anchor_preservation_union_truth_recall": (
             cross_anchor_experiment or {}
         ).get("anchor_preservation_union_truth_recall"),
+        "cross_anchor_preservation_silently_dropped_count": (
+            cross_anchor_experiment or {}
+        ).get("anchor_preservation_silently_dropped_count"),
+        "cross_anchor_baseline_group_request_count": (
+            cross_anchor_experiment or {}
+        ).get("baseline_group_request_count"),
+        "cross_anchor_spatial_request_budget_eligible": (
+            cross_anchor_experiment or {}
+        ).get("spatial_request_budget_eligible"),
+        "cross_anchor_spatial_request_budget": (
+            cross_anchor_experiment or {}
+        ).get("spatial_request_budget"),
+        "cross_anchor_spatial_experiment_status": (
+            cross_anchor_experiment or {}
+        ).get("spatial_experiment_status"),
         "cross_anchor_spatial_group_request_count": (
             cross_anchor_experiment or {}
         ).get("spatial_group_request_count"),
+        "cross_anchor_spatial_group_error_count": (
+            cross_anchor_experiment or {}
+        ).get("spatial_group_error_count"),
         "cross_anchor_spatial_question_event_count": (
             cross_anchor_experiment or {}
         ).get("spatial_question_event_count"),
@@ -3769,6 +3873,7 @@ def run_case(
     compare_stable_events: bool = False,
     compare_cross_anchor: bool = False,
     cross_anchor_profile: str = "baseline",
+    cross_anchor_replay_from: Path | None = None,
     primitive_duplicate_containment_threshold: float | None = None,
     cross_circle_max_center_distance: float | None = None,
 ) -> dict:
@@ -3925,6 +4030,14 @@ def run_case(
                     config=cross_cv_config,
                     subject_hint=subject_hint,
                     profile=cross_anchor_profile,
+                    llm1_snapshot_dir=(
+                        resolve_cross_anchor_snapshot_dir(
+                            cross_anchor_replay_from,
+                            label,
+                        )
+                        if cross_anchor_replay_from is not None
+                        else None
+                    ),
                 )
             except Exception as exc:
                 cross_anchor_experiment_error = {
@@ -3972,6 +4085,7 @@ def run_cross_anchor_experiment(
     config: dict,
     subject_hint: str | None,
     profile: str = "baseline",
+    llm1_snapshot_dir: Path | None = None,
 ) -> dict:
     if profile not in CROSS_ANCHOR_PROFILES:
         raise ValueError(f"unknown cross-anchor profile: {profile}")
@@ -3999,34 +4113,50 @@ def run_cross_anchor_experiment(
     )
 
     candidate_ids = [candidate["candidate_id"] for candidate in cv_candidates]
+    llm1_snapshot = (
+        load_cross_anchor_llm1_snapshot(llm1_snapshot_dir)
+        if llm1_snapshot_dir is not None
+        else None
+    )
     verification_runs = []
     phase_started = time.perf_counter()
-    verification_run_count = int(
-        config.get("cross_anchor_llm1_verification_runs", 1)
-    )
-    for run_index in range(1, verification_run_count + 1):
-        run_result = client.verify_cross_candidates(
-            str(candidate_montage_path),
-            cv_candidates,
-        )
+    if llm1_snapshot is not None:
+        verification_run_count = 0
+        verification_runs.append(llm1_snapshot["verification"])
         _write_json(
-            experiment_dir
-            / f"llm1-candidate-verification-run-{run_index:03d}.json",
-            run_result,
+            experiment_dir / "llm1-replay-source.json",
+            {
+                "source": llm1_snapshot["source"],
+                "sha256": llm1_snapshot["sha256"],
+            },
         )
-        run_audit = audit_cross_candidate_dispositions(run_result, candidate_ids)
-        if not run_audit["valid"]:
+    else:
+        verification_run_count = int(
+            config.get("cross_anchor_llm1_verification_runs", 1)
+        )
+        for run_index in range(1, verification_run_count + 1):
+            run_result = client.verify_cross_candidates(
+                str(candidate_montage_path),
+                cv_candidates,
+            )
             _write_json(
                 experiment_dir
-                / f"llm1-candidate-membership-audit-run-{run_index:03d}.json",
-                run_audit,
+                / f"llm1-candidate-verification-run-{run_index:03d}.json",
+                run_result,
             )
-            _write_json(
-                experiment_dir / "llm1-candidate-membership-audit.json",
-                run_audit,
-            )
-            raise ValueError("candidate disposition audit failed")
-        verification_runs.append(run_result)
+            run_audit = audit_cross_candidate_dispositions(run_result, candidate_ids)
+            if not run_audit["valid"]:
+                _write_json(
+                    experiment_dir
+                    / f"llm1-candidate-membership-audit-run-{run_index:03d}.json",
+                    run_audit,
+                )
+                _write_json(
+                    experiment_dir / "llm1-candidate-membership-audit.json",
+                    run_audit,
+                )
+                raise ValueError("candidate disposition audit failed")
+            verification_runs.append(run_result)
     timings_ms["llm1_candidate_verification"] = round(
         (time.perf_counter() - phase_started) * 1000, 2
     )
@@ -4050,7 +4180,11 @@ def run_cross_anchor_experiment(
         raise ValueError("candidate disposition audit failed")
 
     phase_started = time.perf_counter()
-    independent_scan = client.scan_independent_crosses(str(image_path))
+    independent_scan = (
+        llm1_snapshot["independent_scan"]
+        if llm1_snapshot is not None
+        else client.scan_independent_crosses(str(image_path))
+    )
     _write_json(experiment_dir / "llm1-independent-scan.json", independent_scan)
     timings_ms["independent_cross_scan"] = round(
         (time.perf_counter() - phase_started) * 1000, 2
@@ -4067,7 +4201,9 @@ def run_cross_anchor_experiment(
         for candidate_id, cross in enumerate(independent_scan.crosses)
     ]
     phase_started = time.perf_counter()
-    if fallback_candidates:
+    if llm1_snapshot is not None:
+        fallback_verification = llm1_snapshot["fallback_verification"]
+    elif fallback_candidates:
         fallback_montage_path = experiment_dir / "fallback-candidate-montage.jpg"
         fallback_montage_summary = write_cross_candidate_montage(
             image_path,
@@ -4285,111 +4421,55 @@ def run_cross_anchor_experiment(
     anchored_items = []
     llm2_batch_errors = []
     spatial_localization = None
-    if profile == "spatial-grouped":
-        spatial_groups = group_cross_anchors_spatially(anchors, config)
-        _write_json(
-            experiment_dir / "spatial-anchor-groups.json",
-            spatial_groups,
-        )
-        spatial_localization = run_spatial_group_localization(
-            image_path=image_path,
-            experiment_dir=experiment_dir,
-            client=client,
-            groups=spatial_groups,
-            subject_hint=subject_hint,
-        )
-        spatial_result = spatial_localization["result"]
-        llm2_batch_count = spatial_localization["request_count"]
-        llm2_batch_errors = [
-            {
-                "batch_index": error["spatial_group_id"] + 1,
-                "cross_ids": error["cross_ids"],
-                "type": error["type"],
-                "code": error["code"],
-                "message": error["message"],
-            }
-            for error in spatial_localization["errors"]
+    spatial_request_budget = None
+    spatial_experiment_status = None
+    baseline_group_request_count = math.ceil(len(anchors) / batch_size) if anchors else 0
+    for batch_index, start in enumerate(range(0, len(anchors), batch_size), 1):
+        llm2_batch_count += 1
+        batch = anchors[start : start + batch_size]
+        batch_entries = [
+            {"mark_id": anchor["cross_id"], "bbox": anchor["bbox"]}
+            for anchor in batch
         ]
-        _write_json(
-            experiment_dir / "spatial-group-result.json",
-            spatial_result,
+        batch_overlay_path = experiment_dir / (
+            f"llm2-run-001-batch-{batch_index:03d}-overlay.jpg"
         )
-        _write_json(
-            experiment_dir / "group-membership-audit.json",
-            spatial_localization["membership_audit"],
+        _draw_boxes(
+            image_path,
+            batch_overlay_path,
+            [("C", batch_entries, "blue")],
         )
-        _write_json(
-            experiment_dir / "spatial-group-errors.json",
-            {"errors": spatial_localization["errors"]},
-        )
-        for question_group in spatial_result.groups:
-            anchored_items.extend(
-                CrossAnchoredQuestion(
-                    cross_id=cross_id,
-                    matched=True,
-                    question_bbox=question_group.question_bbox,
-                    unmatched_reason=None,
-                    confidence=question_group.confidence,
-                )
-                for cross_id in question_group.cross_ids
+        try:
+            batch_result = client.locate_cross_anchored_questions(
+                str(batch_overlay_path),
+                batch,
+                subject_hint,
             )
-        anchored_items.extend(
-            CrossAnchoredQuestion(
-                cross_id=item.cross_id,
-                matched=False,
-                question_bbox=None,
-                unmatched_reason=item.reason,
-                confidence=item.confidence,
+        except Exception as exc:
+            if profile not in ("anchor-preserving", "spatial-grouped"):
+                raise
+            llm2_batch_errors.append(
+                {
+                    "batch_index": batch_index,
+                    "cross_ids": [anchor["cross_id"] for anchor in batch],
+                    "type": type(exc).__name__,
+                    "code": getattr(exc, "code", None),
+                    "message": str(exc),
+                }
             )
-            for item in spatial_result.unmatched
-        )
-    else:
-        for batch_index, start in enumerate(range(0, len(anchors), batch_size), 1):
-            llm2_batch_count += 1
-            batch = anchors[start : start + batch_size]
-            batch_entries = [
-                {"mark_id": anchor["cross_id"], "bbox": anchor["bbox"]}
-                for anchor in batch
-            ]
-            batch_overlay_path = experiment_dir / (
-                f"llm2-run-001-batch-{batch_index:03d}-overlay.jpg"
+            batch_result = CrossAnchoredQuestionResult(
+                items=[
+                    CrossAnchoredQuestion(
+                        cross_id=anchor["cross_id"],
+                        matched=False,
+                        question_bbox=None,
+                        unmatched_reason="LLM2 batch request failed",
+                        confidence=0.0,
+                    )
+                    for anchor in batch
+                ]
             )
-            _draw_boxes(
-                image_path,
-                batch_overlay_path,
-                [("C", batch_entries, "blue")],
-            )
-            try:
-                batch_result = client.locate_cross_anchored_questions(
-                    str(batch_overlay_path),
-                    batch,
-                    subject_hint,
-                )
-            except Exception as exc:
-                if profile != "anchor-preserving":
-                    raise
-                llm2_batch_errors.append(
-                    {
-                        "batch_index": batch_index,
-                        "cross_ids": [anchor["cross_id"] for anchor in batch],
-                        "type": type(exc).__name__,
-                        "code": getattr(exc, "code", None),
-                        "message": str(exc),
-                    }
-                )
-                batch_result = CrossAnchoredQuestionResult(
-                    items=[
-                        CrossAnchoredQuestion(
-                            cross_id=anchor["cross_id"],
-                            matched=False,
-                            question_bbox=None,
-                            unmatched_reason="LLM2 batch request failed",
-                            confidence=0.0,
-                        )
-                        for anchor in batch
-                    ]
-                )
-            anchored_items.extend(batch_result.items)
+        anchored_items.extend(batch_result.items)
     _write_json(
         experiment_dir / "llm2-batch-errors.json",
         {"errors": llm2_batch_errors},
@@ -4421,6 +4501,10 @@ def run_cross_anchor_experiment(
     _write_json(
         experiment_dir / "question-geometry-audit-run-001.json",
         first_geometry_audit,
+    )
+    timings_ms["baseline_llm2_localization"] = round(
+        (time.perf_counter() - run_started) * 1000,
+        2,
     )
     anchor_preservation = None
     anchor_preservation_truth = None
@@ -4481,44 +4565,155 @@ def run_cross_anchor_experiment(
             anchor_preservation_confirmed_truth,
         )
     if profile == "spatial-grouped":
-        spatial_question_events = build_spatial_question_events(
-            spatial_result,
-            anchor_preservation,
+        spatial_groups = group_cross_anchors_spatially(anchors, config)
+        _write_json(
+            experiment_dir / "spatial-anchor-groups.json",
+            spatial_groups,
+        )
+        spatial_request_budget = audit_spatial_request_budget(
+            anchor_count=len(anchors),
+            baseline_batch_size=batch_size,
+            spatial_group_count=len(spatial_groups),
         )
         _write_json(
-            experiment_dir / "spatial-question-events.json",
-            spatial_question_events,
+            experiment_dir / "spatial-request-budget-audit.json",
+            spatial_request_budget,
         )
-        spatial_deduplicated_events = deduplicate_spatial_question_events(
-            spatial_question_events["events"],
-            anchors,
-            config,
-        )
-        _write_json(
-            experiment_dir / "deduplicated-question-events.json",
-            {
-                "event_count": spatial_deduplicated_events["event_count"],
-                "events": spatial_deduplicated_events["events"],
-                "policy": spatial_deduplicated_events["policy"],
-            },
-        )
-        _write_json(
-            experiment_dir / "deduplication-audit.json",
-            {"decisions": spatial_deduplicated_events["audit"]},
-        )
-        spatial_truth_comparison = compare_question_events_to_truth(
-            spatial_deduplicated_events,
-            truth_regions,
-            min_iou=float(config["question_truth_min_iou"]),
-        )
-        _write_json(
-            experiment_dir / "spatial-question-events-truth-comparison.json",
-            spatial_truth_comparison,
-        )
-    timings_ms["llm2_localization_run_001"] = round(
-        (time.perf_counter() - run_started) * 1000,
-        2,
-    )
+        if spatial_request_budget["eligible"]:
+            spatial_started = time.perf_counter()
+            spatial_localization = run_spatial_group_localization(
+                image_path=image_path,
+                experiment_dir=experiment_dir,
+                client=client,
+                groups=spatial_groups,
+                subject_hint=subject_hint,
+            )
+            timings_ms["spatial_llm2_localization"] = round(
+                (time.perf_counter() - spatial_started) * 1000,
+                2,
+            )
+            llm2_batch_count += spatial_localization["request_count"]
+            spatial_result = spatial_localization["result"]
+            spatial_experiment_status = "completed"
+            _write_json(
+                experiment_dir / "spatial-group-result.json",
+                spatial_result,
+            )
+            _write_json(
+                experiment_dir / "group-membership-audit.json",
+                spatial_localization["membership_audit"],
+            )
+            _write_json(
+                experiment_dir / "spatial-group-errors.json",
+                {"errors": spatial_localization["errors"]},
+            )
+            spatial_anchored_result = CrossAnchoredQuestionResult(
+                items=[
+                    CrossAnchoredQuestion(
+                        cross_id=cross_id,
+                        matched=True,
+                        question_bbox=question_group.question_bbox,
+                        unmatched_reason=None,
+                        confidence=question_group.confidence,
+                    )
+                    for question_group in spatial_result.groups
+                    for cross_id in question_group.cross_ids
+                ]
+                + [
+                    CrossAnchoredQuestion(
+                        cross_id=item.cross_id,
+                        matched=False,
+                        question_bbox=None,
+                        unmatched_reason=item.reason,
+                        confidence=item.confidence,
+                    )
+                    for item in spatial_result.unmatched
+                ]
+            )
+            spatial_geometry_audit = audit_anchored_question_geometry(
+                spatial_anchored_result,
+                anchors,
+                max_area_ratio=float(
+                    config["cross_anchor_question_max_area_ratio"]
+                ),
+                max_gap_ratio=float(config["cross_anchor_question_max_gap_ratio"]),
+            )
+            spatial_batch_errors = [
+                {
+                    "batch_index": error["spatial_group_id"] + 1,
+                    "cross_ids": error["cross_ids"],
+                    "type": error["type"],
+                    "code": error["code"],
+                    "message": error["message"],
+                }
+                for error in spatial_localization["errors"]
+            ]
+            spatial_anchor_preservation = build_anchor_preservation_events(
+                anchors=anchors,
+                result=spatial_anchored_result,
+                geometry_audit=spatial_geometry_audit,
+                batch_errors=spatial_batch_errors,
+                image_path=image_path,
+                config=config,
+            )
+            _write_json(
+                experiment_dir / "spatial-anchor-preservation-events.json",
+                {
+                    "event_count": spatial_anchor_preservation["event_count"],
+                    "events": spatial_anchor_preservation["events"],
+                    "policy": spatial_anchor_preservation["policy"],
+                },
+            )
+            _write_json(
+                experiment_dir / "spatial-anchor-preservation-audit.json",
+                {
+                    "items": spatial_anchor_preservation["audit"],
+                    "silently_dropped_anchor_count": spatial_anchor_preservation[
+                        "silently_dropped_anchor_count"
+                    ],
+                    "batch_errors": spatial_batch_errors,
+                },
+            )
+            spatial_question_events = build_spatial_question_events(
+                spatial_result,
+                spatial_anchor_preservation,
+            )
+            _write_json(
+                experiment_dir / "spatial-question-events.json",
+                spatial_question_events,
+            )
+            spatial_deduplicated_events = deduplicate_spatial_question_events(
+                spatial_question_events["events"],
+                anchors,
+                config,
+            )
+            _write_json(
+                experiment_dir / "deduplicated-question-events.json",
+                {
+                    "event_count": spatial_deduplicated_events["event_count"],
+                    "events": spatial_deduplicated_events["events"],
+                    "policy": spatial_deduplicated_events["policy"],
+                },
+            )
+            _write_json(
+                experiment_dir / "deduplication-audit.json",
+                {"decisions": spatial_deduplicated_events["audit"]},
+            )
+            spatial_truth_comparison = compare_question_events_to_truth(
+                spatial_deduplicated_events,
+                truth_regions,
+                min_iou=float(config["question_truth_min_iou"]),
+            )
+            _write_json(
+                experiment_dir / "spatial-question-events-truth-comparison.json",
+                spatial_truth_comparison,
+            )
+        else:
+            spatial_experiment_status = "budget_rejected"
+            timings_ms["spatial_llm2_localization"] = 0.0
+    timings_ms["llm2_localization_run_001"] = timings_ms[
+        "baseline_llm2_localization"
+    ]
 
     retry_selection = select_llm2_retry_anchors(
         first_run,
@@ -4788,6 +4983,10 @@ def run_cross_anchor_experiment(
 
     summary = {
         "profile": profile,
+        "llm1_input_mode": "replay" if llm1_snapshot is not None else "live",
+        "llm1_snapshot_source": (
+            llm1_snapshot["source"] if llm1_snapshot is not None else None
+        ),
         "cv_candidate_count": len(cv_candidates),
         "llm1_verification_run_count": verification_run_count,
         "llm1_unstable_candidate_count": len(
@@ -4869,10 +5068,32 @@ def run_cross_anchor_experiment(
             if anchor_preservation_truth is not None
             else None
         ),
+        "anchor_preservation_silently_dropped_count": (
+            anchor_preservation["silently_dropped_anchor_count"]
+            if anchor_preservation is not None
+            else None
+        ),
+        "baseline_group_request_count": baseline_group_request_count,
+        "spatial_request_budget_eligible": (
+            spatial_request_budget["eligible"]
+            if spatial_request_budget is not None
+            else None
+        ),
+        "spatial_request_budget": (
+            spatial_request_budget["baseline_request_budget"]
+            if spatial_request_budget is not None
+            else None
+        ),
+        "spatial_experiment_status": spatial_experiment_status,
         "spatial_group_request_count": (
             spatial_localization["request_count"]
             if spatial_localization is not None
-            else None
+            else (0 if profile == "spatial-grouped" else None)
+        ),
+        "spatial_group_error_count": (
+            len(spatial_localization["errors"])
+            if spatial_localization is not None
+            else (0 if profile == "spatial-grouped" else None)
         ),
         "spatial_question_event_count": (
             spatial_deduplicated_events["event_count"]
@@ -4953,9 +5174,13 @@ def run_cross_anchor_experiment(
             "union_minimum_matched_truth_coverage"
         ],
         "llm_request_count": (
-            verification_run_count
-            + 1
-            + (1 if fallback_candidates else 0)
+            (
+                0
+                if llm1_snapshot is not None
+                else verification_run_count
+                + 1
+                + (1 if fallback_candidates else 0)
+            )
             + llm2_batch_count
         ),
         "timings_ms": timings_ms,
@@ -5315,23 +5540,37 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
             "",
             "## 独立实验 Profile",
             "",
-            "> confirmed 与 needs_review 分开统计；空间分组结果只代表当前显式 profile，不覆盖 baseline 字段。",
+            "> 同一输入回放时，LLM1输入显示 replay；空间实验先运行同锚点baseline，再仅在请求数不超过baseline预算时运行。",
             "",
-            "| 图片 | Profile | 独立补锚 | LLM2批次异常 | confirmed | needs_review | confirmed召回 | 含保底召回 | 空间分组请求 | 去重后事件 | 空间结果召回 | 空间误报事件 |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 图片 | Profile | LLM1输入 | 独立补锚 | baseline请求 | 空间预算 | 空间状态 | 空间请求 | 空间异常 | LLM2批次异常 | confirmed | needs_review | 静默丢锚 | confirmed召回 | 含保底召回 | 去重后事件 | 空间结果召回 | 空间误报事件 |",
+            "|---|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for summary in summaries:
         item = summary["checkpoints"]
         lines.append(
-            "| {label} | {profile} | {rescue} | {batch_errors} | {confirmed} | {needs_review} | {confirmed_recall} | {union_recall} | {spatial_requests} | {spatial_events} | {spatial_recall} | {spatial_false} |".format(
+            "| {label} | {profile} | {input_mode} | {rescue} | {baseline_requests} | {budget_eligible} | {spatial_status} | {spatial_requests} | {spatial_errors} | {batch_errors} | {confirmed} | {needs_review} | {dropped} | {confirmed_recall} | {union_recall} | {spatial_events} | {spatial_recall} | {spatial_false} |".format(
                 label=summary["label"],
                 profile=item["cross_anchor_profile"],
+                input_mode=item["cross_anchor_llm1_input_mode"],
                 rescue=item["cross_anchor_independent_rescue_count"],
+                baseline_requests=item[
+                    "cross_anchor_baseline_group_request_count"
+                ],
+                budget_eligible=item[
+                    "cross_anchor_spatial_request_budget_eligible"
+                ],
+                spatial_status=item[
+                    "cross_anchor_spatial_experiment_status"
+                ],
+                spatial_errors=item["cross_anchor_spatial_group_error_count"],
                 batch_errors=item["cross_anchor_llm2_batch_error_count"],
                 confirmed=item["cross_anchor_preservation_confirmed_count"],
                 needs_review=item[
                     "cross_anchor_preservation_needs_review_count"
+                ],
+                dropped=item[
+                    "cross_anchor_preservation_silently_dropped_count"
                 ],
                 confirmed_recall=item[
                     "cross_anchor_preservation_confirmed_truth_recall"
@@ -5360,15 +5599,15 @@ def _write_timing_report(output_dir: Path, summaries: list[dict]) -> None:
         "",
         "> 单位均为毫秒。旧生产流程、旧stable实验和新cross-anchor实验在同一轮中串行执行；整页总耗时包含本地CV、文件输出及所有启用实验。",
         "",
-        "| 图片 | 整页总耗时 | 红色证据CV | 红叉候选CV | 旧生产流程 | 旧stable实验 | 新方案总耗时 | LLM1核验次数 | 新方案LLM请求 | 定向复查触发 | 定向复查请求 | LLM1候选核验 | 独立漏检扫描 | fallback复核 | LLM2定位总计 | 定向复查耗时 | 后置审计 | Profile | 空间分组请求 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|",
+        "| 图片 | 整页总耗时 | 红色证据CV | 红叉候选CV | 旧生产流程 | 旧stable实验 | 新方案总耗时 | LLM1输入 | LLM1核验次数 | 新方案LLM请求 | 定向复查触发 | 定向复查请求 | LLM1候选核验 | 独立漏检扫描 | fallback复核 | baseline LLM2 | 空间LLM2 | LLM2定位总计 | 定向复查耗时 | 后置审计 | Profile | 空间分组请求 |",
+        "|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
     for summary in summaries:
         case_timings = summary.get("timings_ms") or {}
         checkpoints = summary["checkpoints"]
         stage_timings = checkpoints.get("cross_anchor_stage_timings_ms") or {}
         lines.append(
-            "| {label} | {total} | {red_cv} | {cross_cv} | {production} | {stable} | {cross_anchor} | {runs} | {requests} | {retry_triggers} | {retry_requests} | {verify} | {scan} | {fallback} | {llm2} | {llm2_second} | {audit} | {profile} | {spatial_requests} |".format(
+            "| {label} | {total} | {red_cv} | {cross_cv} | {production} | {stable} | {cross_anchor} | {input_mode} | {runs} | {requests} | {retry_triggers} | {retry_requests} | {verify} | {scan} | {fallback} | {baseline_llm2} | {spatial_llm2} | {llm2} | {llm2_second} | {audit} | {profile} | {spatial_requests} |".format(
                 label=summary["label"],
                 total=case_timings.get("total"),
                 red_cv=case_timings.get("red_evidence_cv"),
@@ -5376,6 +5615,7 @@ def _write_timing_report(output_dir: Path, summaries: list[dict]) -> None:
                 production=case_timings.get("production_pipeline"),
                 stable=case_timings.get("stable_event_experiment"),
                 cross_anchor=case_timings.get("cross_anchor_experiment"),
+                input_mode=checkpoints.get("cross_anchor_llm1_input_mode"),
                 runs=checkpoints.get(
                     "cross_anchor_llm1_verification_run_count"
                 ),
@@ -5391,6 +5631,10 @@ def _write_timing_report(output_dir: Path, summaries: list[dict]) -> None:
                 fallback=stage_timings.get(
                     "fallback_montage_and_verification"
                 ),
+                baseline_llm2=stage_timings.get(
+                    "baseline_llm2_localization"
+                ),
+                spatial_llm2=stage_timings.get("spatial_llm2_localization"),
                 llm2=stage_timings.get("llm2_localization"),
                 llm2_second=stage_timings.get(
                     "llm2_localization_run_002"
@@ -5457,6 +5701,13 @@ def main() -> int:
         help="select an isolated cross-anchor diagnostic experiment profile",
     )
     parser.add_argument(
+        "--cross-anchor-replay-from",
+        help=(
+            "reuse LLM1 candidate verification, independent scan, and fallback "
+            "verification from an earlier diagnostic output directory"
+        ),
+    )
+    parser.add_argument(
         "--stable-primitive-duplicate-containment-threshold",
         type=float,
         help="same-type primitive containment ratio used by diagnostic audit",
@@ -5483,6 +5734,10 @@ def main() -> int:
             parser.error("--compare-cross-anchor requires --cross-cv-config")
         if not args.truth_regions:
             parser.error("--compare-cross-anchor requires --truth-regions")
+    elif args.cross_anchor_replay_from:
+        parser.error(
+            "--cross-anchor-replay-from requires --compare-cross-anchor"
+        )
 
     if args.compare_stable_events:
         if args.stable_primitive_duplicate_containment_threshold is None:
@@ -5519,6 +5774,13 @@ def main() -> int:
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             parser.error(str(exc))
     output_dir = Path(args.output).expanduser().resolve()
+    cross_anchor_replay_from = (
+        Path(args.cross_anchor_replay_from).expanduser().resolve()
+        if args.cross_anchor_replay_from
+        else None
+    )
+    if cross_anchor_replay_from is not None and not cross_anchor_replay_from.is_dir():
+        parser.error("--cross-anchor-replay-from must be an existing directory")
     output_dir.mkdir(parents=True, exist_ok=False)
     _write_json(
         output_dir / "manifest.json",
@@ -5530,6 +5792,11 @@ def main() -> int:
             "compare_stable_events": args.compare_stable_events,
             "compare_cross_anchor": args.compare_cross_anchor,
             "cross_anchor_profile": args.cross_anchor_profile,
+            "cross_anchor_replay_from": (
+                str(cross_anchor_replay_from)
+                if cross_anchor_replay_from is not None
+                else None
+            ),
             "stable_primitive_duplicate_containment_threshold": (
                 args.stable_primitive_duplicate_containment_threshold
             ),
@@ -5552,6 +5819,7 @@ def main() -> int:
             compare_stable_events=args.compare_stable_events,
             compare_cross_anchor=args.compare_cross_anchor,
             cross_anchor_profile=args.cross_anchor_profile,
+            cross_anchor_replay_from=cross_anchor_replay_from,
             primitive_duplicate_containment_threshold=(
                 args.stable_primitive_duplicate_containment_threshold
             ),
