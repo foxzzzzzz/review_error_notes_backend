@@ -34,6 +34,291 @@ def _new_cross_experiment_config_fields():
     }
 
 
+def _holistic_v3_payload():
+    return {
+        "page_rule": "red_cross_primary",
+        "observed_cross_count": 2,
+        "cross_anchors": [
+            {
+                "anchor_id": "a0",
+                "bbox": [0.15, 0.15, 0.25, 0.25],
+                "visual_evidence": "two_intersecting_red_diagonal_strokes",
+                "model_confidence": 0.95,
+            },
+            {
+                "anchor_id": "a1",
+                "bbox": [0.65, 0.65, 0.75, 0.75],
+                "visual_evidence": "two_intersecting_red_diagonal_strokes",
+                "model_confidence": 0.9,
+            },
+        ],
+        "question_events": [
+            {
+                "event_id": "q0",
+                "anchor_ids": ["a0"],
+                "question_bbox": [0.1, 0.1, 0.4, 0.4],
+                "model_confidence": 0.9,
+            },
+            {
+                "event_id": "q1",
+                "anchor_ids": ["a1"],
+                "question_bbox": [0.6, 0.6, 0.9, 0.9],
+                "model_confidence": 0.85,
+            },
+        ],
+        "circle_only_regions": [],
+        "unassigned_cross_anchor_ids": [],
+    }
+
+
+def test_holistic_v3_contract_rejects_silent_or_duplicate_anchor_assignment():
+    diagnostic = _load_script_module()
+    silent_drop = _holistic_v3_payload()
+    silent_drop["question_events"] = silent_drop["question_events"][:1]
+    with pytest.raises(ValueError, match="neither assigned nor unassigned"):
+        diagnostic.HolisticCrossGeometryResult.model_validate(silent_drop)
+
+    duplicate_assignment = _holistic_v3_payload()
+    duplicate_assignment["question_events"][1]["anchor_ids"] = ["a0", "a1"]
+    with pytest.raises(ValueError, match="assigned more than once"):
+        diagnostic.HolisticCrossGeometryResult.model_validate(duplicate_assignment)
+
+
+def test_recording_client_holistic_v3_uses_one_geometry_only_request(tmp_path):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.jpg"
+    Image.new("RGB", (100, 100), "white").save(source)
+    calls = []
+
+    class FakeVisionClient:
+        max_edge = 2048
+        max_retries = 0
+        jpeg_quality = 90
+
+        def _request(self, payload, result_model, request_diagnostic):
+            calls.append((payload, result_model, request_diagnostic))
+            return result_model.model_validate(_holistic_v3_payload())
+
+    client = diagnostic.RecordingVisionClient(
+        FakeVisionClient(),
+        diagnostic.ExchangeRecorder(tmp_path / "recording"),
+    )
+
+    result = client.recognize_holistic_v3_geometry(
+        str(source),
+        prompt_version="HOLISTIC_CROSS_GEOMETRY_PROMPT_V3",
+    )
+
+    assert result.observed_cross_count == 2
+    assert len(calls) == 1
+    assert calls[0][1] is diagnostic.HolisticCrossGeometryResult
+    assert "raw_text" not in calls[0][0]["prompt"]
+    assert calls[0][2]["prompt_version"] == "HOLISTIC_CROSS_GEOMETRY_PROMPT_V3"
+    call_dirs = list((tmp_path / "recording" / "llm-calls").iterdir())
+    assert len(call_dirs) == 1
+
+
+def test_holistic_v3_experiment_reports_anchor_and_event_truth_independently(tmp_path):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.jpg"
+    Image.new("RGB", (100, 100), "white").save(source)
+    payload = _holistic_v3_payload()
+    payload["circle_only_regions"] = [
+        {
+            "bbox": [0.12, 0.12, 0.2, 0.2],
+            "reason": "red_circle_without_cross",
+        }
+    ]
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def recognize_holistic_v3_geometry(self, image_path, prompt_version):
+            self.calls += 1
+            return diagnostic.HolisticCrossGeometryResult.model_validate(payload)
+
+    truth = [
+        {"truth_id": "T1", "source_bbox_normalized": [0.1, 0.1, 0.4, 0.4]},
+        {"truth_id": "T2", "source_bbox_normalized": [0.6, 0.6, 0.9, 0.9]},
+    ]
+    client = FakeClient()
+
+    summary = diagnostic.run_holistic_v3_experiment(
+        image_path=source,
+        case_dir=tmp_path / "case",
+        client=client,
+        truth_regions=truth,
+        config={
+                "holistic_v3_prompt_version": "HOLISTIC_CROSS_GEOMETRY_PROMPT_V3",
+                "holistic_v3_max_retries": 0,
+                "question_truth_min_iou": 0.2,
+            "truth_match_margin_ratio": 0.01,
+        },
+        long_edge=2048,
+    )
+
+    assert client.calls == 1
+    assert summary["llm_request_count"] == 1
+    assert summary["cross_anchor_truth_recall"] == 1.0
+    assert summary["question_event_truth_recall"] == 1.0
+    assert summary["circle_only_false_positive_count"] == 1
+    assert summary["duplicate_event_count"] == 0
+    assert summary["content_ocr_status"] == "not_run"
+    experiment_dir = tmp_path / "case" / "holistic-v3-experiment"
+    assert (experiment_dir / "result.json").is_file()
+    assert (experiment_dir / "cross-anchor-truth-comparison.json").is_file()
+    assert (experiment_dir / "question-event-truth-comparison.json").is_file()
+    assert (experiment_dir / "question-events-overlay.jpg").is_file()
+
+
+def test_main_holistic_v3_only_forwards_frozen_single_request_mode(
+    tmp_path, monkeypatch
+):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.jpg"
+    Image.new("RGB", (20, 20), "white").save(source)
+    truth_path = tmp_path / "truth.json"
+    truth_path.write_text(
+        json.dumps(
+            {
+                "pages": {
+                    "sample": {
+                        "regions": [
+                            {
+                                "truth_id": "T1",
+                                "source_bbox_normalized": [0.1, 0.1, 0.4, 0.4],
+                            }
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    received = []
+
+    def fake_run_case(**kwargs):
+        received.append(kwargs)
+        summary = diagnostic.build_summary(
+            label=kwargs["label"],
+            expected_count=1,
+            cv={"raw_component_count": 0, "evidence_group_count": 0},
+            pipeline=None,
+        )
+        summary.update(
+            {
+                "error": None,
+                "stable_experiment_error": None,
+                "cross_anchor_experiment_error": None,
+                "holistic_v3_experiment_error": None,
+            }
+        )
+        return summary
+
+    output = tmp_path / "output"
+    monkeypatch.setattr(diagnostic, "run_case", fake_run_case)
+    monkeypatch.setattr(
+        diagnostic.sys,
+        "argv",
+        [
+            "diagnose_vision_pipeline.py",
+            f"sample={source}",
+            "--expected",
+            "sample=1",
+            "--holistic-v3-only",
+            "--holistic-v3-long-edge",
+            "3072",
+            "--cross-cv-config",
+            str(BACKEND_ROOT / "scripts" / "cv_cross_experiment_config.json"),
+            "--truth-regions",
+            str(truth_path),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert diagnostic.main() == 0
+    assert received[0]["holistic_v3_only"] is True
+    assert received[0]["holistic_v3_long_edge"] == 3072
+    assert received[0]["compare_cross_anchor"] is False
+    manifest = json.loads((output / "manifest.json").read_text("utf-8"))
+    assert manifest["holistic_v3_only"] is True
+    assert manifest["holistic_v3_long_edge"] == 3072
+
+
+def test_run_case_holistic_v3_skips_production_and_cross_anchor_chains(
+    tmp_path, monkeypatch
+):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.jpg"
+    Image.new("RGB", (20, 20), "white").save(source)
+    calls = []
+
+    class FakeMiniMaxClient:
+        max_edge = 100
+        max_retries = 2
+        jpeg_quality = 90
+        diagnostic_event_sink = None
+
+        @classmethod
+        def from_settings(cls):
+            return cls()
+
+        def _request(self, payload, result_model, request_diagnostic):
+            calls.append((payload, result_model, request_diagnostic))
+            one_anchor = _holistic_v3_payload()
+            one_anchor["observed_cross_count"] = 1
+            one_anchor["cross_anchors"] = one_anchor["cross_anchors"][:1]
+            one_anchor["question_events"] = one_anchor["question_events"][:1]
+            return result_model.model_validate(one_anchor)
+
+    def fail_production(*args, **kwargs):
+        raise AssertionError("production pipeline must not run")
+
+    monkeypatch.setattr(
+        diagnostic,
+        "write_cv_artifacts",
+        lambda *args, **kwargs: {
+            "raw_component_count": 0,
+            "evidence_group_count": 0,
+        },
+    )
+    monkeypatch.setattr(diagnostic, "MiniMaxVisionClient", FakeMiniMaxClient)
+    monkeypatch.setattr(diagnostic, "recognize_marked_three_stage", fail_production)
+
+    summary = diagnostic.run_case(
+        label="sample",
+        image_path=source,
+        output_dir=tmp_path / "output",
+        expected_count=1,
+        subject_hint="chinese",
+        cv_only=False,
+        cross_cv_config={
+            "holistic_v3_prompt_version": "HOLISTIC_CROSS_GEOMETRY_PROMPT_V3",
+            "holistic_v3_max_retries": 0,
+            "question_truth_min_iou": 0.2,
+            "truth_match_margin_ratio": 0.01,
+        },
+        truth_regions=[
+            {
+                "truth_id": "T1",
+                "source_bbox_normalized": [0.1, 0.1, 0.4, 0.4],
+            }
+        ],
+        holistic_v3_only=True,
+        holistic_v3_long_edge=2048,
+    )
+
+    assert len(calls) == 1
+    assert summary["pipeline_status"] == "not_run"
+    assert summary["cross_anchor_experiment_status"] == "not_run"
+    assert summary["holistic_v3_experiment_status"] == "completed"
+    assert summary["checkpoints"]["holistic_v3_llm_request_count"] == 1
+    assert calls[0][2]["image_max_edge"] == 2048
+    assert calls[0][2]["max_retries"] == 0
+
+
 def test_write_cv_artifacts_records_components_groups_and_overlay(tmp_path):
     diagnostic = _load_script_module()
     source = tmp_path / "page.jpg"

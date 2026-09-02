@@ -63,7 +63,11 @@
     "cross_anchor_montage_columns": "候选核验拼图中局部放大候选的列数。",
     "cross_anchor_montage_crop_padding_ratio": "候选局部裁剪在CV框外扩张的整页归一化比例。",
     "cross_anchor_llm2_batch_size": "LLM2每次区域定位请求最多包含的红叉锚点数；减小可降低整页多锚点任务复杂度。",
-    "question_truth_min_iou": "旧方案和红叉锚定新方案中，错题框与人工真值框视为同一区域的最低IoU；仅用于并行测试对比。"
+    "question_truth_min_iou": "旧方案和红叉锚定新方案中，错题框与人工真值框视为同一区域的最低IoU；仅用于并行测试对比。",
+    "holistic_v3_prompt_version": "单次整页几何诊断使用的冻结Prompt版本；三轮正式实验期间不得修改。",
+    "holistic_v3_default_long_edge": "未显式指定时，单次整页几何诊断输入图片采用的最长边像素。",
+    "holistic_v3_supported_long_edges": "允许进行独立对照实验的输入最长边像素列表；不同尺寸必须分别运行。",
+    "holistic_v3_max_retries": "单次整页几何诊断允许的底层HTTP或格式重试次数；Phase 0固定为0，确保每页只有一次实际模型请求。"
   },
   "analysis_max_edge": 1000,
   "red_min_channel": 60,
@@ -133,5 +137,9 @@
   "cross_anchor_montage_columns": 3,
   "cross_anchor_montage_crop_padding_ratio": 0.03,
   "cross_anchor_llm2_batch_size": 3,
-  "question_truth_min_iou": 0.2
+  "question_truth_min_iou": 0.2,
+  "holistic_v3_prompt_version": "HOLISTIC_CROSS_GEOMETRY_PROMPT_V3",
+  "holistic_v3_default_long_edge": 2048,
+  "holistic_v3_supported_long_edges": [2048, 3072],
+  "holistic_v3_max_retries": 0
 }

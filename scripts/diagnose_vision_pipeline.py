@@ -169,6 +169,28 @@ SPATIAL_CROSS_GROUP_PROMPT = """你是小学作业红叉锚定错题空间归组
 """
 
 
+HOLISTIC_CROSS_GEOMETRY_PROMPT_V3 = """你是“中国小学作业红叉与错题区域几何识别器”。只处理几何位置，不识别题目文字和答案。
+
+任务：检查完整作业页面，清点所有明确的老师红叉，并将红叉归属到最小但完整的独立答题单元。
+
+规则：
+1. 只有能看到两条红色相交笔画、且表示老师判错的 × 才是 cross_anchor。
+2. 红圈只能辅助判断红叉归属和答题单元边界；只有红圈没有红叉时不得生成 question_event。
+3. 红叉可以没有红圈，仍必须输出。
+4. 对勾、下划线、方格线、页码、装饰线、箭头、批注文字和普通圈画不是红叉。
+5. 先从上到下、从左到右清点整页红叉，再进行事件聚合；检查页面顶部、底部和边缘。
+6. 一个 cross_anchor 表示一个可见红叉。同一答题单元有多个红叉时，全部锚点归入同一个 question_event。
+7. 相邻但独立的小题必须生成不同事件，不得因为位置接近而合并。
+8. question_bbox 覆盖最小但完整的题干提示、学生作答和相关批改痕迹；不得只框红叉，也不得吞入相邻兄弟题。
+9. 每个锚点必须且只能归入一个事件；确实无法定位所属答题单元时，放入 unassigned_cross_anchor_ids，禁止静默丢失。
+10. bbox 使用完整输入图的归一化 [left, top, right, bottom]。
+11. 只返回指定结构的合法 JSON，不输出解释、Markdown、内容识别字段或额外字段。
+
+输出格式：
+{"page_rule":"red_cross_primary","observed_cross_count":1,"cross_anchors":[{"anchor_id":"a0","bbox":[0.1,0.2,0.2,0.3],"visual_evidence":"two_intersecting_red_diagonal_strokes","model_confidence":0.9}],"question_events":[{"event_id":"q0","anchor_ids":["a0"],"question_bbox":[0.05,0.15,0.4,0.35],"model_confidence":0.9}],"circle_only_regions":[],"unassigned_cross_anchor_ids":[]}
+"""
+
+
 class StableMarkEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -347,10 +369,107 @@ class SpatialQuestionGroupResult(BaseModel):
     unmatched: list[SpatialUnmatchedCross] = Field(default_factory=list)
 
 
+class HolisticCrossAnchor(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid", strict=True, protected_namespaces=()
+    )
+
+    anchor_id: str = Field(min_length=1)
+    bbox: list[float]
+    visual_evidence: Literal["two_intersecting_red_diagonal_strokes"]
+    model_confidence: float = Field(ge=0, le=1)
+
+    @field_validator("bbox")
+    @classmethod
+    def bbox_must_be_normalized(cls, value):
+        return validate_normalized_bbox(value)
+
+
+class HolisticQuestionEvent(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid", strict=True, protected_namespaces=()
+    )
+
+    event_id: str = Field(min_length=1)
+    anchor_ids: list[str] = Field(min_length=1)
+    question_bbox: list[float]
+    model_confidence: float = Field(ge=0, le=1)
+
+    @field_validator("question_bbox")
+    @classmethod
+    def bbox_must_be_normalized(cls, value):
+        return validate_normalized_bbox(value)
+
+
+class HolisticCircleOnlyRegion(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    bbox: list[float]
+    reason: Literal["red_circle_without_cross"]
+
+    @field_validator("bbox")
+    @classmethod
+    def bbox_must_be_normalized(cls, value):
+        return validate_normalized_bbox(value)
+
+
+class HolisticCrossGeometryResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    page_rule: Literal["red_cross_primary"]
+    observed_cross_count: int = Field(ge=0)
+    cross_anchors: list[HolisticCrossAnchor] = Field(default_factory=list)
+    question_events: list[HolisticQuestionEvent] = Field(default_factory=list)
+    circle_only_regions: list[HolisticCircleOnlyRegion] = Field(default_factory=list)
+    unassigned_cross_anchor_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def anchor_membership_must_be_complete_and_unique(self):
+        anchor_ids = [anchor.anchor_id for anchor in self.cross_anchors]
+        if self.observed_cross_count != len(anchor_ids):
+            raise ValueError("observed cross count must equal cross anchor count")
+        if len(anchor_ids) != len(set(anchor_ids)):
+            raise ValueError("cross anchor ids must be unique")
+        event_ids = [event.event_id for event in self.question_events]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("question event ids must be unique")
+        assigned = [
+            anchor_id
+            for event in self.question_events
+            for anchor_id in event.anchor_ids
+        ]
+        unknown = sorted(set(assigned) - set(anchor_ids))
+        if unknown:
+            raise ValueError(f"question events reference unknown anchors: {unknown}")
+        duplicates = sorted(
+            anchor_id for anchor_id in set(assigned) if assigned.count(anchor_id) > 1
+        )
+        if duplicates:
+            raise ValueError(f"cross anchors assigned more than once: {duplicates}")
+        unassigned = self.unassigned_cross_anchor_ids
+        if len(unassigned) != len(set(unassigned)):
+            raise ValueError("unassigned cross anchor ids must be unique")
+        unknown_unassigned = sorted(set(unassigned) - set(anchor_ids))
+        if unknown_unassigned:
+            raise ValueError(
+                f"unassigned list references unknown anchors: {unknown_unassigned}"
+            )
+        overlap = sorted(set(assigned) & set(unassigned))
+        if overlap:
+            raise ValueError(f"cross anchors both assigned and unassigned: {overlap}")
+        missing = sorted(set(anchor_ids) - set(assigned) - set(unassigned))
+        if missing:
+            raise ValueError(
+                f"cross anchors neither assigned nor unassigned: {missing}"
+            )
+        return self
+
+
 CrossCandidateVerificationResult.model_rebuild(_types_namespace=globals())
 IndependentCrossScanResult.model_rebuild(_types_namespace=globals())
 CrossAnchoredQuestionResult.model_rebuild(_types_namespace=globals())
 SpatialQuestionGroupResult.model_rebuild(_types_namespace=globals())
+HolisticCrossGeometryResult.model_rebuild(_types_namespace=globals())
 
 
 def _json_value(value: Any) -> Any:
@@ -3327,6 +3446,44 @@ class RecordingVisionClient:
             ),
         )
 
+    def recognize_holistic_v3_geometry(
+        self,
+        image_path: str,
+        *,
+        prompt_version: str,
+    ) -> HolisticCrossGeometryResult:
+        if prompt_version != "HOLISTIC_CROSS_GEOMETRY_PROMPT_V3":
+            raise ValueError(f"unsupported holistic V3 prompt: {prompt_version}")
+        diagnostic = {
+            "operation": "holistic_v3_geometry",
+            "prompt_version": prompt_version,
+            "image_max_edge": self.client.max_edge,
+            "max_retries": self.client.max_retries,
+        }
+        image_url = prepare_image_data_url(
+            image_path,
+            self.client.max_edge,
+            self.client.jpeg_quality,
+            diagnostic,
+        )
+        return self._call(
+            "holistic_v3_geometry",
+            image_path,
+            {
+                "prompt_version": prompt_version,
+                "image_max_edge": self.client.max_edge,
+                "max_retries": self.client.max_retries,
+            },
+            lambda: self.client._request(
+                {
+                    "prompt": HOLISTIC_CROSS_GEOMETRY_PROMPT_V3,
+                    "image_url": image_url,
+                },
+                HolisticCrossGeometryResult,
+                diagnostic,
+            ),
+        )
+
     def locate_spatial_cross_groups(
         self,
         image_path: str,
@@ -3547,10 +3704,12 @@ def build_summary(
     pipeline_truth_comparison: dict | None = None,
     stable_experiment: dict | None = None,
     cross_anchor_experiment: dict | None = None,
+    holistic_v3_experiment: dict | None = None,
 ) -> dict:
     pipeline_ran = pipeline is not None
     stable_experiment_ran = stable_experiment is not None
     cross_anchor_experiment_ran = cross_anchor_experiment is not None
+    holistic_v3_experiment_ran = holistic_v3_experiment is not None
     pipeline = pipeline or {}
     checkpoints = {
         "expected_error_count": expected_count,
@@ -3801,6 +3960,57 @@ def build_summary(
             if cross_anchor_experiment_ran
             else None
         ),
+        "holistic_v3_prompt_version": (holistic_v3_experiment or {}).get(
+            "prompt_version"
+        ),
+        "holistic_v3_long_edge": (holistic_v3_experiment or {}).get("long_edge"),
+        "holistic_v3_json_schema_status": (holistic_v3_experiment or {}).get(
+            "json_schema_status"
+        ),
+        "holistic_v3_cross_anchor_count": (holistic_v3_experiment or {}).get(
+            "cross_anchor_count"
+        ),
+        "holistic_v3_cross_anchor_truth_matched_count": (
+            holistic_v3_experiment or {}
+        ).get("cross_anchor_truth_matched_count"),
+        "holistic_v3_cross_anchor_truth_recall": (
+            holistic_v3_experiment or {}
+        ).get("cross_anchor_truth_recall"),
+        "holistic_v3_cross_anchor_false_count": (
+            holistic_v3_experiment or {}
+        ).get("cross_anchor_false_count"),
+        "holistic_v3_question_event_count": (holistic_v3_experiment or {}).get(
+            "question_event_count"
+        ),
+        "holistic_v3_question_event_truth_matched_count": (
+            holistic_v3_experiment or {}
+        ).get("question_event_truth_matched_count"),
+        "holistic_v3_question_event_truth_recall": (
+            holistic_v3_experiment or {}
+        ).get("question_event_truth_recall"),
+        "holistic_v3_question_event_false_count": (
+            holistic_v3_experiment or {}
+        ).get("question_event_false_count"),
+        "holistic_v3_circle_only_false_positive_count": (
+            holistic_v3_experiment or {}
+        ).get("circle_only_false_positive_count"),
+        "holistic_v3_duplicate_event_count": (holistic_v3_experiment or {}).get(
+            "duplicate_event_count"
+        ),
+        "holistic_v3_unassigned_cross_anchor_count": (
+            holistic_v3_experiment or {}
+        ).get("unassigned_cross_anchor_count"),
+        "holistic_v3_llm_request_count": (holistic_v3_experiment or {}).get(
+            "llm_request_count"
+        ),
+        "holistic_v3_stage_timings_ms": (holistic_v3_experiment or {}).get(
+            "timings_ms"
+        ),
+        "holistic_v3_content_ocr_status": (
+            (holistic_v3_experiment or {}).get("content_ocr_status")
+            if holistic_v3_experiment_ran
+            else None
+        ),
     }
     first_divergence = None
     if expected_count is not None and pipeline_ran:
@@ -3818,6 +4028,9 @@ def build_summary(
         ),
         "cross_anchor_experiment_status": (
             "completed" if cross_anchor_experiment_ran else "not_run"
+        ),
+        "holistic_v3_experiment_status": (
+            "completed" if holistic_v3_experiment_ran else "not_run"
         ),
         "checkpoints": checkpoints,
         "first_count_divergence": first_divergence,
@@ -3872,6 +4085,8 @@ def run_case(
     truth_regions: list[dict] | None = None,
     compare_stable_events: bool = False,
     compare_cross_anchor: bool = False,
+    holistic_v3_only: bool = False,
+    holistic_v3_long_edge: int | None = None,
     cross_anchor_profile: str = "baseline",
     cross_anchor_replay_from: Path | None = None,
     primitive_duplicate_containment_threshold: float | None = None,
@@ -3904,7 +4119,7 @@ def run_case(
             cross_cv_config,
             truth_regions,
         )
-        if cross_cv_config is not None
+        if cross_cv_config is not None and not holistic_v3_only
         else None
     )
     timings_ms["cross_candidate_cv"] = round(
@@ -3916,8 +4131,11 @@ def run_case(
     stable_experiment_error = None
     cross_anchor_experiment = None
     cross_anchor_experiment_error = None
+    holistic_v3_experiment = None
+    holistic_v3_experiment_error = None
+    holistic_v3_recorder = None
     error = None
-    if not cv_only:
+    if not cv_only and not holistic_v3_only:
         recorder = ExchangeRecorder(case_dir)
         client = MiniMaxVisionClient.from_settings()
         client.diagnostic_event_sink = recorder
@@ -4054,6 +4272,62 @@ def run_case(
                 timings_ms["cross_anchor_experiment"] = round(
                     (time.perf_counter() - phase_started) * 1000, 2
                 )
+    if holistic_v3_only:
+        phase_started = time.perf_counter()
+        try:
+            if (
+                cross_cv_config is None
+                or truth_regions is None
+                or holistic_v3_long_edge is None
+            ):
+                raise ValueError(
+                    "holistic V3 requires config, truth regions, and long edge"
+                )
+            holistic_v3_recorder = ExchangeRecorder(case_dir)
+            client = MiniMaxVisionClient.from_settings()
+            client.max_edge = holistic_v3_long_edge
+            client.max_retries = int(cross_cv_config["holistic_v3_max_retries"])
+            client.diagnostic_event_sink = holistic_v3_recorder
+            recording_client = RecordingVisionClient(client, holistic_v3_recorder)
+            _write_json(
+                case_dir / "holistic-v3-effective-config.json",
+                {
+                    "prompt_version": cross_cv_config[
+                        "holistic_v3_prompt_version"
+                    ],
+                    "long_edge": holistic_v3_long_edge,
+                    "max_retries": cross_cv_config["holistic_v3_max_retries"],
+                    "question_truth_min_iou": cross_cv_config[
+                        "question_truth_min_iou"
+                    ],
+                    "truth_match_margin_ratio": cross_cv_config[
+                        "truth_match_margin_ratio"
+                    ],
+                },
+            )
+            holistic_v3_experiment = run_holistic_v3_experiment(
+                image_path=image_path,
+                case_dir=case_dir,
+                client=recording_client,
+                truth_regions=truth_regions,
+                config=cross_cv_config,
+                long_edge=holistic_v3_long_edge,
+            )
+        except Exception as exc:
+            holistic_v3_experiment_error = {
+                "type": type(exc).__name__,
+                "code": getattr(exc, "code", None),
+                "message": str(exc),
+                "diagnostic": getattr(exc, "diagnostic", None),
+            }
+            _write_json(
+                case_dir / "holistic-v3-experiment-error.json",
+                holistic_v3_experiment_error,
+            )
+        finally:
+            timings_ms["holistic_v3_experiment"] = round(
+                (time.perf_counter() - phase_started) * 1000, 2
+            )
     timings_ms["total"] = round((time.perf_counter() - case_started) * 1000, 2)
     summary = build_summary(
         label=label,
@@ -4063,10 +4337,29 @@ def run_case(
         pipeline_truth_comparison=pipeline_truth_comparison,
         stable_experiment=stable_experiment,
         cross_anchor_experiment=cross_anchor_experiment,
+        holistic_v3_experiment=holistic_v3_experiment,
     )
     summary["error"] = error
     summary["stable_experiment_error"] = stable_experiment_error
     summary["cross_anchor_experiment_error"] = cross_anchor_experiment_error
+    summary["holistic_v3_experiment_error"] = holistic_v3_experiment_error
+    if holistic_v3_only:
+        summary["holistic_v3_experiment_status"] = (
+            "failed" if holistic_v3_experiment_error is not None else "completed"
+        )
+        summary["checkpoints"]["holistic_v3_prompt_version"] = cross_cv_config[
+            "holistic_v3_prompt_version"
+        ]
+        summary["checkpoints"]["holistic_v3_long_edge"] = holistic_v3_long_edge
+        summary["checkpoints"]["holistic_v3_json_schema_status"] = (
+            "failed" if holistic_v3_experiment_error is not None else "completed"
+        )
+        summary["checkpoints"]["holistic_v3_llm_request_count"] = (
+            holistic_v3_recorder.call_count
+            if holistic_v3_recorder is not None
+            else 0
+        )
+        summary["checkpoints"]["holistic_v3_content_ocr_status"] = "not_run"
     summary["cv_cross_experiment"] = cross_cv_experiment
     summary["timings_ms"] = timings_ms
     _write_json(case_dir / "timings.json", timings_ms)
@@ -5384,6 +5677,176 @@ def load_cross_cv_inputs(
     return config, truth_by_label
 
 
+def run_holistic_v3_experiment(
+    *,
+    image_path: Path,
+    case_dir: Path,
+    client,
+    truth_regions: list[dict],
+    config: dict,
+    long_edge: int,
+) -> dict:
+    experiment_started = time.perf_counter()
+    experiment_dir = case_dir / "holistic-v3-experiment"
+    experiment_dir.mkdir(parents=True, exist_ok=False)
+    prompt_version = str(config["holistic_v3_prompt_version"])
+
+    request_started = time.perf_counter()
+    result = client.recognize_holistic_v3_geometry(
+        str(image_path),
+        prompt_version=prompt_version,
+    )
+    request_ms = round((time.perf_counter() - request_started) * 1000, 2)
+    _write_json(experiment_dir / "result.json", result)
+
+    anchor_candidates = [
+        {
+            "candidate_id": anchor.anchor_id,
+            "bbox": list(anchor.bbox),
+            "center": [
+                round((anchor.bbox[0] + anchor.bbox[2]) / 2, 6),
+                round((anchor.bbox[1] + anchor.bbox[3]) / 2, 6),
+            ],
+        }
+        for anchor in result.cross_anchors
+    ]
+    anchor_comparison = compare_cross_candidates_to_truth(
+        anchor_candidates,
+        truth_regions,
+        margin_ratio=float(config["truth_match_margin_ratio"]),
+    )
+    _write_json(
+        experiment_dir / "cross-anchor-truth-comparison.json",
+        anchor_comparison,
+    )
+
+    event_audit = {
+        "events": [
+            {
+                "event_id": index,
+                "source_event_id": event.event_id,
+                "anchor_ids": list(event.anchor_ids),
+                "question_bboxes": [list(event.question_bbox)],
+            }
+            for index, event in enumerate(result.question_events)
+        ]
+    }
+    event_comparison = compare_question_events_to_truth(
+        event_audit,
+        truth_regions,
+        min_iou=float(config["question_truth_min_iou"]),
+    )
+    _write_json(
+        experiment_dir / "question-event-truth-comparison.json",
+        event_comparison,
+    )
+
+    circle_candidates = [
+        {
+            "candidate_id": index,
+            "bbox": list(region.bbox),
+            "center": [
+                round((region.bbox[0] + region.bbox[2]) / 2, 6),
+                round((region.bbox[1] + region.bbox[3]) / 2, 6),
+            ],
+        }
+        for index, region in enumerate(result.circle_only_regions)
+    ]
+    circle_comparison = compare_cross_candidates_to_truth(
+        circle_candidates,
+        truth_regions,
+        margin_ratio=float(config["truth_match_margin_ratio"]),
+    )
+    _write_json(
+        experiment_dir / "circle-only-truth-comparison.json",
+        circle_comparison,
+    )
+
+    anchor_entries = [
+        {"mark_id": anchor.anchor_id, "bbox": anchor.bbox}
+        for anchor in result.cross_anchors
+    ]
+    event_entries = [
+        {"mark_id": event.event_id, "bbox": event.question_bbox}
+        for event in result.question_events
+    ]
+    _draw_boxes(
+        image_path,
+        experiment_dir / "question-events-overlay.jpg",
+        [("A", anchor_entries, "red"), ("Q", event_entries, "blue")],
+    )
+
+    timings_ms = {
+        "model_request": request_ms,
+        "total": round((time.perf_counter() - experiment_started) * 1000, 2),
+    }
+    summary = {
+        "prompt_version": prompt_version,
+        "long_edge": long_edge,
+        "json_schema_status": "completed",
+        "cross_anchor_count": len(result.cross_anchors),
+        "cross_anchor_truth_matched_count": anchor_comparison["matched_truth_count"],
+        "cross_anchor_truth_recall": anchor_comparison["truth_recall"],
+        "cross_anchor_false_count": len(anchor_comparison["false_candidate_ids"]),
+        "question_event_count": len(result.question_events),
+        "question_event_truth_matched_count": event_comparison["matched_truth_count"],
+        "question_event_truth_recall": event_comparison["truth_recall"],
+        "question_event_false_count": len(event_comparison["false_event_ids"]),
+        "duplicate_event_count": len(
+            event_comparison["duplicate_truth_event_ids"]
+        ),
+        "circle_only_region_count": len(result.circle_only_regions),
+        "circle_only_false_positive_count": circle_comparison[
+            "matched_truth_count"
+        ],
+        "unassigned_cross_anchor_count": len(
+            result.unassigned_cross_anchor_ids
+        ),
+        "llm_request_count": 1,
+        "timings_ms": timings_ms,
+        "content_ocr_status": "not_run",
+    }
+    _write_json(experiment_dir / "timings.json", timings_ms)
+    _write_json(experiment_dir / "summary.json", summary)
+    return summary
+
+
+def load_holistic_v3_inputs(
+    config_path: Path,
+    truth_path: Path,
+    labels: list[str],
+) -> tuple[dict, dict[str, list[dict]]]:
+    config, truth_by_label = load_cross_cv_inputs(config_path, truth_path, labels)
+    required = {
+        "holistic_v3_prompt_version",
+        "holistic_v3_default_long_edge",
+        "holistic_v3_supported_long_edges",
+        "holistic_v3_max_retries",
+    }
+    missing = sorted(required - set(config))
+    if missing:
+        raise ValueError(f"holistic V3 config missing fields: {missing}")
+    if not isinstance(config["holistic_v3_prompt_version"], str) or not config[
+        "holistic_v3_prompt_version"
+    ]:
+        raise ValueError("holistic V3 prompt version must not be empty")
+    supported = config["holistic_v3_supported_long_edges"]
+    if (
+        not isinstance(supported, list)
+        or not supported
+        or any(not isinstance(value, int) or value <= 0 for value in supported)
+        or len(supported) != len(set(supported))
+    ):
+        raise ValueError("holistic V3 supported long edges must be unique positives")
+    default_long_edge = config["holistic_v3_default_long_edge"]
+    if not isinstance(default_long_edge, int) or default_long_edge not in supported:
+        raise ValueError("holistic V3 default long edge must be supported")
+    max_retries = config["holistic_v3_max_retries"]
+    if not isinstance(max_retries, int) or max_retries != 0:
+        raise ValueError("holistic V3 max retries must be zero for Phase 0")
+    return config, truth_by_label
+
+
 def _write_report(output_dir: Path, summaries: list[dict]) -> None:
     lines = [
         "# 视觉识别流程诊断报告",
@@ -5588,6 +6051,48 @@ def _write_report(output_dir: Path, summaries: list[dict]) -> None:
                 spatial_false=item["cross_anchor_spatial_false_event_count"],
             )
         )
+    lines.extend(
+        [
+            "",
+            "## V3 单次整页几何实验",
+            "",
+            "> 锚点召回表示模型红叉中心覆盖人工错题区域；事件召回使用题框与人工区域逐题匹配。仅红圈命中表示模型把真实错题区域错误列为circle-only。",
+            "",
+            "| 图片 | Prompt | 长边 | Schema | 红叉锚点 | 锚点真值命中 | 锚点真值召回 | 区域外锚点 | 错题事件 | 事件真值命中 | 事件真值召回 | 误报事件 | 仅红圈命中错题 | 重复事件 | 未分配锚点 | LLM请求 | 内容/OCR |",
+            "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        ]
+    )
+    for summary in summaries:
+        item = summary["checkpoints"]
+        lines.append(
+            "| {label} | {prompt} | {edge} | {schema} | {anchors} | {anchor_matched} | {anchor_recall} | {anchor_false} | {events} | {event_matched} | {event_recall} | {event_false} | {circle_false} | {duplicates} | {unassigned} | {requests} | {content} |".format(
+                label=summary["label"],
+                prompt=item["holistic_v3_prompt_version"],
+                edge=item["holistic_v3_long_edge"],
+                schema=item["holistic_v3_json_schema_status"],
+                anchors=item["holistic_v3_cross_anchor_count"],
+                anchor_matched=item[
+                    "holistic_v3_cross_anchor_truth_matched_count"
+                ],
+                anchor_recall=item["holistic_v3_cross_anchor_truth_recall"],
+                anchor_false=item["holistic_v3_cross_anchor_false_count"],
+                events=item["holistic_v3_question_event_count"],
+                event_matched=item[
+                    "holistic_v3_question_event_truth_matched_count"
+                ],
+                event_recall=item["holistic_v3_question_event_truth_recall"],
+                event_false=item["holistic_v3_question_event_false_count"],
+                circle_false=item[
+                    "holistic_v3_circle_only_false_positive_count"
+                ],
+                duplicates=item["holistic_v3_duplicate_event_count"],
+                unassigned=item[
+                    "holistic_v3_unassigned_cross_anchor_count"
+                ],
+                requests=item["holistic_v3_llm_request_count"],
+                content=item["holistic_v3_content_ocr_status"],
+            )
+        )
     (output_dir / "comparison-report.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )
@@ -5646,6 +6151,29 @@ def _write_timing_report(output_dir: Path, summaries: list[dict]) -> None:
                 ),
             )
         )
+    lines.extend(
+        [
+            "",
+            "## V3 单次整页几何耗时",
+            "",
+            "| 图片 | 输入长边 | 整页总耗时 | V3实验总耗时 | MiniMax请求耗时 | LLM请求 |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for summary in summaries:
+        case_timings = summary.get("timings_ms") or {}
+        checkpoints = summary["checkpoints"]
+        holistic_timings = checkpoints.get("holistic_v3_stage_timings_ms") or {}
+        lines.append(
+            "| {label} | {edge} | {total} | {experiment} | {request} | {requests} |".format(
+                label=summary["label"],
+                edge=checkpoints.get("holistic_v3_long_edge"),
+                total=case_timings.get("total"),
+                experiment=case_timings.get("holistic_v3_experiment"),
+                request=holistic_timings.get("model_request"),
+                requests=checkpoints.get("holistic_v3_llm_request_count"),
+            )
+        )
     (output_dir / "timing-report.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )
@@ -5664,6 +6192,16 @@ def main() -> int:
         "--cv-cross-only",
         action="store_true",
         help="run deterministic local red-cross CV and truth comparison without LLM",
+    )
+    parser.add_argument(
+        "--holistic-v3-only",
+        action="store_true",
+        help="run exactly one full-page geometry-only MiniMax request per image",
+    )
+    parser.add_argument(
+        "--holistic-v3-long-edge",
+        type=int,
+        help="full-page input long edge for the isolated holistic V3 experiment",
     )
     parser.add_argument(
         "--cross-cv-config",
@@ -5729,6 +6267,22 @@ def main() -> int:
         if args.compare_cross_anchor:
             parser.error("--cv-cross-only cannot be combined with --compare-cross-anchor")
 
+    if args.holistic_v3_only:
+        if not args.cross_cv_config:
+            parser.error("--holistic-v3-only requires --cross-cv-config")
+        if not args.truth_regions:
+            parser.error("--holistic-v3-only requires --truth-regions")
+        if args.cv_only or args.cv_cross_only:
+            parser.error("--holistic-v3-only cannot be combined with CV-only modes")
+        if args.compare_stable_events or args.compare_cross_anchor:
+            parser.error(
+                "--holistic-v3-only cannot be combined with comparison modes"
+            )
+        if args.cross_anchor_replay_from:
+            parser.error("--holistic-v3-only cannot be combined with replay")
+    elif args.holistic_v3_long_edge is not None:
+        parser.error("--holistic-v3-long-edge requires --holistic-v3-only")
+
     if args.compare_cross_anchor:
         if not args.cross_cv_config:
             parser.error("--compare-cross-anchor requires --cross-cv-config")
@@ -5764,15 +6318,33 @@ def main() -> int:
         parser.error(str(exc))
     cross_cv_config = None
     truth_by_label = {}
-    if args.cv_cross_only or args.compare_cross_anchor:
+    if args.cv_cross_only or args.compare_cross_anchor or args.holistic_v3_only:
         try:
-            cross_cv_config, truth_by_label = load_cross_cv_inputs(
+            loader = (
+                load_holistic_v3_inputs
+                if args.holistic_v3_only
+                else load_cross_cv_inputs
+            )
+            cross_cv_config, truth_by_label = loader(
                 Path(args.cross_cv_config).expanduser().resolve(),
                 Path(args.truth_regions).expanduser().resolve(),
                 [label for label, _path in images],
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             parser.error(str(exc))
+    holistic_v3_long_edge = None
+    if args.holistic_v3_only:
+        holistic_v3_long_edge = (
+            args.holistic_v3_long_edge
+            if args.holistic_v3_long_edge is not None
+            else int(cross_cv_config["holistic_v3_default_long_edge"])
+        )
+        supported_long_edges = cross_cv_config["holistic_v3_supported_long_edges"]
+        if holistic_v3_long_edge not in supported_long_edges:
+            parser.error(
+                "--holistic-v3-long-edge must be one of "
+                + ", ".join(str(value) for value in supported_long_edges)
+            )
     output_dir = Path(args.output).expanduser().resolve()
     cross_anchor_replay_from = (
         Path(args.cross_anchor_replay_from).expanduser().resolve()
@@ -5789,6 +6361,8 @@ def main() -> int:
             "warning": "Contains worksheet images, prompts, and model responses; delete after analysis.",
             "cv_only": args.cv_only or args.cv_cross_only,
             "cv_cross_only": args.cv_cross_only,
+            "holistic_v3_only": args.holistic_v3_only,
+            "holistic_v3_long_edge": holistic_v3_long_edge,
             "compare_stable_events": args.compare_stable_events,
             "compare_cross_anchor": args.compare_cross_anchor,
             "cross_anchor_profile": args.cross_anchor_profile,
@@ -5818,6 +6392,8 @@ def main() -> int:
             truth_regions=truth_by_label.get(label),
             compare_stable_events=args.compare_stable_events,
             compare_cross_anchor=args.compare_cross_anchor,
+            holistic_v3_only=args.holistic_v3_only,
+            holistic_v3_long_edge=holistic_v3_long_edge,
             cross_anchor_profile=args.cross_anchor_profile,
             cross_anchor_replay_from=cross_anchor_replay_from,
             primitive_duplicate_containment_threshold=(
@@ -5839,6 +6415,7 @@ def main() -> int:
             summary["error"]
             or summary["stable_experiment_error"]
             or summary["cross_anchor_experiment_error"]
+            or summary.get("holistic_v3_experiment_error")
             for summary in summaries
         )
         else 0
