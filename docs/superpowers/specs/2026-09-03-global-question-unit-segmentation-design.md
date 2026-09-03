@@ -48,7 +48,7 @@ CV 红叉锚点映射到每个锚点的 1～3 个 unit_id
           ↓
 第一阶段：用真值只做离线 oracle 审计
           ↓（本地门槛通过后）
-MiniMax 作为语义裁判：核验锚点、判断错题、选择 unit_id、补充漏检
+MiniMax 作为语义裁判：核验锚点、判断错题、选择视觉候选、补充漏检
           ↓
 按 question_unit_id 去重；重新识别时合并两轮结果
 ```
@@ -98,7 +98,7 @@ MiniMax 作为语义裁判：核验锚点、判断错题、选择 unit_id、补�
 “只能引用编号”约束的是几何输出，并非削弱模型的语义职责。本地阶段通过后，模型每页接收：
 
 - 带编号题目单元的整页图或拼图；
-- 每个红叉锚点允许选择的 1～3 个 `unit_id`；
+- 每个红叉锚点允许选择的 1～3 个视觉 `C:R` 引用；稳定 `unit_id` 只在本地映射中保存，不直接暴露给模型；
 - 红圈、老师批注、学生答案和改正内容等辅助证据；
 - 明确的结构化输出枚举。
 
@@ -108,11 +108,11 @@ MiniMax 负责：
 - 在允许的编号单元中判断红叉属于哪一道题；
 - 结合实际答题内容判断该题是 `incorrect`、`correct` 还是 `uncertain`；
 - 判断本地边界是 `complete`、`too_narrow`、`sibling_intrusion` 还是 `uncertain`；
-- 在同一次整页请求中扫描未绑定锚点的编号单元，用 `supplemental_wrong_unit_ids` 补充明显错题，弥补 CV 漏检。
+- 在同一次整页请求中扫描未绑定锚点的编号单元，用 `supplemental_wrong_candidates` 返回已有视觉 `C:R` 引用，随后在本地解析成稳定单元，弥补 CV 漏检。
 
 模型不得返回坐标，也不得创造不存在的单元。红叉仍是主要锚点，红圈、批注和答案内容作为语义证据。若模型全部确认，报告必须单独记录 `all_selected`；不得把“全部选择”视为默认成功。
 
-建议的核心输出字段为：`anchor_id`、`anchor_validity`、`selected_unit_ids`、`question_status`、`boundary_fit`、`evidence`、`confidence` 和整页级 `supplemental_wrong_unit_ids`。其中只有编号选择影响自动事件集合；解释性字段用于审计、重试合并和后续产品判断。
+建议的模型输出字段为：`cross_id`、`anchor_validity`、`selected_visual_rank`、`question_status`、`boundary_fit`、`evidence`、`confidence` 和整页级 `supplemental_wrong_candidates`。本地把 `C:R` 解析成稳定 `question_unit_id` 后再生成事件；解释性字段用于审计、重试合并和后续产品判断。
 
 ## 8. “重新识别”的两轮合并语义
 

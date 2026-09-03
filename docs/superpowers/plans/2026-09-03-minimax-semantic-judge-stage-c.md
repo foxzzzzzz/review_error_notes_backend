@@ -4,7 +4,7 @@
 
 **Goal:** Add one optional MiniMax semantic-judge request per page on top of the frozen global question-unit candidate layer and report strict-model versus recall-safe results separately.
 
-**Architecture:** The existing Stage A CLI remains offline by default. With `--run-semantic-judge`, it creates an anchor-focused montage, asks MiniMax to validate each anchor and select only allowed stable unit IDs, audits the structured response locally, then compares direct model selections and a deterministic top-one fallback without permitting model-generated coordinates.
+**Architecture:** The existing Stage A CLI remains offline by default. With `--run-semantic-judge`, it creates an anchor-focused montage, asks MiniMax to validate each anchor and return only visual `C:R` references, resolves those references to stable unit IDs locally, then compares direct model selections, a deterministic anchor-containment guard, and a top-one fallback without permitting model-generated coordinates.
 
 **Tech Stack:** Python, Pillow/OpenCV, Pydantic v2, existing `MiniMaxVisionClient`, pytest.
 
@@ -14,7 +14,7 @@
 
 - Diagnostic and test code only; production recognition code must remain unchanged.
 - Default execution must make zero LLM requests; `--run-semantic-judge` makes at most one request per completed page.
-- MiniMax may reference only unit IDs already present in that page's anchor candidate pool and may never return coordinates.
+- MiniMax may reference only visual `C:R` pairs already present in that page's anchor candidate pool and may never see stable unit IDs or return coordinates.
 - Strict model output and recall-safe fallback must be reported independently.
 - Configuration for montage layout and fallback behavior must be documented in `scripts/global_question_unit_config.json`.
 - No commit, tag, or push without explicit user confirmation.
@@ -27,7 +27,8 @@
 
 **Interfaces:**
 - `SemanticAnchorDecision`: one entry per replayed `cross_id`.
-- `SemanticJudgeResult`: `decisions` plus `supplemental_wrong_unit_ids`.
+- `SemanticJudgeResult`: `decisions` plus `supplemental_wrong_candidates` using visual `C:R` references.
+- `resolve_semantic_references(response, mapping)`: resolves visual references to stable unit IDs entirely locally.
 - `audit_semantic_judgment(raw_decisions, supplemental_ids, mapping) -> dict` returns accepted entries and explicit violations.
 
 - [ ] Write tests proving every anchor appears exactly once, selected IDs belong to that anchor, supplemental IDs belong to the page candidate pool, and the prompt forbids bbox/coordinate output.
@@ -58,11 +59,11 @@
 
 **Interfaces:**
 - New CLI flags: `--run-semantic-judge` and `--subject`.
-- New artifacts: `semantic-judge-montage.jpg`, `semantic-judge-response.json`, `semantic-judge-audit.json`, `semantic-strict-comparison.json`, `semantic-recall-safe-comparison.json`, and `llm-events.json`.
+- New artifacts include the montage, raw response, local reference resolution, semantic audit, strict comparison, anchor-containment guard comparison, recall-safe comparisons, and LLM events.
 
 - [ ] Write a CLI test with a fake MiniMax client proving exactly one `_request` call and a default CLI test proving zero calls.
 - [ ] Run the test and observe the missing flag/integration failure.
-- [ ] Add documented montage dimensions, render one tile per anchor with its allowed unit IDs, and make one `_request` call for the page.
+- [ ] Add documented montage dimensions, render one tile per anchor with its allowed visual ranks, and make one `_request` call for the page.
 - [ ] Catch request/format failures per page, persist the error, and retain Stage A outputs.
 - [ ] Extend per-page and Markdown summaries with strict recall/false units, recall-safe recall/false units, semantic violations, model `none`/`uncertain`, LLM duration, and request count.
 - [ ] Run all new tests, then the full unit suite.

@@ -169,10 +169,12 @@ def _semantic_mapping():
     return {
         "anchor_candidates": {
             "1": [
-                {"question_unit_id": "U1", "rank": 1},
-                {"question_unit_id": "U2", "rank": 2},
+                {"question_unit_id": "U1", "rank": 1, "anchor_in_unit": True},
+                {"question_unit_id": "U2", "rank": 2, "anchor_in_unit": False},
             ],
-            "2": [{"question_unit_id": "U3", "rank": 1}],
+            "2": [
+                {"question_unit_id": "U3", "rank": 1, "anchor_in_unit": True},
+            ],
             "3": [],
         },
         "unassigned_anchors": [
@@ -201,7 +203,65 @@ def test_semantic_prompt_uses_model_as_judge_without_allowing_geometry():
     assert "红圈" in diagnostic.SEMANTIC_JUDGE_PROMPT
     assert "不得返回" in diagnostic.SEMANTIC_JUDGE_PROMPT
     assert "bbox" in diagnostic.SEMANTIC_JUDGE_PROMPT
-    assert "supplemental_wrong_unit_ids" in diagnostic.SEMANTIC_JUDGE_PROMPT
+    assert "selected_visual_rank" in diagnostic.SEMANTIC_JUDGE_PROMPT
+    assert "supplemental_wrong_candidates" in diagnostic.SEMANTIC_JUDGE_PROMPT
+    assert "selected_unit_id" not in diagnostic.SEMANTIC_JUDGE_PROMPT
+
+
+def test_semantic_visual_references_resolve_locally_without_exposing_unit_ids():
+    diagnostic = _load_diagnostic()
+    response = {
+        "decisions": [
+            {
+                **_decision(1),
+                "selected_visual_rank": "R1",
+            },
+            {
+                **_decision(2, validity="uncertain", status="uncertain"),
+                "selected_visual_rank": None,
+            },
+            {
+                **_decision(3, validity="uncertain", status="uncertain"),
+                "selected_visual_rank": None,
+            },
+        ],
+        "supplemental_wrong_candidates": [
+            {"cross_id": 2, "visual_rank": "R1"}
+        ],
+    }
+    for decision in response["decisions"]:
+        decision.pop("selected_unit_id")
+
+    resolved = diagnostic.resolve_semantic_references(
+        response, _semantic_mapping()
+    )
+
+    assert resolved["decisions"][0]["selected_unit_id"] == "U1"
+    assert resolved["supplemental_wrong_unit_ids"] == ["U3"]
+    assert resolved["violations"] == []
+
+
+def test_geometry_guard_prefers_containing_rank_one_over_non_containing_selection():
+    diagnostic = _load_diagnostic()
+    audit = {
+        "accepted": [_decision(1, selected="U2")],
+        "accepted_supplemental_unit_ids": [],
+        "violations": [],
+    }
+
+    result = diagnostic.build_geometry_guarded_unit_sets(
+        audit, _semantic_mapping(), enabled=True
+    )
+
+    assert result["strict_unit_ids"] == ["U1"]
+    assert result["overrides"] == [
+        {
+            "cross_id": 1,
+            "model_unit_id": "U2",
+            "guarded_unit_id": "U1",
+            "reason": "rank_one_contains_anchor",
+        }
+    ]
 
 
 def test_semantic_audit_rejects_duplicate_cross_and_foreign_unit_ids():
@@ -278,14 +338,14 @@ def test_cli_semantic_judge_makes_exactly_one_request(tmp_path, monkeypatch):
                         {
                             "cross_id": 1,
                             "anchor_validity": "valid",
-                            "selected_unit_id": "U-S01-R01-C01",
+                            "selected_visual_rank": "R1",
                             "question_status": "incorrect",
                             "boundary_fit": "complete",
                             "evidence": ["red_cross", "answer_mismatch"],
                             "confidence": 0.92,
                         }
                     ],
-                    "supplemental_wrong_unit_ids": [],
+                    "supplemental_wrong_candidates": [],
                 }
             )
 
@@ -302,11 +362,15 @@ def test_cli_semantic_judge_makes_exactly_one_request(tmp_path, monkeypatch):
     assert diagnostic.main(arguments) == 0
 
     assert len(calls) == 1
+    assert "selected_visual_rank" in calls[0][0]["prompt"]
+    assert "U-S01" not in calls[0][0]["prompt"]
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     assert summary["llm_request_count"] == 1
+    assert summary["page_summaries"][0]["semantic_all_candidate_anchors_selected"]
     page_dir = output / "page33"
     assert (page_dir / "semantic-judge-montage.jpg").is_file()
     assert (page_dir / "semantic-judge-response.json").is_file()
     assert (page_dir / "semantic-judge-audit.json").is_file()
     assert (page_dir / "semantic-strict-comparison.json").is_file()
     assert (page_dir / "semantic-recall-safe-comparison.json").is_file()
+    assert (page_dir / "semantic-geometry-guard-comparison.json").is_file()

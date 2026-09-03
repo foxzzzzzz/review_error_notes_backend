@@ -1,6 +1,4 @@
-"""Diagnose deterministic page-global question units without LLM requests."""
-
-from __future__ import annotations
+"""Diagnose deterministic question units and optional MiniMax semantic filtering."""
 
 import argparse
 import hashlib
@@ -38,22 +36,22 @@ from global_question_units import (
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("global_question_unit_config.json")
 
 
-SEMANTIC_JUDGE_PROMPT = """你是小学作业错题语义裁判。图片按C编号展示红叉锚点及其允许选择的U题目单元；红框是待核验锚点，绿色框是本地CV+OCR生成的稳定题目单元。
+SEMANTIC_JUDGE_PROMPT = """你是小学作业错题语义裁判。图片按C编号展示红叉锚点及其R1/R2/R3候选；红框是待核验锚点，绿色框是本地CV+OCR生成的题目单元。
 
 你的任务不是画框，而是理解批改语义：核验红叉真假、判断红叉属于哪道题、结合学生实际答题判断是否为错题，并检查候选单元是否完整且没有侵入兄弟题。
 
 要求：
 1. 每个输入cross_id必须且只能返回一次，不得遗漏、增加、合并或重排。
-2. selected_unit_id只能从该cross_id的allowed_units中选择一个unit_id；图内R编号与visual_rank对应，不能跨锚点选择。
+2. selected_visual_rank只能从该cross_id的allowed_visual_ranks中选择；图内R编号与返回值完全一致，不能跨锚点选择。
 3. 红叉是主要证据；附近红圈、老师批注、改正痕迹和答案不匹配可以辅助判断，但印刷红格不能单独证明错题。
 4. anchor_validity分别为valid、invalid、uncertain；question_status分别为incorrect、correct、uncertain。不得采用全部默认确认策略，必须逐个检查红框内是否有两条相交红色斜线及实际答题情况。
 5. boundary_fit分别为complete、too_narrow、sibling_intrusion、uncertain。绿色框应包含一整道独立作答单元，不能把左右或上下兄弟题一起算入。
-6. 只有明确对应错题时填写selected_unit_id；不是红叉或不是错题时返回null，无法判断时使用uncertain并返回null。
-7. supplemental_wrong_unit_ids只能引用输入candidate_unit_ids中的编号，用于补充本页明显错题但未被逐锚点结果选中的单元；没有则返回空数组。
+6. 只有明确对应错题时填写selected_visual_rank；不是红叉或不是错题时返回null，无法判断时使用uncertain并返回null。
+7. supplemental_wrong_candidates用于补充本页明显错题但未被逐锚点结果选中的候选，只能返回输入中已有的cross_id和visual_rank组合；没有则返回空数组。
 8. evidence只能从red_cross、red_circle、teacher_correction、answer_mismatch、student_correction、insufficient_detail、other中选择。
 9. 不得返回或生成任何bbox、坐标、新编号、题目文字、解释或Markdown，只返回严格JSON。
 
-返回格式：{"decisions":[{"cross_id":0,"anchor_validity":"valid","selected_unit_id":"U-S01-R01-C01","question_status":"incorrect","boundary_fit":"complete","evidence":["red_cross","answer_mismatch"],"confidence":0.93}],"supplemental_wrong_unit_ids":[]}。
+返回格式：{"decisions":[{"cross_id":0,"anchor_validity":"valid","selected_visual_rank":"R1","question_status":"incorrect","boundary_fit":"complete","evidence":["red_cross","answer_mismatch"],"confidence":0.93}],"supplemental_wrong_candidates":[{"cross_id":2,"visual_rank":"R2"}]}。
 
 科目：__SUBJECT__
 输入候选：__CANDIDATES__
@@ -65,7 +63,7 @@ class SemanticAnchorDecision(BaseModel):
 
     cross_id: int
     anchor_validity: Literal["valid", "invalid", "uncertain"]
-    selected_unit_id: str | None = None
+    selected_visual_rank: Literal["R1", "R2", "R3"] | None = None
     question_status: Literal["incorrect", "correct", "uncertain"]
     boundary_fit: Literal[
         "complete", "too_narrow", "sibling_intrusion", "uncertain"
@@ -84,11 +82,67 @@ class SemanticAnchorDecision(BaseModel):
     confidence: float = Field(ge=0, le=1)
 
 
+class SemanticCandidateReference(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    cross_id: int
+    visual_rank: Literal["R1", "R2", "R3"]
+
+
 class SemanticJudgeResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     decisions: list[SemanticAnchorDecision]
-    supplemental_wrong_unit_ids: list[str]
+    supplemental_wrong_candidates: list[SemanticCandidateReference]
+
+
+def resolve_semantic_references(response: dict, mapping: dict) -> dict:
+    candidates_by_anchor = {
+        int(cross_id): {
+            f"R{candidate['rank']}": candidate["question_unit_id"]
+            for candidate in candidates
+        }
+        for cross_id, candidates in mapping["anchor_candidates"].items()
+    }
+    decisions = []
+    violations = []
+    for raw_decision in response["decisions"]:
+        decision = dict(raw_decision)
+        visual_rank = decision.pop("selected_visual_rank", None)
+        cross_id = int(decision["cross_id"])
+        selected_unit_id = None
+        if visual_rank is not None:
+            selected_unit_id = candidates_by_anchor.get(cross_id, {}).get(visual_rank)
+            if selected_unit_id is None:
+                violations.append(
+                    {
+                        "cross_id": cross_id,
+                        "visual_rank": visual_rank,
+                        "reason": "unknown_visual_reference",
+                    }
+                )
+        decision["selected_unit_id"] = selected_unit_id
+        decisions.append(decision)
+    supplemental_unit_ids = []
+    for reference in response["supplemental_wrong_candidates"]:
+        cross_id = int(reference["cross_id"])
+        visual_rank = reference["visual_rank"]
+        unit_id = candidates_by_anchor.get(cross_id, {}).get(visual_rank)
+        if unit_id is None:
+            violations.append(
+                {
+                    "cross_id": cross_id,
+                    "visual_rank": visual_rank,
+                    "reason": "unknown_supplemental_visual_reference",
+                }
+            )
+        elif unit_id not in supplemental_unit_ids:
+            supplemental_unit_ids.append(unit_id)
+    return {
+        "decisions": decisions,
+        "supplemental_wrong_unit_ids": supplemental_unit_ids,
+        "violations": violations,
+    }
 
 
 def audit_semantic_judgment(
@@ -190,6 +244,54 @@ def build_semantic_unit_sets(audit: dict, mapping: dict) -> dict:
         "strict_unit_ids": sorted(strict),
         "recall_safe_unit_ids": sorted(recall_safe),
         "needs_review": needs_review,
+    }
+
+
+def build_geometry_guarded_unit_sets(
+    audit: dict, mapping: dict, *, enabled: bool
+) -> dict:
+    guarded_audit = {
+        **audit,
+        "accepted": [dict(item) for item in audit["accepted"]],
+    }
+    overrides = []
+    if enabled:
+        candidates_by_anchor = {
+            int(cross_id): candidates
+            for cross_id, candidates in mapping["anchor_candidates"].items()
+        }
+        for decision in guarded_audit["accepted"]:
+            selected_unit_id = decision.get("selected_unit_id")
+            candidates = candidates_by_anchor.get(int(decision["cross_id"]), [])
+            if selected_unit_id is None or not candidates:
+                continue
+            rank_one = candidates[0]
+            selected = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate["question_unit_id"] == selected_unit_id
+                ),
+                None,
+            )
+            if (
+                selected is not None
+                and selected_unit_id != rank_one["question_unit_id"]
+                and bool(rank_one.get("anchor_in_unit"))
+                and not bool(selected.get("anchor_in_unit"))
+            ):
+                decision["selected_unit_id"] = rank_one["question_unit_id"]
+                overrides.append(
+                    {
+                        "cross_id": int(decision["cross_id"]),
+                        "model_unit_id": selected_unit_id,
+                        "guarded_unit_id": rank_one["question_unit_id"],
+                        "reason": "rank_one_contains_anchor",
+                    }
+                )
+    return {
+        **build_semantic_unit_sets(guarded_audit, mapping),
+        "overrides": overrides,
     }
 
 
@@ -452,7 +554,15 @@ def run_page(
         for candidate in candidates
     }
     semantic_montage_path = page_dir / "semantic-judge-montage.jpg"
-    semantic_response = {"decisions": [], "supplemental_wrong_unit_ids": []}
+    semantic_response = {
+        "decisions": [],
+        "supplemental_wrong_candidates": [],
+    }
+    semantic_resolution = {
+        "decisions": [],
+        "supplemental_wrong_unit_ids": [],
+        "violations": [],
+    }
     semantic_audit = {
         "accepted": [],
         "accepted_supplemental_unit_ids": [],
@@ -477,11 +587,8 @@ def run_page(
                     "cross_id": int(anchor["cross_id"]),
                     "source": anchor.get("source"),
                     "cv_confidence": anchor.get("confidence"),
-                    "allowed_units": [
-                        {
-                            "visual_rank": f"R{item['rank']}",
-                            "unit_id": item["question_unit_id"],
-                        }
+                    "allowed_visual_ranks": [
+                        f"R{item['rank']}"
                         for item in mapping["anchor_candidates"].get(
                             str(int(anchor["cross_id"])), []
                         )
@@ -489,7 +596,6 @@ def run_page(
                 }
                 for anchor in sorted(anchors, key=lambda item: int(item["cross_id"]))
             ],
-            "candidate_unit_ids": sorted(candidate_ids),
         }
         prompt = SEMANTIC_JUDGE_PROMPT.replace("__SUBJECT__", subject).replace(
             "__CANDIDATES__",
@@ -520,10 +626,17 @@ def run_page(
                 diagnostic_context,
             )
             semantic_response = result.model_dump(mode="json")
+            semantic_resolution = resolve_semantic_references(
+                semantic_response, mapping
+            )
             semantic_audit = audit_semantic_judgment(
-                semantic_response["decisions"],
-                semantic_response["supplemental_wrong_unit_ids"],
+                semantic_resolution["decisions"],
+                semantic_resolution["supplemental_wrong_unit_ids"],
                 mapping,
+            )
+            semantic_audit["violations"] = (
+                semantic_resolution["violations"]
+                + semantic_audit["violations"]
             )
         except Exception as exc:
             semantic_error = {
@@ -534,6 +647,11 @@ def run_page(
             }
         llm_ms = (time.perf_counter() - llm_started) * 1000
     semantic_sets = build_semantic_unit_sets(semantic_audit, mapping)
+    geometry_guard_sets = build_geometry_guarded_unit_sets(
+        semantic_audit,
+        mapping,
+        enabled=bool(config["semantic_anchor_containment_guard_enabled"]),
+    )
     unit_by_id = {unit["question_unit_id"]: unit for unit in unit_result["units"]}
     strict_units = [
         unit_by_id[unit_id]
@@ -545,17 +663,53 @@ def run_page(
         for unit_id in semantic_sets["recall_safe_unit_ids"]
         if unit_id in unit_by_id
     ]
+    geometry_guard_units = [
+        unit_by_id[unit_id]
+        for unit_id in geometry_guard_sets["strict_unit_ids"]
+        if unit_id in unit_by_id
+    ]
+    geometry_guard_safe_units = [
+        unit_by_id[unit_id]
+        for unit_id in geometry_guard_sets["recall_safe_unit_ids"]
+        if unit_id in unit_by_id
+    ]
     strict_audit = audit_fixed_units(strict_units, truth_regions, config)
     recall_safe_audit = audit_fixed_units(recall_safe_units, truth_regions, config)
+    geometry_guard_audit = audit_fixed_units(
+        geometry_guard_units, truth_regions, config
+    )
+    geometry_guard_safe_audit = audit_fixed_units(
+        geometry_guard_safe_units, truth_regions, config
+    )
     _write_json(page_dir / "semantic-judge-response.json", semantic_response)
+    _write_json(page_dir / "semantic-reference-resolution.json", semantic_resolution)
     _write_json(page_dir / "semantic-judge-audit.json", semantic_audit)
     _write_json(page_dir / "semantic-unit-sets.json", semantic_sets)
+    _write_json(page_dir / "semantic-geometry-guard-sets.json", geometry_guard_sets)
     _write_json(page_dir / "semantic-strict-comparison.json", strict_audit)
     _write_json(
         page_dir / "semantic-recall-safe-comparison.json", recall_safe_audit
     )
+    _write_json(
+        page_dir / "semantic-geometry-guard-comparison.json",
+        geometry_guard_audit,
+    )
+    _write_json(
+        page_dir / "semantic-geometry-guard-safe-comparison.json",
+        geometry_guard_safe_audit,
+    )
     _write_json(page_dir / "semantic-judge-error.json", semantic_error)
     _write_json(page_dir / "llm-events.json", llm_events)
+    candidate_anchor_ids = {
+        int(cross_id)
+        for cross_id, candidates in mapping["anchor_candidates"].items()
+        if candidates
+    }
+    selected_anchor_ids = {
+        int(item["cross_id"])
+        for item in semantic_audit["accepted"]
+        if item.get("selected_unit_id") is not None
+    }
     summary = {
         "label": label,
         "status": "completed",
@@ -568,6 +722,9 @@ def run_page(
         "candidate_oracle_missed_truth_ids": audit["missed_truth_ids"],
         "false_unit_count": len(audit["false_unit_ids"]),
         "sibling_intrusion_unit_count": len(audit["sibling_intrusion_unit_ids"]),
+        "candidate_multi_truth_unit_count": sum(
+            len(matches) > 1 for matches in audit["unit_truth_matches"].values()
+        ),
         "config_sha256": config_sha256,
         "geometry_fingerprint": _geometry_fingerprint(unit_result, mapping),
         "ocr_status": page_ocr.status,
@@ -578,14 +735,47 @@ def run_page(
         ),
         "semantic_strict_truth_recall": strict_audit["truth_recall"],
         "semantic_strict_false_unit_count": len(strict_audit["false_unit_ids"]),
+        "semantic_strict_sibling_intrusion_unit_count": len(
+            strict_audit["sibling_intrusion_unit_ids"]
+        ),
+        "semantic_strict_multi_truth_unit_count": sum(
+            len(matches) > 1
+            for matches in strict_audit["unit_truth_matches"].values()
+        ),
         "semantic_recall_safe_truth_recall": recall_safe_audit["truth_recall"],
         "semantic_recall_safe_false_unit_count": len(
             recall_safe_audit["false_unit_ids"]
+        ),
+        "semantic_geometry_guard_truth_recall": geometry_guard_audit[
+            "truth_recall"
+        ],
+        "semantic_geometry_guard_false_unit_count": len(
+            geometry_guard_audit["false_unit_ids"]
+        ),
+        "semantic_geometry_guard_sibling_intrusion_unit_count": len(
+            geometry_guard_audit["sibling_intrusion_unit_ids"]
+        ),
+        "semantic_geometry_guard_multi_truth_unit_count": sum(
+            len(matches) > 1
+            for matches in geometry_guard_audit["unit_truth_matches"].values()
+        ),
+        "semantic_geometry_guard_override_count": len(
+            geometry_guard_sets["overrides"]
+        ),
+        "semantic_geometry_guard_safe_truth_recall": geometry_guard_safe_audit[
+            "truth_recall"
+        ],
+        "semantic_geometry_guard_safe_false_unit_count": len(
+            geometry_guard_safe_audit["false_unit_ids"]
         ),
         "semantic_none_or_uncertain_count": sum(
             item.get("selected_unit_id") is None
             for item in semantic_audit["accepted"]
         ),
+        "semantic_selected_anchor_count": len(selected_anchor_ids),
+        "semantic_candidate_anchor_count": len(candidate_anchor_ids),
+        "semantic_all_candidate_anchors_selected": bool(candidate_anchor_ids)
+        and candidate_anchor_ids <= selected_anchor_ids,
         "semantic_violation_count": len(semantic_audit["violations"]),
         "semantic_needs_review_count": len(semantic_sets["needs_review"]),
         "ocr_ms": round(ocr_ms, 2),
@@ -602,24 +792,34 @@ def run_page(
 
 def _write_report(path: Path, summaries: list[dict]) -> None:
     lines = [
-        "# 全局题目单元阶段A诊断",
+        "# 全局题目单元与MiniMax语义筛选诊断",
         "",
-        "> 全流程仅使用本地CV与OCR；真值只参与后置审计，LLM请求恒为0。",
+        "> 真值只参与后置审计；语义筛选启用时每页最多请求MiniMax一次，几何保护与安全回填均不增加LLM请求。",
         "",
-        "| 图片 | 真值 | 单元 | 锚点 | 未分配锚点 | 候选召回 | 候选误报 | 模型严格召回 | 模型严格误报 | 安全召回 | 安全误报 | needs_review | 语义异常 | 兄弟题侵入 | OCR(ms) | 版面(ms) | LLM(ms) | 总耗时(ms) | LLM请求 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 真值 | 锚点 | 候选召回 | 候选误报 | 候选侵入 | 候选跨真值 | 模型召回 | 模型误报 | 模型侵入 | 模型跨真值 | 模型选中锚点 | 全选 | 几何召回 | 几何误报 | 几何侵入 | 几何跨真值 | 几何改写 | 几何安全召回 | 几何安全误报 | needs_review | 语义异常 | OCR(ms) | LLM(ms) | 总耗时(ms) | LLM请求 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for item in summaries:
         lines.append(
-            "| {label} | {truth_count} | {unit_count} | {anchor_count} | "
-            "{unassigned_anchor_count} | {candidate_oracle_truth_recall} | "
-            "{false_unit_count} | {semantic_strict_truth_recall} | "
-            "{semantic_strict_false_unit_count} | "
-            "{semantic_recall_safe_truth_recall} | "
-            "{semantic_recall_safe_false_unit_count} | "
+            "| {label} | {truth_count} | {anchor_count} | "
+            "{candidate_oracle_truth_recall} | {false_unit_count} | "
+            "{sibling_intrusion_unit_count} | {candidate_multi_truth_unit_count} | "
+            "{semantic_strict_truth_recall} | {semantic_strict_false_unit_count} | "
+            "{semantic_strict_sibling_intrusion_unit_count} | "
+            "{semantic_strict_multi_truth_unit_count} | "
+            "{semantic_selected_anchor_count}/{semantic_candidate_anchor_count} | "
+            "{semantic_all_candidate_anchors_selected} | "
+            "{semantic_geometry_guard_truth_recall} | "
+            "{semantic_geometry_guard_false_unit_count} | "
+            "{semantic_geometry_guard_sibling_intrusion_unit_count} | "
+            "{semantic_geometry_guard_multi_truth_unit_count} | "
+            "{semantic_geometry_guard_override_count} | "
+            "{semantic_geometry_guard_safe_truth_recall} | "
+            "{semantic_geometry_guard_safe_false_unit_count} | "
             "{semantic_needs_review_count} | {semantic_violation_count} | "
-            "{sibling_intrusion_unit_count} | {ocr_ms} | {layout_ms} | "
-            "{llm_ms} | {total_ms} | {llm_request_count} |".format(**item)
+            "{ocr_ms} | {llm_ms} | {total_ms} | {llm_request_count} |".format(
+                **item
+            )
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -664,8 +864,9 @@ def main(arguments=None) -> int:
         for label, image_path in images
     ]
     aggregate = {
-        "experiment": "global_question_unit_stage_a",
-        "offline_only": True,
+        "experiment": "global_question_unit_semantic_filter",
+        "production_code_unchanged": True,
+        "semantic_judge_enabled": args.run_semantic_judge,
         "labels": labels,
         "llm_request_count": sum(item["llm_request_count"] for item in summaries),
         "truth_count": sum(item["truth_count"] for item in summaries),
