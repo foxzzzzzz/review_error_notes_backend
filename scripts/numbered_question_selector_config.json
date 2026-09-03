@@ -47,7 +47,16 @@
     "local_recheck_center_window_ratio": "本地复检计算交点红色支持时中心窗口半宽高相对锚点框的比例。",
     "local_recheck_min_center_red_ratio": "锚点中心窗口最低红色像素占比；低于该值才作为高确定性非红叉拒绝。",
     "local_recheck_bottom_page_number_min_y_ratio": "仅在锚点中心低于该页面纵向位置时启用页码数字排除。",
-    "local_recheck_page_number_max_distance_ratio": "页底锚点中心与纯数字OCR中心视为同一页码标记的最大归一化距离。"
+    "local_recheck_page_number_max_distance_ratio": "页底锚点中心与纯数字OCR中心视为同一页码标记的最大归一化距离。",
+    "atomic_duplicate_iou_threshold": "两个本地题目事件进入OCR重复复检所需的最低框IoU。",
+    "atomic_duplicate_ocr_jaccard_threshold": "两个重叠事件共享OCR行编号集合所需的最低Jaccard相似度。",
+    "atomic_same_row_center_y_ratio": "两个事件视为同一题目行时允许的中心纵向差，相对较小事件高度的比例。",
+    "atomic_same_column_center_x_ratio": "两个事件视为同一题目列时允许的中心横向差，相对较小事件宽度的比例。",
+    "atomic_horizontal_min_center_separation_ratio": "相邻事件执行横向边界裁断所需的最小中心距离，相对较小事件宽度的比例；用于避免同列近邻被误当左右兄弟题。",
+    "atomic_horizontal_partition_overlap_ratio": "同行相邻事件按中心分界时，在分界线两侧保留的安全重叠宽度，相对较小事件宽度的比例。",
+    "atomic_vertical_min_center_separation_ratio": "宽事件执行纵向边界裁断所需的最小中心距离，相对较小事件高度的比例。",
+    "atomic_vertical_clip_min_width_multiplier": "事件宽度超过本页事件中位宽度的该倍数时，才允许按上一题下边界做纵向裁断。",
+    "atomic_ocr_row_merge_gap_height_multiplier": "OCR行中心间距不超过全页OCR中位行高的该倍数时合并为同一文本行。"
   },
   "ocr_full_page_max_edge": 1600,
   "ocr_line_confidence_threshold": 0.45,
@@ -96,5 +105,14 @@
   "local_recheck_center_window_ratio": 0.08,
   "local_recheck_min_center_red_ratio": 0.05,
   "local_recheck_bottom_page_number_min_y_ratio": 0.9,
-  "local_recheck_page_number_max_distance_ratio": 0.04
+  "local_recheck_page_number_max_distance_ratio": 0.04,
+  "atomic_duplicate_iou_threshold": 0.45,
+  "atomic_duplicate_ocr_jaccard_threshold": 0.5,
+  "atomic_same_row_center_y_ratio": 0.45,
+  "atomic_same_column_center_x_ratio": 0.45,
+  "atomic_horizontal_min_center_separation_ratio": 0.25,
+  "atomic_horizontal_partition_overlap_ratio": 0.03,
+  "atomic_vertical_min_center_separation_ratio": 0.5,
+  "atomic_vertical_clip_min_width_multiplier": 1.15,
+  "atomic_ocr_row_merge_gap_height_multiplier": 0.7
 }

@@ -206,6 +206,14 @@ def load_config(path: Path) -> dict:
         "truth_match_min_iou",
         "truth_match_min_coverage",
         "sibling_intrusion_min_coverage",
+        "atomic_duplicate_iou_threshold",
+        "atomic_duplicate_ocr_jaccard_threshold",
+        "atomic_same_row_center_y_ratio",
+        "atomic_same_column_center_x_ratio",
+        "atomic_horizontal_min_center_separation_ratio",
+        "atomic_horizontal_partition_overlap_ratio",
+        "atomic_vertical_min_center_separation_ratio",
+        "atomic_ocr_row_merge_gap_height_multiplier",
     ):
         if not 0 <= float(config[name]) <= 1:
             raise ValueError(f"{name} must be between zero and one")
@@ -218,6 +226,10 @@ def load_config(path: Path) -> dict:
     ):
         if not 0 <= float(config[name]) <= 1:
             raise ValueError(f"{name} must be between zero and one")
+    if float(config["atomic_vertical_clip_min_width_multiplier"]) <= 0:
+        raise ValueError(
+            "atomic_vertical_clip_min_width_multiplier must be positive"
+        )
     return config
 
 
@@ -642,6 +654,252 @@ def build_deterministic_events(
     return events
 
 
+def _ocr_line_membership(
+    bbox: list[float], ocr_lines: list[dict]
+) -> set[int]:
+    members = set()
+    for index, line in enumerate(ocr_lines):
+        line_bbox = _validate_bbox(line["bbox"])
+        center_x = (line_bbox[0] + line_bbox[2]) / 2
+        center_y = (line_bbox[1] + line_bbox[3]) / 2
+        if _contains_point(bbox, center_x, center_y):
+            members.add(index)
+    return members
+
+
+def _set_jaccard(first: set[int], second: set[int]) -> float:
+    union = first | second
+    return len(first & second) / len(union) if union else 0.0
+
+
+def build_atomic_question_events(
+    *, events: list[dict], ocr_lines: list[dict], config: dict,
+    anchors: list[dict] | None = None
+) -> tuple[list[dict], dict]:
+    duplicate_iou = float(config["atomic_duplicate_iou_threshold"])
+    duplicate_ocr_jaccard = float(
+        config["atomic_duplicate_ocr_jaccard_threshold"]
+    )
+    merged = []
+    duplicate_groups = []
+    for event in events:
+        event_bbox = _validate_bbox(event["question_bbox"])
+        event_ocr = _ocr_line_membership(event_bbox, ocr_lines)
+        duplicate = next(
+            (
+                item
+                for item in merged
+                if _bbox_iou(item["question_bbox"], event_bbox) >= duplicate_iou
+                and _set_jaccard(item["ocr_line_ids"], event_ocr)
+                >= duplicate_ocr_jaccard
+            ),
+            None,
+        )
+        if duplicate is None:
+            merged.append(
+                {
+                    "event_id": len(merged),
+                    "candidate_id": event["candidate_id"],
+                    "cross_ids": sorted(event["cross_ids"]),
+                    "question_bbox": event_bbox,
+                    "confidence": float(event["confidence"]),
+                    "source_event_ids": [int(event["event_id"])],
+                    "ocr_line_ids": event_ocr,
+                }
+            )
+            continue
+        duplicate["cross_ids"] = sorted(
+            set(duplicate["cross_ids"]) | set(event["cross_ids"])
+        )
+        duplicate["confidence"] = max(
+            duplicate["confidence"], float(event["confidence"])
+        )
+        duplicate["source_event_ids"].append(int(event["event_id"]))
+        duplicate["ocr_line_ids"] |= event_ocr
+
+    duplicate_groups = [
+        item["source_event_ids"]
+        for item in merged
+        if len(item["source_event_ids"]) > 1
+    ]
+    anchor_by_id = {
+        int(anchor["cross_id"]): anchor for anchor in (anchors or [])
+    }
+    geometry = []
+    for item in merged:
+        bbox = list(item["question_bbox"])
+        geometry.append(
+            {
+                "event": item,
+                "bbox": bbox,
+                "center_x": (bbox[0] + bbox[2]) / 2,
+                "center_y": (bbox[1] + bbox[3]) / 2,
+                "width": bbox[2] - bbox[0],
+                "height": bbox[3] - bbox[1],
+            }
+        )
+    median_width = statistics.median(
+        item["width"] for item in geometry
+    ) if geometry else 0.0
+    row_tolerance = float(config["atomic_same_row_center_y_ratio"])
+    column_tolerance = float(config["atomic_same_column_center_x_ratio"])
+    horizontal_separation = float(
+        config["atomic_horizontal_min_center_separation_ratio"]
+    )
+    horizontal_overlap = float(
+        config["atomic_horizontal_partition_overlap_ratio"]
+    )
+    vertical_separation = float(
+        config["atomic_vertical_min_center_separation_ratio"]
+    )
+    wide_multiplier = float(
+        config["atomic_vertical_clip_min_width_multiplier"]
+    )
+    partitioned = set()
+    for current in geometry:
+        event = current["event"]
+        bbox = event["question_bbox"]
+        left_centers = []
+        right_centers = []
+        for other in geometry:
+            if other is current:
+                continue
+            min_width = min(current["width"], other["width"])
+            min_height = min(current["height"], other["height"])
+            if (
+                abs(other["center_y"] - current["center_y"])
+                <= row_tolerance * min_height
+                and abs(other["center_x"] - current["center_x"])
+                >= horizontal_separation * min_width
+            ):
+                if other["center_x"] < current["center_x"]:
+                    left_centers.append(other["center_x"])
+                else:
+                    right_centers.append(other["center_x"])
+        original = list(bbox)
+        if left_centers:
+            boundary = (current["center_x"] + max(left_centers)) / 2
+            bbox[0] = max(
+                bbox[0], boundary - current["width"] * horizontal_overlap
+            )
+        if right_centers:
+            boundary = (current["center_x"] + min(right_centers)) / 2
+            bbox[2] = min(
+                bbox[2], boundary + current["width"] * horizontal_overlap
+            )
+        if median_width and current["width"] > median_width * wide_multiplier:
+            above = []
+            for other in geometry:
+                if other is current or other["center_y"] >= current["center_y"]:
+                    continue
+                min_width = min(current["width"], other["width"])
+                min_height = min(current["height"], other["height"])
+                if (
+                    current["center_y"] - other["center_y"]
+                    >= vertical_separation * min_height
+                    and abs(other["center_x"] - current["center_x"])
+                    <= column_tolerance * min_width
+                    and other["bbox"][3] > current["bbox"][1]
+                ):
+                    above.append(other)
+            if above:
+                nearest = max(above, key=lambda item: item["center_y"])
+                bbox[1] = max(bbox[1], nearest["bbox"][3])
+        for cross_id in event["cross_ids"]:
+            anchor = anchor_by_id.get(cross_id)
+            if anchor is None:
+                continue
+            anchor_bbox = _validate_bbox(anchor["bbox"])
+            anchor_x = (anchor_bbox[0] + anchor_bbox[2]) / 2
+            anchor_y = (anchor_bbox[1] + anchor_bbox[3]) / 2
+            if not _contains_point(original, anchor_x, anchor_y):
+                continue
+            bbox[0] = min(bbox[0], anchor_x)
+            bbox[1] = min(bbox[1], anchor_y)
+            bbox[2] = max(bbox[2], anchor_x)
+            bbox[3] = max(bbox[3], anchor_y)
+        if bbox != original:
+            partitioned.add(int(event["event_id"]))
+
+    refined = []
+    for item in merged:
+        refined.append(
+            {
+                "event_id": len(refined),
+                "candidate_id": item["candidate_id"],
+                "cross_ids": item["cross_ids"],
+                "question_bbox": [round(value, 6) for value in item["question_bbox"]],
+                "confidence": item["confidence"],
+            }
+        )
+    event_ocr_row_audits = []
+    multi_ocr_row_event_ids = []
+    anchor_outside_event_ids = []
+    median_ocr_height = (
+        statistics.median(
+            _validate_bbox(line["bbox"])[3] - _validate_bbox(line["bbox"])[1]
+            for line in ocr_lines
+        )
+        if ocr_lines
+        else 0.0
+    )
+    final_row_gap = median_ocr_height * float(
+        config["atomic_ocr_row_merge_gap_height_multiplier"]
+    )
+    for event in refined:
+        bbox = event["question_bbox"]
+        line_centers = []
+        for line in ocr_lines:
+            line_bbox = _validate_bbox(line["bbox"])
+            center_x = (line_bbox[0] + line_bbox[2]) / 2
+            center_y = (line_bbox[1] + line_bbox[3]) / 2
+            if _contains_point(bbox, center_x, center_y):
+                line_centers.append(center_y)
+        line_centers.sort()
+        row_group_count = 0
+        previous_center = None
+        for center_y in line_centers:
+            if previous_center is None or center_y - previous_center > final_row_gap:
+                row_group_count += 1
+            previous_center = center_y
+        multi_row_risk = row_group_count > 2
+        event_ocr_row_audits.append(
+            {
+                "event_id": int(event["event_id"]),
+                "ocr_line_count": len(line_centers),
+                "ocr_row_group_count": row_group_count,
+                "multi_row_risk": multi_row_risk,
+            }
+        )
+        if multi_row_risk:
+            multi_ocr_row_event_ids.append(int(event["event_id"]))
+        if any(
+            cross_id in anchor_by_id
+            and not _contains_point(
+                bbox,
+                (
+                    _validate_bbox(anchor_by_id[cross_id]["bbox"])[0]
+                    + _validate_bbox(anchor_by_id[cross_id]["bbox"])[2]
+                )
+                / 2,
+                (
+                    _validate_bbox(anchor_by_id[cross_id]["bbox"])[1]
+                    + _validate_bbox(anchor_by_id[cross_id]["bbox"])[3]
+                )
+                / 2,
+            )
+            for cross_id in event["cross_ids"]
+        ):
+            anchor_outside_event_ids.append(int(event["event_id"]))
+    return refined, {
+        "ocr_duplicate_groups": duplicate_groups,
+        "partitioned_event_ids": sorted(partitioned),
+        "event_ocr_row_audits": event_ocr_row_audits,
+        "multi_ocr_row_event_ids": multi_ocr_row_event_ids,
+        "anchor_outside_event_ids": anchor_outside_event_ids,
+    }
+
+
 def audit_selections(selections: list[dict], allowed: dict[int, list[str]]) -> dict:
     known_candidates = {
         candidate_id for candidate_ids in allowed.values() for candidate_id in candidate_ids
@@ -965,8 +1223,8 @@ def _write_report(path: Path, summaries: list[dict]) -> None:
         "",
         "> 题目边界由本地规则确定；MiniMax每页只核验一次红叉真假，不选择候选、不生成坐标。",
         "",
-        "| 图片 | 真值 | 锚点 | 候选上限召回 | 本地拒绝锚点 | LLM真叉 | LLM拒绝 | LLM不确定 | 全保留召回 | 全保留误报 | 本地召回 | 本地误报 | LLM单独召回 | LLM单独误报 | 一致拒绝召回 | 一致拒绝误报 | 语义异常 | OCR耗时(ms) | 版面耗时(ms) | 本地复检(ms) | LLM耗时(ms) | 总耗时(ms) | LLM请求 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 真值 | 锚点 | 候选上限召回 | 本地拒绝锚点 | LLM真叉 | LLM拒绝 | LLM不确定 | 全保留召回 | 全保留误报 | 本地召回 | 本地误报 | 原子题召回 | 原子题误报 | 原子题事件 | OCR重复合并 | 多OCR行风险 | 锚点在题框外 | 兄弟题侵入 | LLM单独召回 | LLM单独误报 | 一致拒绝召回 | 一致拒绝误报 | 语义异常 | OCR耗时(ms) | 版面耗时(ms) | 本地复检(ms) | 原子化(ms) | LLM耗时(ms) | 总耗时(ms) | LLM请求 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for item in summaries:
         lines.append(
@@ -975,10 +1233,16 @@ def _write_report(path: Path, summaries: list[dict]) -> None:
             "{llm_not_cross_count} | {llm_uncertain_count} | "
             "{all_truth_recall} | {all_false_event_count} | "
             "{local_truth_recall} | {local_false_event_count} | "
+            "{atomic_truth_recall} | {atomic_false_event_count} | "
+            "{atomic_event_count} | {atomic_ocr_duplicate_group_count} | "
+            "{atomic_multi_ocr_row_event_count} | "
+            "{atomic_anchor_outside_event_count} | "
+            "{atomic_sibling_intrusion_event_count} | "
             "{llm_truth_recall} | {llm_false_event_count} | "
             "{consensus_truth_recall} | {consensus_false_event_count} | "
             "{semantic_violation_count} | {ocr_ms} | {layout_ms} | "
-            "{local_recheck_ms} | {llm_ms} | {total_ms} | {llm_request_count} |".format(**item)
+            "{local_recheck_ms} | {atomic_ms} | {llm_ms} | {total_ms} | "
+            "{llm_request_count} |".format(**item)
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1128,6 +1392,14 @@ def run_page(
         allowed=allowed,
         kept_cross_ids=consensus["kept_cross_ids"],
     )
+    atomic_started = time.perf_counter()
+    atomic_events, atomic_audit = build_atomic_question_events(
+        events=local_events,
+        ocr_lines=ocr_lines,
+        config=config,
+        anchors=anchors,
+    )
+    atomic_ms = (time.perf_counter() - atomic_started) * 1000
     candidate_oracle = compare_selected_events_to_truth(
         anchors=anchors,
         events=build_candidate_oracle_events(proposal["candidates"]),
@@ -1144,12 +1416,15 @@ def run_page(
         for name, events in (
             ("all", all_events),
             ("local", local_events),
+            ("atomic", atomic_events),
             ("llm", llm_events),
             ("consensus", consensus_events),
         )
     }
     _write_json(page_dir / "all-anchor-events.json", all_events)
     _write_json(page_dir / "local-filtered-events.json", local_events)
+    _write_json(page_dir / "local-atomic-events.json", atomic_events)
+    _write_json(page_dir / "local-atomic-audit.json", atomic_audit)
     _write_json(page_dir / "llm-filtered-events.json", llm_events)
     _write_json(page_dir / "consensus-filtered-events.json", consensus_events)
     _write_json(page_dir / "anchor-filter-consensus.json", consensus)
@@ -1178,10 +1453,23 @@ def run_page(
         "ocr_ms": round(ocr_ms, 2),
         "layout_ms": round(layout_ms, 2),
         "local_recheck_ms": round(local_recheck_ms, 2),
+        "atomic_ms": round(atomic_ms, 2),
         "llm_ms": round(llm_ms, 2),
         "total_ms": round((time.perf_counter() - started) * 1000, 2),
         "llm_request_count": llm_request_count,
         "truth_count": len(truth_regions),
+        "atomic_ocr_duplicate_group_count": len(
+            atomic_audit["ocr_duplicate_groups"]
+        ),
+        "atomic_multi_ocr_row_event_count": len(
+            atomic_audit["multi_ocr_row_event_ids"]
+        ),
+        "atomic_anchor_outside_event_count": len(
+            atomic_audit["anchor_outside_event_ids"]
+        ),
+        "atomic_sibling_intrusion_event_count": len(
+            comparisons["atomic"]["sibling_intrusion_event_ids"]
+        ),
     }
     for name, comparison in comparisons.items():
         summary[f"{name}_matched_truth_count"] = comparison["matched_truth_count"]
@@ -1192,6 +1480,7 @@ def run_page(
             {
                 "all": all_events,
                 "local": local_events,
+                "atomic": atomic_events,
                 "llm": llm_events,
                 "consensus": consensus_events,
             }[name]
@@ -1253,17 +1542,25 @@ def main(arguments=None) -> int:
                     "llm_not_cross_count": 0, "llm_uncertain_count": 0,
                     "all_truth_recall": 0.0, "all_false_event_count": 0,
                     "local_truth_recall": 0.0, "local_false_event_count": 0,
+                    "atomic_truth_recall": 0.0, "atomic_false_event_count": 0,
+                    "atomic_event_count": 0,
+                    "atomic_ocr_duplicate_group_count": 0,
+                    "atomic_multi_ocr_row_event_count": 0,
+                    "atomic_anchor_outside_event_count": 0,
+                    "atomic_sibling_intrusion_event_count": 0,
                     "llm_truth_recall": 0.0, "llm_false_event_count": 0,
                     "consensus_truth_recall": 0.0,
                     "consensus_false_event_count": 0,
                     "semantic_violation_count": 0, "ocr_ms": 0.0,
                     "layout_ms": 0.0, "local_recheck_ms": 0.0,
-                    "llm_ms": 0.0, "total_ms": 0.0, "llm_request_count": 0,
+                    "atomic_ms": 0.0, "llm_ms": 0.0, "total_ms": 0.0,
+                    "llm_request_count": 0,
                     "consensus_matched_truth_count": 0,
+                    "atomic_matched_truth_count": 0,
                 }
             )
     aggregate = {
-        "experiment": "deterministic_boundary_conservative_anchor_filter",
+        "experiment": "deterministic_boundary_local_atomic_filter",
         "offline_only": args.offline_only,
         "labels": labels,
         "llm_request_count": sum(item["llm_request_count"] for item in summaries),
@@ -1271,10 +1568,16 @@ def main(arguments=None) -> int:
         "matched_truth_count": sum(
             item["consensus_matched_truth_count"] for item in summaries
         ),
+        "atomic_matched_truth_count": sum(
+            item["atomic_matched_truth_count"] for item in summaries
+        ),
         "page_summaries": summaries,
     }
     aggregate["truth_recall"] = round(
         aggregate["matched_truth_count"] / aggregate["truth_count"], 6
+    )
+    aggregate["atomic_truth_recall"] = round(
+        aggregate["atomic_matched_truth_count"] / aggregate["truth_count"], 6
     )
     _write_json(output / "summary.json", aggregate)
     _write_report(output / "comparison-report.md", summaries)

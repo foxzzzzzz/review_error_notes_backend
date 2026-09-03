@@ -68,6 +68,15 @@ def _config():
         "local_recheck_min_center_red_ratio": 0.05,
         "local_recheck_bottom_page_number_min_y_ratio": 0.9,
         "local_recheck_page_number_max_distance_ratio": 0.04,
+        "atomic_duplicate_iou_threshold": 0.45,
+        "atomic_duplicate_ocr_jaccard_threshold": 0.5,
+        "atomic_same_row_center_y_ratio": 0.45,
+        "atomic_same_column_center_x_ratio": 0.45,
+        "atomic_horizontal_min_center_separation_ratio": 0.25,
+        "atomic_horizontal_partition_overlap_ratio": 0.03,
+        "atomic_vertical_min_center_separation_ratio": 0.5,
+        "atomic_vertical_clip_min_width_multiplier": 1.15,
+        "atomic_ocr_row_merge_gap_height_multiplier": 0.7,
     }
 
 
@@ -448,3 +457,197 @@ def test_anchor_prompt_does_not_ask_model_to_select_question_candidates():
     assert "禁止默认全部确认" in diagnostic.ANCHOR_VERIFICATION_PROMPT
     assert "two_intersecting_red_diagonal_strokes" in diagnostic.ANCHOR_VERIFICATION_PROMPT
     assert "selected_candidate_id" not in diagnostic.ANCHOR_VERIFICATION_PROMPT
+
+
+def test_atomic_events_merge_only_overlapping_boxes_with_shared_ocr_lines():
+    diagnostic = _load_script_module()
+    events = [
+        {
+            "event_id": 0,
+            "candidate_id": "Q1",
+            "cross_ids": [0],
+            "question_bbox": [0.67, 0.06, 1.0, 0.22],
+            "confidence": 0.8,
+        },
+        {
+            "event_id": 1,
+            "candidate_id": "Q3",
+            "cross_ids": [1],
+            "question_bbox": [0.67, 0.11, 1.0, 0.27],
+            "confidence": 0.9,
+        },
+        {
+            "event_id": 2,
+            "candidate_id": "Q4",
+            "cross_ids": [2],
+            "question_bbox": [0.1, 0.1, 0.3, 0.3],
+            "confidence": 0.7,
+        },
+    ]
+    ocr_lines = [
+        {"text": "same question", "bbox": [0.72, 0.14, 0.92, 0.2], "confidence": 0.9},
+        {"text": "other", "bbox": [0.12, 0.14, 0.25, 0.2], "confidence": 0.9},
+    ]
+
+    refined, audit = diagnostic.build_atomic_question_events(
+        events=events,
+        ocr_lines=ocr_lines,
+        config=_config(),
+    )
+
+    assert refined[0] == {
+        "event_id": 0,
+        "candidate_id": "Q1",
+        "cross_ids": [0, 1],
+        "question_bbox": [0.67, 0.06, 1.0, 0.22],
+        "confidence": 0.9,
+    }
+    assert refined[1]["cross_ids"] == [2]
+    assert audit["ocr_duplicate_groups"] == [[0, 1]]
+
+
+def test_atomic_events_partition_same_row_and_wide_lower_sibling_overlap():
+    diagnostic = _load_script_module()
+    events = [
+        {
+            "event_id": 0,
+            "candidate_id": "left",
+            "cross_ids": [0],
+            "question_bbox": [0.0, 0.214, 0.321, 0.37],
+            "confidence": 0.9,
+        },
+        {
+            "event_id": 1,
+            "candidate_id": "right",
+            "cross_ids": [1],
+            "question_bbox": [0.197, 0.165, 0.541, 0.321],
+            "confidence": 0.9,
+        },
+        {
+            "event_id": 2,
+            "candidate_id": "upper",
+            "cross_ids": [2],
+            "question_bbox": [0.214, 0.476, 0.543, 0.631],
+            "confidence": 0.9,
+        },
+        {
+            "event_id": 3,
+            "candidate_id": "wide-lower",
+            "cross_ids": [3],
+            "question_bbox": [0.284, 0.602, 0.71, 0.757],
+            "confidence": 0.8,
+        },
+    ]
+
+    refined, audit = diagnostic.build_atomic_question_events(
+        events=events,
+        ocr_lines=[],
+        config=_config(),
+    )
+
+    assert refined[0]["question_bbox"][2] > refined[1]["question_bbox"][0]
+    assert refined[3]["question_bbox"][1] == 0.631
+    assert audit["partitioned_event_ids"] == [0, 1, 3]
+
+
+def test_atomic_events_do_not_clip_normal_width_stacked_question():
+    diagnostic = _load_script_module()
+    events = [
+        {
+            "event_id": 0,
+            "candidate_id": "upper",
+            "cross_ids": [6],
+            "question_bbox": [0.006, 0.505, 0.279, 0.658],
+            "confidence": 0.8,
+        },
+        {
+            "event_id": 1,
+            "candidate_id": "target",
+            "cross_ids": [7],
+            "question_bbox": [0.075, 0.603, 0.339, 0.755],
+            "confidence": 0.9,
+        },
+        {
+            "event_id": 2,
+            "candidate_id": "lower",
+            "cross_ids": [8],
+            "question_bbox": [0.031, 0.664, 0.375, 0.816],
+            "confidence": 0.8,
+        },
+    ]
+
+    refined, audit = diagnostic.build_atomic_question_events(
+        events=events,
+        ocr_lines=[],
+        config=_config(),
+    )
+
+    assert refined[1]["question_bbox"] == [0.075, 0.603, 0.339, 0.755]
+    assert 1 not in audit["partitioned_event_ids"]
+
+
+def test_atomic_event_audit_exposes_multi_row_and_anchor_outside_risks():
+    diagnostic = _load_script_module()
+    events = [
+        {
+            "event_id": 0,
+            "candidate_id": "target",
+            "cross_ids": [4],
+            "question_bbox": [0.1, 0.1, 0.5, 0.5],
+            "confidence": 0.9,
+        }
+    ]
+    anchors = [{"cross_id": 4, "bbox": [0.7, 0.2, 0.75, 0.25]}]
+    ocr_lines = [
+        {"text": "row one", "bbox": [0.15, 0.12, 0.4, 0.16], "confidence": 0.9},
+        {"text": "row two", "bbox": [0.15, 0.24, 0.4, 0.28], "confidence": 0.9},
+        {"text": "row three", "bbox": [0.15, 0.4, 0.4, 0.44], "confidence": 0.9},
+    ]
+
+    refined, audit = diagnostic.build_atomic_question_events(
+        events=events,
+        ocr_lines=ocr_lines,
+        config=_config(),
+        anchors=anchors,
+    )
+
+    assert refined[0]["question_bbox"] == [0.1, 0.1, 0.5, 0.5]
+    assert audit["multi_ocr_row_event_ids"] == [0]
+    assert audit["anchor_outside_event_ids"] == [0]
+    assert audit["event_ocr_row_audits"][0]["ocr_row_group_count"] == 3
+
+
+def test_atomic_events_do_not_partition_away_a_previously_contained_anchor():
+    diagnostic = _load_script_module()
+    events = [
+        {
+            "event_id": 0,
+            "candidate_id": "left",
+            "cross_ids": [0],
+            "question_bbox": [0.1, 0.2, 0.5, 0.4],
+            "confidence": 0.9,
+        },
+        {
+            "event_id": 1,
+            "candidate_id": "right",
+            "cross_ids": [1],
+            "question_bbox": [0.3, 0.2, 0.7, 0.4],
+            "confidence": 0.9,
+        },
+    ]
+    anchors = [
+        {"cross_id": 0, "bbox": [0.43, 0.27, 0.47, 0.31]},
+        {"cross_id": 1, "bbox": [0.55, 0.27, 0.59, 0.31]},
+    ]
+
+    refined, audit = diagnostic.build_atomic_question_events(
+        events=events,
+        ocr_lines=[],
+        config=_config(),
+        anchors=anchors,
+    )
+
+    assert refined[0]["question_bbox"] == [0.1, 0.2, 0.45, 0.4]
+    assert refined[1]["question_bbox"][0] == 0.388
+    assert audit["partitioned_event_ids"] == [0, 1]
+    assert audit["anchor_outside_event_ids"] == []
