@@ -45,7 +45,14 @@
     "semantic_montage_font_size": "语义裁判拼图中C/R编号的字体大小。",
     "semantic_montage_crop_padding_ratio": "锚点与允许单元联合区域四周增加的页面比例。",
     "semantic_montage_jpeg_quality": "语义裁判拼图保存为JPEG时的质量。",
-    "semantic_anchor_containment_guard_enabled": "模型选择的候选不包含红叉、且首选候选包含红叉时，是否使用首选候选作为独立几何保护结果。"
+    "semantic_anchor_containment_guard_enabled": "模型选择的候选不包含红叉、且首选候选包含红叉时，是否使用首选候选作为独立几何保护结果。",
+    "retry_duplicate_min_iou": "两轮不同题目单元进入保守OCR去重所需的最低IoU。",
+    "retry_duplicate_min_containment": "两轮单元没有共享红叉锚点时，进入保守OCR去重所需的较小框包含率。",
+    "retry_duplicate_min_ocr_jaccard": "两轮不同题目单元进入保守去重所需的OCR证据Jaccard下限。",
+    "boundary_option_min_iou": "同一红叉的另一题目单元成为边界交互备选时，与当前单元所需的最低IoU。",
+    "boundary_option_min_containment": "同一红叉的另一题目单元成为边界交互备选时，较小框需被较大框包含的最低比例。",
+    "boundary_auto_narrow_min_ocr_jaccard": "自动切换到更窄题目单元时，与当前单元所需的OCR证据Jaccard下限。",
+    "boundary_interaction_max_options": "边界歧义事件最多向小程序提供的本地编号选项数。"
   },
   "ocr_full_page_max_edge": 1600,
   "red_min_channel": 105,
@@ -92,5 +99,12 @@
   "semantic_montage_font_size": 18,
   "semantic_montage_crop_padding_ratio": 0.02,
   "semantic_montage_jpeg_quality": 90,
-  "semantic_anchor_containment_guard_enabled": true
+  "semantic_anchor_containment_guard_enabled": true,
+  "retry_duplicate_min_iou": 0.45,
+  "retry_duplicate_min_containment": 0.9,
+  "retry_duplicate_min_ocr_jaccard": 0.5,
+  "boundary_option_min_iou": 0.15,
+  "boundary_option_min_containment": 0.9,
+  "boundary_auto_narrow_min_ocr_jaccard": 0.75,
+  "boundary_interaction_max_options": 3
 }

@@ -311,6 +311,67 @@ def test_semantic_unit_sets_keep_strict_selection_and_safe_rank_one_fallback():
     ]
 
 
+def test_selected_unit_events_preserve_guarded_and_fallback_anchor_evidence():
+    diagnostic = _load_diagnostic()
+    units = [
+        {
+            "question_unit_id": "U1",
+            "unit_bbox": [0.1, 0.1, 0.4, 0.3],
+            "ocr_tokens": ["first"],
+        },
+        {
+            "question_unit_id": "U3",
+            "unit_bbox": [0.5, 0.1, 0.8, 0.3],
+            "ocr_tokens": ["second"],
+        },
+    ]
+    audit = {
+        "accepted": [
+            _decision(1, selected="U2"),
+            _decision(2, selected=None, validity="uncertain", status="uncertain"),
+        ],
+        "accepted_supplemental_unit_ids": [],
+        "violations": [],
+    }
+    guarded_sets = {
+        "recall_safe_unit_ids": ["U1", "U3"],
+        "needs_review": [
+            {"cross_id": 2, "fallback_unit_id": "U3", "reason": "semantic_uncertain"}
+        ],
+        "overrides": [
+            {
+                "cross_id": 1,
+                "model_unit_id": "U2",
+                "guarded_unit_id": "U1",
+                "reason": "rank_one_contains_anchor",
+            }
+        ],
+    }
+
+    events = diagnostic.build_selected_unit_events(
+        units, audit, guarded_sets, source_round=1
+    )
+
+    assert events == [
+        {
+            "question_unit_id": "U1",
+            "unit_bbox": [0.1, 0.1, 0.4, 0.3],
+            "anchor_ids": [1],
+            "ocr_tokens": ["first"],
+            "source_round": 1,
+            "boundary_fits": ["complete"],
+        },
+        {
+            "question_unit_id": "U3",
+            "unit_bbox": [0.5, 0.1, 0.8, 0.3],
+            "anchor_ids": [2],
+            "ocr_tokens": ["second"],
+            "source_round": 1,
+            "boundary_fits": ["uncertain"],
+        },
+    ]
+
+
 def test_cli_semantic_judge_makes_exactly_one_request(tmp_path, monkeypatch):
     diagnostic = _load_diagnostic()
     image_path, anchors_root, truth_path = _fixture(tmp_path)
@@ -374,3 +435,11 @@ def test_cli_semantic_judge_makes_exactly_one_request(tmp_path, monkeypatch):
     assert (page_dir / "semantic-strict-comparison.json").is_file()
     assert (page_dir / "semantic-recall-safe-comparison.json").is_file()
     assert (page_dir / "semantic-geometry-guard-comparison.json").is_file()
+    assert (page_dir / "ocr-lines.json").is_file()
+    assert (page_dir / "semantic-recall-safe-events.json").is_file()
+    assert (page_dir / "semantic-converged-events.json").is_file()
+    assert (page_dir / "semantic-convergence-audit.json").is_file()
+    page_summary = summary["page_summaries"][0]
+    assert page_summary["semantic_converged_truth_recall"] == 0.0
+    assert page_summary["semantic_boundary_ambiguous_count"] == 0
+    assert page_summary["convergence_ms"] >= 0

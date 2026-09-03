@@ -31,6 +31,11 @@ from global_question_units import (
     map_anchors_to_units,
     validate_bbox,
 )
+from global_question_unit_convergence import (
+    build_boundary_metadata,
+    build_unit_ocr_tokens,
+    consolidate_retry_events,
+)
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("global_question_unit_config.json")
@@ -295,6 +300,44 @@ def build_geometry_guarded_unit_sets(
     }
 
 
+def build_selected_unit_events(
+    units: list[dict], semantic_audit: dict, guarded_sets: dict, *, source_round: int
+) -> list[dict]:
+    selected_ids = set(guarded_sets["recall_safe_unit_ids"])
+    anchors_by_unit = {unit_id: set() for unit_id in selected_ids}
+    boundary_fits_by_unit = {unit_id: set() for unit_id in selected_ids}
+    overrides = {
+        int(item["cross_id"]): str(item["guarded_unit_id"])
+        for item in guarded_sets.get("overrides", [])
+    }
+    accepted_by_cross = {
+        int(item["cross_id"]): item for item in semantic_audit["accepted"]
+    }
+    for cross_id, decision in accepted_by_cross.items():
+        unit_id = overrides.get(cross_id, decision.get("selected_unit_id"))
+        if unit_id in selected_ids:
+            anchors_by_unit[unit_id].add(cross_id)
+            boundary_fits_by_unit[unit_id].add(decision["boundary_fit"])
+    for item in guarded_sets["needs_review"]:
+        unit_id = item.get("fallback_unit_id")
+        if unit_id in selected_ids:
+            anchors_by_unit[unit_id].add(int(item["cross_id"]))
+            boundary_fits_by_unit[unit_id].add("uncertain")
+    unit_by_id = {str(item["question_unit_id"]): item for item in units}
+    return [
+        {
+            "question_unit_id": unit_id,
+            "unit_bbox": list(unit_by_id[unit_id]["unit_bbox"]),
+            "anchor_ids": sorted(anchors_by_unit[unit_id]),
+            "ocr_tokens": list(unit_by_id[unit_id].get("ocr_tokens", [])),
+            "source_round": source_round,
+            "boundary_fits": sorted(boundary_fits_by_unit[unit_id]),
+        }
+        for unit_id in sorted(selected_ids)
+        if unit_id in unit_by_id
+    ]
+
+
 def _write_json(path: Path, value) -> None:
     path.write_text(
         json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -518,6 +561,8 @@ def run_page(
         ]
     layout_started = time.perf_counter()
     unit_result = build_global_question_units(image, ocr_lines, config)
+    for unit in unit_result["units"]:
+        unit["ocr_tokens"] = build_unit_ocr_tokens(unit, ocr_lines)
     layout_ms = (time.perf_counter() - layout_started) * 1000
     mapping_started = time.perf_counter()
     mapping = map_anchors_to_units(unit_result["units"], anchors, config)
@@ -681,6 +726,35 @@ def run_page(
     geometry_guard_safe_audit = audit_fixed_units(
         geometry_guard_safe_units, truth_regions, config
     )
+    convergence_started = time.perf_counter()
+    selected_events = build_selected_unit_events(
+        unit_result["units"], semantic_audit, geometry_guard_sets, source_round=1
+    )
+    convergence = consolidate_retry_events([selected_events], config)
+    converged_units = [
+        {
+            "question_unit_id": event["question_unit_id"],
+            "unit_bbox": event["unit_bbox"],
+        }
+        for event in convergence["events"]
+    ]
+    converged_audit = audit_fixed_units(converged_units, truth_regions, config)
+    boundary_events = build_boundary_metadata(
+        convergence["events"],
+        unit_by_id,
+        mapping["anchor_candidates"],
+        config,
+    )
+    display_units = [
+        {
+            "question_unit_id": event["display_unit_id"],
+            "unit_bbox": event["display_bbox"],
+        }
+        for event in boundary_events
+    ]
+    display_audit = audit_fixed_units(display_units, truth_regions, config)
+    convergence_ms = (time.perf_counter() - convergence_started) * 1000
+    _write_json(page_dir / "ocr-lines.json", ocr_lines)
     _write_json(page_dir / "semantic-judge-response.json", semantic_response)
     _write_json(page_dir / "semantic-reference-resolution.json", semantic_resolution)
     _write_json(page_dir / "semantic-judge-audit.json", semantic_audit)
@@ -698,6 +772,11 @@ def run_page(
         page_dir / "semantic-geometry-guard-safe-comparison.json",
         geometry_guard_safe_audit,
     )
+    _write_json(page_dir / "semantic-recall-safe-events.json", selected_events)
+    _write_json(page_dir / "semantic-converged-events.json", boundary_events)
+    _write_json(page_dir / "semantic-convergence-audit.json", convergence["audit"])
+    _write_json(page_dir / "semantic-converged-comparison.json", converged_audit)
+    _write_json(page_dir / "semantic-display-comparison.json", display_audit)
     _write_json(page_dir / "semantic-judge-error.json", semantic_error)
     _write_json(page_dir / "llm-events.json", llm_events)
     candidate_anchor_ids = {
@@ -768,6 +847,25 @@ def run_page(
         "semantic_geometry_guard_safe_false_unit_count": len(
             geometry_guard_safe_audit["false_unit_ids"]
         ),
+        "semantic_converged_truth_recall": converged_audit["truth_recall"],
+        "semantic_converged_false_unit_count": len(
+            converged_audit["false_unit_ids"]
+        ),
+        "semantic_converged_sibling_intrusion_unit_count": len(
+            converged_audit["sibling_intrusion_unit_ids"]
+        ),
+        "semantic_display_truth_recall": display_audit["truth_recall"],
+        "semantic_display_sibling_intrusion_unit_count": len(
+            display_audit["sibling_intrusion_unit_ids"]
+        ),
+        "semantic_ocr_geometry_merge_count": convergence["audit"][
+            "conservative_ocr_geometry_merge_count"
+        ],
+        "semantic_boundary_ambiguous_count": sum(
+            item["boundary_status"] == "boundary_ambiguous"
+            for item in boundary_events
+        ),
+        "convergence_ms": round(convergence_ms, 2),
         "semantic_none_or_uncertain_count": sum(
             item.get("selected_unit_id") is None
             for item in semantic_audit["accepted"]
@@ -796,8 +894,8 @@ def _write_report(path: Path, summaries: list[dict]) -> None:
         "",
         "> 真值只参与后置审计；语义筛选启用时每页最多请求MiniMax一次，几何保护与安全回填均不增加LLM请求。",
         "",
-        "| 图片 | 真值 | 锚点 | 候选召回 | 候选误报 | 候选侵入 | 候选跨真值 | 模型召回 | 模型误报 | 模型侵入 | 模型跨真值 | 模型选中锚点 | 全选 | 几何召回 | 几何误报 | 几何侵入 | 几何跨真值 | 几何改写 | 几何安全召回 | 几何安全误报 | needs_review | 语义异常 | OCR(ms) | LLM(ms) | 总耗时(ms) | LLM请求 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 真值 | 锚点 | 候选召回 | 候选误报 | 候选侵入 | 候选跨真值 | 模型召回 | 模型误报 | 模型侵入 | 模型跨真值 | 模型选中锚点 | 全选 | 几何召回 | 几何误报 | 几何侵入 | 几何跨真值 | 几何改写 | 几何安全召回 | 几何安全误报 | 收敛召回 | 收敛误报 | OCR空间合并 | 展示召回 | 展示侵入 | 边界歧义 | needs_review | 语义异常 | OCR(ms) | LLM(ms) | 本地收敛(ms) | 总耗时(ms) | LLM请求 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for item in summaries:
         lines.append(
@@ -816,8 +914,15 @@ def _write_report(path: Path, summaries: list[dict]) -> None:
             "{semantic_geometry_guard_override_count} | "
             "{semantic_geometry_guard_safe_truth_recall} | "
             "{semantic_geometry_guard_safe_false_unit_count} | "
+            "{semantic_converged_truth_recall} | "
+            "{semantic_converged_false_unit_count} | "
+            "{semantic_ocr_geometry_merge_count} | "
+            "{semantic_display_truth_recall} | "
+            "{semantic_display_sibling_intrusion_unit_count} | "
+            "{semantic_boundary_ambiguous_count} | "
             "{semantic_needs_review_count} | {semantic_violation_count} | "
-            "{ocr_ms} | {llm_ms} | {total_ms} | {llm_request_count} |".format(
+            "{ocr_ms} | {llm_ms} | {convergence_ms} | {total_ms} | "
+            "{llm_request_count} |".format(
                 **item
             )
         )
