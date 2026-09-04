@@ -582,7 +582,9 @@ def run_page(
         ablations[mode] = {
             "unit_count": len(result["units"]),
             "truth_recall": mode_audit["truth_recall"],
+            "atomic_truth_recall": mode_audit["atomic_truth_recall"],
             "missed_truth_ids": mode_audit["missed_truth_ids"],
+            "atomic_missed_truth_ids": mode_audit["atomic_missed_truth_ids"],
             "sibling_intrusion_unit_ids": mode_audit["sibling_intrusion_unit_ids"],
         }
     _write_json(page_dir / "global-question-units.json", unit_result)
@@ -799,6 +801,11 @@ def run_page(
         "candidate_unit_count": len(candidate_ids),
         "candidate_oracle_truth_recall": audit["truth_recall"],
         "candidate_oracle_missed_truth_ids": audit["missed_truth_ids"],
+        "candidate_atomic_oracle_truth_recall": audit["atomic_truth_recall"],
+        "candidate_atomic_oracle_missed_truth_ids": audit[
+            "atomic_missed_truth_ids"
+        ],
+        "candidate_non_atomic_unit_count": len(audit["non_atomic_unit_ids"]),
         "false_unit_count": len(audit["false_unit_ids"]),
         "sibling_intrusion_unit_count": len(audit["sibling_intrusion_unit_ids"]),
         "candidate_multi_truth_unit_count": sum(
@@ -894,13 +901,15 @@ def _write_report(path: Path, summaries: list[dict]) -> None:
         "",
         "> 真值只参与后置审计；语义筛选启用时每页最多请求MiniMax一次，几何保护与安全回填均不增加LLM请求。",
         "",
-        "| 图片 | 真值 | 锚点 | 候选召回 | 候选误报 | 候选侵入 | 候选跨真值 | 模型召回 | 模型误报 | 模型侵入 | 模型跨真值 | 模型选中锚点 | 全选 | 几何召回 | 几何误报 | 几何侵入 | 几何跨真值 | 几何改写 | 几何安全召回 | 几何安全误报 | 收敛召回 | 收敛误报 | OCR空间合并 | 展示召回 | 展示侵入 | 边界歧义 | needs_review | 语义异常 | OCR(ms) | LLM(ms) | 本地收敛(ms) | 总耗时(ms) | LLM请求 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 图片 | 真值 | 锚点 | 候选召回 | 候选原子召回 | 非原子候选 | 候选误报 | 候选侵入 | 候选跨真值 | 模型召回 | 模型误报 | 模型侵入 | 模型跨真值 | 模型选中锚点 | 全选 | 几何召回 | 几何误报 | 几何侵入 | 几何跨真值 | 几何改写 | 几何安全召回 | 几何安全误报 | 收敛召回 | 收敛误报 | OCR空间合并 | 展示召回 | 展示侵入 | 边界歧义 | needs_review | 语义异常 | OCR(ms) | LLM(ms) | 本地收敛(ms) | 总耗时(ms) | LLM请求 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for item in summaries:
         lines.append(
             "| {label} | {truth_count} | {anchor_count} | "
-            "{candidate_oracle_truth_recall} | {false_unit_count} | "
+            "{candidate_oracle_truth_recall} | "
+            "{candidate_atomic_oracle_truth_recall} | "
+            "{candidate_non_atomic_unit_count} | {false_unit_count} | "
             "{sibling_intrusion_unit_count} | {candidate_multi_truth_unit_count} | "
             "{semantic_strict_truth_recall} | {semantic_strict_false_unit_count} | "
             "{semantic_strict_sibling_intrusion_unit_count} | "

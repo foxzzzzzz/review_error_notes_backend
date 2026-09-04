@@ -120,11 +120,18 @@ def test_cli_writes_local_artifacts_and_zero_llm_requests(tmp_path, monkeypatch)
     assert exit_code == 0
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     assert summary["llm_request_count"] == 0
+    page_summary = summary["page_summaries"][0]
+    assert "candidate_atomic_oracle_truth_recall" in page_summary
+    assert "candidate_atomic_oracle_missed_truth_ids" in page_summary
+    assert "candidate_non_atomic_unit_count" in page_summary
     assert (output / "page33/global-question-units.json").is_file()
     assert (output / "page33/anchor-unit-candidates.json").is_file()
     assert (output / "page33/question-unit-oracle-audit.json").is_file()
     assert (output / "page33/global-question-units-overlay.jpg").is_file()
     assert (output / "page33/anchor-unit-candidates-overlay.jpg").is_file()
+    report = (output / "comparison-report.md").read_text(encoding="utf-8")
+    assert "候选原子召回" in report
+    assert "非原子候选" in report
 
 
 def test_cli_repeat_outputs_have_identical_geometry(tmp_path, monkeypatch):

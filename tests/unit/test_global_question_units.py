@@ -247,3 +247,24 @@ def test_candidate_oracle_reports_identity_recall_without_mutating_units():
     assert audit["missed_truth_ids"] == ["T2"]
     assert audit["truth_recall"] == 0.5
     assert json.dumps(page_units, sort_keys=True) == original
+
+
+def test_atomic_oracle_rejects_unit_that_covers_two_truth_regions():
+    units = _load_module()
+    page_units = [
+        _unit("ATOMIC", [0.10, 0.10, 0.40, 0.40]),
+        _unit("WIDE", [0.10, 0.10, 0.90, 0.40]),
+    ]
+    truth = [
+        {"truth_id": "T1", "source_bbox_normalized": [0.12, 0.12, 0.38, 0.38]},
+        {"truth_id": "T2", "source_bbox_normalized": [0.62, 0.12, 0.88, 0.38]},
+    ]
+
+    audit = units.audit_fixed_units(page_units, truth, _config())
+
+    assert audit["matched_truth_ids"] == ["T1", "T2"]
+    assert audit["truth_recall"] == 1.0
+    assert audit["atomic_matched_truth_ids"] == ["T1"]
+    assert audit["atomic_missed_truth_ids"] == ["T2"]
+    assert audit["atomic_truth_recall"] == 0.5
+    assert audit["non_atomic_unit_ids"] == ["WIDE"]

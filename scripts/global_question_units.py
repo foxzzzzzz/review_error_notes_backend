@@ -516,9 +516,11 @@ def audit_fixed_units(
         for item in truth_regions
     ]
     matches_by_truth = {item["truth_id"]: [] for item in truth}
+    atomic_matches_by_truth = {item["truth_id"]: [] for item in truth}
     matches_by_unit = {}
     false_units = []
     sibling_intrusions = []
+    non_atomic_units = []
     for unit in selected_units:
         unit_id = str(unit["question_unit_id"])
         unit_bbox = validate_bbox(unit["unit_bbox"])
@@ -534,6 +536,10 @@ def audit_fixed_units(
         matches_by_unit[unit_id] = matched
         if not matched:
             false_units.append(unit_id)
+        elif len(matched) == 1 and len(overlaps) == 1:
+            atomic_matches_by_truth[matched[0]].append(unit_id)
+        else:
+            non_atomic_units.append(unit_id)
         if matched and any(truth_id not in matched for truth_id in overlaps):
             sibling_intrusions.append(unit_id)
     matched_truth_ids = sorted(
@@ -542,6 +548,12 @@ def audit_fixed_units(
     missed_truth_ids = sorted(set(matches_by_truth) - set(matched_truth_ids))
     duplicate_truth_ids = sorted(
         truth_id for truth_id, unit_ids in matches_by_truth.items() if len(unit_ids) > 1
+    )
+    atomic_matched_truth_ids = sorted(
+        truth_id for truth_id, unit_ids in atomic_matches_by_truth.items() if unit_ids
+    )
+    atomic_missed_truth_ids = sorted(
+        set(atomic_matches_by_truth) - set(atomic_matched_truth_ids)
     )
     return {
         "matched_truth_ids": matched_truth_ids,
@@ -552,6 +564,12 @@ def audit_fixed_units(
         "false_unit_ids": sorted(false_units),
         "duplicate_truth_ids": duplicate_truth_ids,
         "sibling_intrusion_unit_ids": sorted(set(sibling_intrusions)),
+        "atomic_matched_truth_ids": atomic_matched_truth_ids,
+        "atomic_missed_truth_ids": atomic_missed_truth_ids,
+        "atomic_truth_recall": round(
+            len(atomic_matched_truth_ids) / len(truth) if truth else 1.0, 6
+        ),
+        "non_atomic_unit_ids": sorted(non_atomic_units),
         "unit_truth_matches": matches_by_unit,
     }
 
