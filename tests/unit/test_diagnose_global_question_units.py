@@ -206,13 +206,6 @@ def test_semantic_prompt_uses_model_as_judge_without_allowing_geometry():
     assert "selected_visual_rank" in diagnostic.SEMANTIC_JUDGE_PROMPT
     assert "supplemental_wrong_candidates" in diagnostic.SEMANTIC_JUDGE_PROMPT
     assert "selected_unit_id" not in diagnostic.SEMANTIC_JUDGE_PROMPT
-    validity_gate = diagnostic.SEMANTIC_JUDGE_PROMPT.index("第一步：核验红叉真假")
-    rank_gate = diagnostic.SEMANTIC_JUDGE_PROMPT.index("第二步：选择题目候选")
-    boundary_gate = diagnostic.SEMANTIC_JUDGE_PROMPT.index("第三步：检查候选边界")
-    assert validity_gate < rank_gate < boundary_gate
-    assert "invalid或uncertain时selected_visual_rank必须为null" in (
-        diagnostic.SEMANTIC_JUDGE_PROMPT
-    )
 
 
 def test_semantic_visual_references_resolve_locally_without_exposing_unit_ids():
@@ -438,6 +431,8 @@ def test_cli_semantic_judge_makes_exactly_one_request(tmp_path, monkeypatch):
         "anchors": [
             {
                 "cross_id": 1,
+                "source": None,
+                "cv_confidence": None,
                 "allowed_visual_ranks": ["R1"],
             }
         ]

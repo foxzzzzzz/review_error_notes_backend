@@ -41,34 +41,20 @@ from global_question_unit_convergence import (
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("global_question_unit_config.json")
 
 
-SEMANTIC_JUDGE_PROMPT = """你是小学作业错题语义裁判。输入是本地CV为保证召回提供的候选，其中允许存在印刷红格、红圈边缘、文字笔画或批注线等误报。图片按C编号展示红叉锚点及其R1/R2/R3候选；红框是待核验锚点，绿色框是本地CV+OCR生成的题目单元。
+SEMANTIC_JUDGE_PROMPT = """你是小学作业错题语义裁判。图片按C编号展示红叉锚点及其R1/R2/R3候选；红框是待核验锚点，绿色框是本地CV+OCR生成的题目单元。
 
-你的任务不是画框。必须对每个C编号独立观察，并严格按以下顺序判断；不能根据编号顺序、候选数量或“来自CV”推断真假，也不能采用全部默认确认策略。
+你的任务不是画框，而是理解批改语义：核验红叉真假、判断红叉属于哪道题、结合学生实际答题判断是否为错题，并检查候选单元是否完整且没有侵入兄弟题。
 
-第一步：核验红叉真假
-- valid：红框内明确看到两条独立的红色斜线相交形成叉。
-- invalid：只是印刷红格、红圈弧线、勾、下划线、文字笔画、批注线或其他不相交结构。
-- uncertain：图片细节不足、遮挡严重或无法确认是否存在两条相交斜线。
-- invalid或uncertain时selected_visual_rank必须为null；uncertain时question_status也必须为uncertain。
-
-第二步：选择题目候选
-- 只有红叉明确为valid，且结合学生实际答题可判为错题时，才选择selected_visual_rank并令question_status为incorrect。
-- selected_visual_rank只能从该cross_id的allowed_visual_ranks中选择；图内R编号与返回值完全一致，不能跨锚点选择。
-- 红叉是主要证据；附近红圈、老师批注、改正痕迹和答案不匹配只能辅助确认红叉归属。印刷红格或红圈不能单独证明错题。
-- 优先选择完整覆盖这一道题及其作答、同时范围最小的候选；不要为了包含红圈或批注而扩大到兄弟题。
-- 真红叉存在但无法可靠归属题目时，selected_visual_rank返回null，question_status返回uncertain。
-
-第三步：检查候选边界
-- complete：候选完整覆盖一道独立作答单元且没有包含兄弟题。
-- too_narrow：候选缺少本题题干、作答或必要上下文。
-- sibling_intrusion：候选同时包含左右或上下兄弟题。
-- uncertain：无法可靠判断边界。候选不合格时必须如实返回，不能一律填写complete。
-
-输出要求：
+要求：
 1. 每个输入cross_id必须且只能返回一次，不得遗漏、增加、合并或重排。
-2. supplemental_wrong_candidates只用于补充本页明显错题但未被逐锚点结果选中的已有cross_id和visual_rank组合；没有则返回空数组。
-3. evidence只能从red_cross、red_circle、teacher_correction、answer_mismatch、student_correction、insufficient_detail、other中选择。
-4. 不得返回或生成任何bbox、坐标、新编号、题目文字、解释或Markdown，只返回严格JSON。
+2. selected_visual_rank只能从该cross_id的allowed_visual_ranks中选择；图内R编号与返回值完全一致，不能跨锚点选择。
+3. 红叉是主要证据；附近红圈、老师批注、改正痕迹和答案不匹配可以辅助判断，但印刷红格不能单独证明错题。
+4. anchor_validity分别为valid、invalid、uncertain；question_status分别为incorrect、correct、uncertain。不得采用全部默认确认策略，必须逐个检查红框内是否有两条相交红色斜线及实际答题情况。
+5. boundary_fit分别为complete、too_narrow、sibling_intrusion、uncertain。绿色框应包含一整道独立作答单元，不能把左右或上下兄弟题一起算入。
+6. 只有明确对应错题时填写selected_visual_rank；不是红叉或不是错题时返回null，无法判断时使用uncertain并返回null。
+7. supplemental_wrong_candidates用于补充本页明显错题但未被逐锚点结果选中的候选，只能返回输入中已有的cross_id和visual_rank组合；没有则返回空数组。
+8. evidence只能从red_cross、red_circle、teacher_correction、answer_mismatch、student_correction、insufficient_detail、other中选择。
+9. 不得返回或生成任何bbox、坐标、新编号、题目文字、解释或Markdown，只返回严格JSON。
 
 返回格式：{"decisions":[{"cross_id":0,"anchor_validity":"valid","selected_visual_rank":"R1","question_status":"incorrect","boundary_fit":"complete","evidence":["red_cross","answer_mismatch"],"confidence":0.93}],"supplemental_wrong_candidates":[{"cross_id":2,"visual_rank":"R2"}]}。
 
@@ -644,6 +630,8 @@ def run_page(
             "anchors": [
                 {
                     "cross_id": int(anchor["cross_id"]),
+                    "source": anchor.get("source"),
+                    "cv_confidence": anchor.get("confidence"),
                     "allowed_visual_ranks": [
                         f"R{item['rank']}"
                         for item in mapping["anchor_candidates"].get(
