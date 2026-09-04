@@ -3874,6 +3874,156 @@ def test_main_compare_cross_anchor_loads_inputs_and_forwards_experiment_flag(
     assert manifest["cross_anchor_replay_from"] == str(replay_root.resolve())
 
 
+def test_main_cross_anchor_confirmation_only_forwards_standalone_mode(
+    tmp_path,
+    monkeypatch,
+):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.jpg"
+    Image.new("RGB", (20, 20), "white").save(source)
+    truth_path = tmp_path / "truth.json"
+    truth_path.write_text(
+        json.dumps(
+            {
+                "pages": {
+                    "sample": {
+                        "regions": [
+                            {
+                                "truth_id": "T1",
+                                "source_bbox_normalized": [0.1, 0.1, 0.3, 0.3],
+                            }
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "output"
+    received = []
+
+    def fake_run_case(**kwargs):
+        received.append(kwargs)
+        summary = diagnostic.build_summary(
+            label=kwargs["label"],
+            expected_count=1,
+            cv={"raw_component_count": 0, "evidence_group_count": 0},
+            pipeline=None,
+            cross_anchor_experiment={"content_ocr_status": "not_run"},
+        )
+        summary.update(
+            {
+                "error": None,
+                "stable_experiment_error": None,
+                "cross_anchor_experiment_error": None,
+                "holistic_v3_experiment_error": None,
+            }
+        )
+        return summary
+
+    monkeypatch.setattr(diagnostic, "run_case", fake_run_case)
+    monkeypatch.setattr(
+        diagnostic.sys,
+        "argv",
+        [
+            "diagnose_vision_pipeline.py",
+            f"sample={source}",
+            "--cross-anchor-confirmation-only",
+            "--cross-cv-config",
+            str(BACKEND_ROOT / "scripts" / "cv_cross_experiment_config.json"),
+            "--truth-regions",
+            str(truth_path),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert diagnostic.main() == 0
+    assert received[0]["cv_only"] is False
+    assert received[0]["compare_cross_anchor"] is True
+    assert received[0]["cross_anchor_confirmation_only"] is True
+    manifest = json.loads((output / "manifest.json").read_text("utf-8"))
+    assert manifest["cross_anchor_confirmation_only"] is True
+
+
+def test_cross_anchor_confirmation_only_writes_anchors_without_calling_llm2(
+    tmp_path,
+):
+    diagnostic = _load_script_module()
+    source = tmp_path / "page.jpg"
+    Image.new("RGB", (200, 200), "white").save(source)
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+    candidate_overlay = tmp_path / "candidate-overlay.jpg"
+    Image.new("RGB", (200, 200), "white").save(candidate_overlay)
+    calls = []
+
+    class FakeClient:
+        def verify_cross_candidates(self, _image_path, candidates):
+            calls.append("verify")
+            return diagnostic.CrossCandidateVerificationResult.model_validate(
+                {
+                    "verdicts": [
+                        {
+                            "candidate_id": candidate["candidate_id"],
+                            "disposition": "confirmed",
+                            "confidence": 0.95,
+                        }
+                        for candidate in candidates
+                    ]
+                }
+            )
+
+        def scan_independent_crosses(self, _image_path):
+            calls.append("scan")
+            return diagnostic.IndependentCrossScanResult(crosses=[])
+
+        def locate_cross_anchored_questions(self, *_args):
+            raise AssertionError("confirmation-only mode must not call LLM2")
+
+    config = json.loads(
+        (BACKEND_ROOT / "scripts" / "cv_cross_experiment_config.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    summary = diagnostic.run_cross_anchor_experiment(
+        image_path=source,
+        case_dir=case_dir,
+        client=FakeClient(),
+        cv_candidates=[
+            {
+                "candidate_id": 0,
+                "bbox": [0.1, 0.1, 0.2, 0.2],
+                "center": [0.15, 0.15],
+                "min_arm_density": 0.3,
+                "center_density": 0.9,
+            }
+        ],
+        candidate_overlay_path=candidate_overlay,
+        truth_regions=[
+            {"truth_id": "T1", "source_bbox_normalized": [0.1, 0.1, 0.2, 0.2]}
+        ],
+        config=config,
+        subject_hint="chinese",
+        confirmation_only=True,
+    )
+
+    assert calls == ["verify"] * config["cross_anchor_llm1_verification_runs"] + [
+        "scan"
+    ]
+    assert summary["mode"] == "confirmation_only"
+    assert summary["llm1_truth_recall"] == 1.0
+    assert summary["llm_request_count"] == (
+        config["cross_anchor_llm1_verification_runs"] + 1
+    )
+    experiment = case_dir / "cross-anchor-experiment"
+    assert (experiment / "confirmed-crosses.json").is_file()
+    assert (experiment / "confirmed-crosses-overlay.jpg").is_file()
+    assert (experiment / "summary.json").is_file()
+    assert (experiment / "timings.json").is_file()
+    assert not list(experiment.glob("llm2-*"))
+
+
 def _anchor_preservation_config():
     return {
         "red_min_channel": 60,

@@ -4085,6 +4085,7 @@ def run_case(
     truth_regions: list[dict] | None = None,
     compare_stable_events: bool = False,
     compare_cross_anchor: bool = False,
+    cross_anchor_confirmation_only: bool = False,
     holistic_v3_only: bool = False,
     holistic_v3_long_edge: int | None = None,
     cross_anchor_profile: str = "baseline",
@@ -4135,7 +4136,51 @@ def run_case(
     holistic_v3_experiment_error = None
     holistic_v3_recorder = None
     error = None
-    if not cv_only and not holistic_v3_only:
+    if cross_anchor_confirmation_only:
+        recorder = ExchangeRecorder(case_dir)
+        client = MiniMaxVisionClient.from_settings()
+        client.diagnostic_event_sink = recorder
+        recording_client = RecordingVisionClient(client, recorder)
+        phase_started = time.perf_counter()
+        try:
+            if cross_cv_config is None or truth_regions is None:
+                raise ValueError(
+                    "cross-anchor confirmation requires CV config and truth regions"
+                )
+            cv_experiment_dir = case_dir / "cv-cross-experiment"
+            cv_candidates = json.loads(
+                (cv_experiment_dir / "candidates.json").read_text(encoding="utf-8")
+            )
+            cross_anchor_experiment = run_cross_anchor_experiment(
+                image_path=image_path,
+                case_dir=case_dir,
+                client=recording_client,
+                cv_candidates=cv_candidates,
+                candidate_overlay_path=(
+                    cv_experiment_dir / "candidates-overlay.jpg"
+                ),
+                truth_regions=truth_regions,
+                config=cross_cv_config,
+                subject_hint=subject_hint,
+                profile=cross_anchor_profile,
+                confirmation_only=True,
+            )
+        except Exception as exc:
+            cross_anchor_experiment_error = {
+                "type": type(exc).__name__,
+                "code": getattr(exc, "code", None),
+                "message": str(exc),
+                "diagnostic": getattr(exc, "diagnostic", None),
+            }
+            _write_json(
+                case_dir / "cross-anchor-experiment-error.json",
+                cross_anchor_experiment_error,
+            )
+        finally:
+            timings_ms["cross_anchor_experiment"] = round(
+                (time.perf_counter() - phase_started) * 1000, 2
+            )
+    if not cv_only and not holistic_v3_only and not cross_anchor_confirmation_only:
         recorder = ExchangeRecorder(case_dir)
         client = MiniMaxVisionClient.from_settings()
         client.diagnostic_event_sink = recorder
@@ -4379,6 +4424,7 @@ def run_cross_anchor_experiment(
     subject_hint: str | None,
     profile: str = "baseline",
     llm1_snapshot_dir: Path | None = None,
+    confirmation_only: bool = False,
 ) -> dict:
     if profile not in CROSS_ANCHOR_PROFILES:
         raise ValueError(f"unknown cross-anchor profile: {profile}")
@@ -4702,6 +4748,91 @@ def run_cross_anchor_experiment(
     timings_ms["anchor_build_and_audit"] = round(
         (time.perf_counter() - phase_started) * 1000, 2
     )
+
+    if confirmation_only:
+        timings_ms["total"] = round(
+            (time.perf_counter() - experiment_started) * 1000, 2
+        )
+        disposition_counts = {
+            disposition: sum(
+                verdict.disposition == disposition
+                for verdict in verification.verdicts
+            )
+            for disposition in ("confirmed", "rejected", "uncertain")
+        }
+        summary = {
+            "mode": "confirmation_only",
+            "profile": profile,
+            "llm1_input_mode": "replay" if llm1_snapshot is not None else "live",
+            "llm1_snapshot_source": (
+                llm1_snapshot["source"] if llm1_snapshot is not None else None
+            ),
+            "cv_candidate_count": len(cv_candidates),
+            "llm1_verification_run_count": verification_run_count,
+            "llm1_unstable_candidate_count": len(
+                stability_audit["unstable_candidate_ids"]
+            ),
+            "llm1_confirmed_cross_count": len(anchors),
+            "llm1_cv_confirmed_cross_count": sum(
+                anchor["source"] == "cv_confirmed" for anchor in anchors
+            ),
+            "llm1_cv_uncertain_retained_count": sum(
+                anchor["source"] == "cv_uncertain" for anchor in anchors
+            ),
+            "llm1_cv_high_score_retained_count": sum(
+                anchor["source"] == "cv_high_score_retained" for anchor in anchors
+            ),
+            "llm1_cv_rejected_retained_count": sum(
+                anchor["source"] == "cv_rejected_retained" for anchor in anchors
+            ),
+            "llm1_fallback_cross_count": sum(
+                anchor["source"] == "llm_fallback" for anchor in anchors
+            ),
+            "llm1_fallback_verified_count": len(confirmed_fallback_ids),
+            "llm1_fallback_uncertain_retained_count": len(uncertain_fallback_ids),
+            "llm1_fallback_generates_anchors": fallback_generates_anchors,
+            "llm1_independent_rescue_count": (
+                rescue_audit["rescued_count"] if rescue_audit is not None else 0
+            ),
+            "llm1_independent_scan_count": len(independent_scan.crosses),
+            "llm1_independent_supported_count": sum(
+                anchor["independent_scan_supported"] for anchor in anchors
+            ),
+            "llm1_rejected_candidate_count": disposition_counts["rejected"],
+            "llm1_uncertain_candidate_count": disposition_counts["uncertain"],
+            "llm1_candidate_audit_valid": candidate_audit["valid"],
+            "llm1_local_geometry_merge_count": len(
+                anchor_merge_audit["merged_anchors"]
+            ),
+            "llm1_truth_matched_count": llm1_truth_comparison[
+                "matched_truth_count"
+            ],
+            "llm1_truth_recall": llm1_truth_comparison["truth_recall"],
+            "llm1_model_confirmed_truth_matched_count": (
+                llm1_model_confirmed_truth_comparison["matched_truth_count"]
+            ),
+            "llm1_model_confirmed_truth_recall": (
+                llm1_model_confirmed_truth_comparison["truth_recall"]
+            ),
+            "llm1_false_cross_count": len(
+                llm1_truth_comparison["false_candidate_ids"]
+            ),
+            "llm1_duplicate_truth_candidate_count": len(
+                llm1_truth_multiplicity
+            ),
+            "llm_request_count": (
+                0
+                if llm1_snapshot is not None
+                else verification_run_count
+                + 1
+                + (1 if fallback_candidates else 0)
+            ),
+            "timings_ms": timings_ms,
+            "content_ocr_status": "not_run",
+        }
+        _write_json(experiment_dir / "timings.json", timings_ms)
+        _write_json(experiment_dir / "summary.json", summary)
+        return summary
 
     batch_size = int(config["cross_anchor_llm2_batch_size"])
     llm2_run_count = int(config.get("cross_anchor_llm2_localization_runs", 1))
@@ -6228,6 +6359,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--cross-anchor-confirmation-only",
+        action="store_true",
+        help=(
+            "run CV candidate generation and LLM1 cross confirmation only; "
+            "skip the production pipeline and LLM2 localization"
+        ),
+    )
+    parser.add_argument(
         "--cross-anchor-profile",
         choices=(
             "baseline",
@@ -6283,11 +6422,25 @@ def main() -> int:
     elif args.holistic_v3_long_edge is not None:
         parser.error("--holistic-v3-long-edge requires --holistic-v3-only")
 
-    if args.compare_cross_anchor:
+    if args.cross_anchor_confirmation_only:
+        if args.cv_only or args.cv_cross_only:
+            parser.error(
+                "--cross-anchor-confirmation-only cannot be combined with CV-only modes"
+            )
+        if args.holistic_v3_only or args.compare_stable_events:
+            parser.error(
+                "--cross-anchor-confirmation-only cannot be combined with other experiments"
+            )
+        if args.compare_cross_anchor:
+            parser.error(
+                "--cross-anchor-confirmation-only already selects the cross-anchor experiment"
+            )
+
+    if args.compare_cross_anchor or args.cross_anchor_confirmation_only:
         if not args.cross_cv_config:
-            parser.error("--compare-cross-anchor requires --cross-cv-config")
+            parser.error("cross-anchor experiment requires --cross-cv-config")
         if not args.truth_regions:
-            parser.error("--compare-cross-anchor requires --truth-regions")
+            parser.error("cross-anchor experiment requires --truth-regions")
     elif args.cross_anchor_replay_from:
         parser.error(
             "--cross-anchor-replay-from requires --compare-cross-anchor"
@@ -6318,7 +6471,12 @@ def main() -> int:
         parser.error(str(exc))
     cross_cv_config = None
     truth_by_label = {}
-    if args.cv_cross_only or args.compare_cross_anchor or args.holistic_v3_only:
+    if (
+        args.cv_cross_only
+        or args.compare_cross_anchor
+        or args.cross_anchor_confirmation_only
+        or args.holistic_v3_only
+    ):
         try:
             loader = (
                 load_holistic_v3_inputs
@@ -6365,6 +6523,7 @@ def main() -> int:
             "holistic_v3_long_edge": holistic_v3_long_edge,
             "compare_stable_events": args.compare_stable_events,
             "compare_cross_anchor": args.compare_cross_anchor,
+            "cross_anchor_confirmation_only": args.cross_anchor_confirmation_only,
             "cross_anchor_profile": args.cross_anchor_profile,
             "cross_anchor_replay_from": (
                 str(cross_anchor_replay_from)
@@ -6391,7 +6550,10 @@ def main() -> int:
             cross_cv_config=cross_cv_config,
             truth_regions=truth_by_label.get(label),
             compare_stable_events=args.compare_stable_events,
-            compare_cross_anchor=args.compare_cross_anchor,
+            compare_cross_anchor=(
+                args.compare_cross_anchor or args.cross_anchor_confirmation_only
+            ),
+            cross_anchor_confirmation_only=args.cross_anchor_confirmation_only,
             holistic_v3_only=args.holistic_v3_only,
             holistic_v3_long_edge=holistic_v3_long_edge,
             cross_anchor_profile=args.cross_anchor_profile,
