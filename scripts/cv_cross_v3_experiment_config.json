@@ -1,0 +1,28 @@
+{
+  "_descriptions": {
+    "background_percentile": "按整页各颜色通道的该百分位估计纸张与光照底色，用于归一化暖色偏色。",
+    "normalized_red_intersection_threshold": "重定位相交点时参与搜索的归一化红色优势下限。",
+    "intersection_candidate_limit": "每个baseline候选框内最多检查的相交点数量；限制本地几何计算耗时。",
+    "intersection_min_spacing_ratio": "相交点候选之间的最小间距，占分析图最长边比例；避免重复检查同一小片红色像素。",
+    "continuity_inner_radius_ratio": "相交斜线连续性检查跳过的中心半径，占分析图最长边比例。",
+    "continuity_outer_radius_ratio": "相交斜线连续性检查的最远半径，占分析图最长边比例。",
+    "continuity_band_ratio": "连续性检查允许斜线偏离采样射线的带宽，占分析图最长边比例。",
+    "continuity_angle_min_degrees": "第一条斜线搜索的最小角度；第二条斜线自动使用其镜像角度区间。",
+    "continuity_angle_max_degrees": "第一条斜线搜索的最大角度；第二条斜线自动使用其镜像角度区间。",
+    "continuity_angle_step_degrees": "斜线方向搜索步长。",
+    "continuity_score_weight": "重定位后双斜臂连续性在综合色度质量分中的权重。",
+    "minimum_candidate_quality_score": "保留候选所需的综合色度质量分下限；分数=归一化红色99分位+连续性权重×最佳双斜臂连续性。"
+  },
+  "background_percentile": 90,
+  "normalized_red_intersection_threshold": 0.03,
+  "intersection_candidate_limit": 12,
+  "intersection_min_spacing_ratio": 0.005,
+  "continuity_inner_radius_ratio": 0.006,
+  "continuity_outer_radius_ratio": 0.03,
+  "continuity_band_ratio": 0.002,
+  "continuity_angle_min_degrees": 20,
+  "continuity_angle_max_degrees": 70,
+  "continuity_angle_step_degrees": 5,
+  "continuity_score_weight": 0.5,
+  "minimum_candidate_quality_score": 0.3
+}
