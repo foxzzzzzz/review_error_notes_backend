@@ -1,0 +1,10 @@
+{
+  "status": "visual-draft-not-acceptance-ground-truth",
+  "coordinate_system": "pixels inside the original manifest question crop",
+  "notes": "仅在查看原裁图后标注，用于诊断及待复核的能力样本。禁止反馈给CV检测或阈值优化。",
+  "regions": [
+    {"question_id": "0905_page36__0905_page36-T3", "bbox": [320, 192, 423, 306]},
+    {"question_id": "0905_page39__0905_page39-T3", "bbox": [25, 20, 140, 199]},
+    {"question_id": "0905_page40__0905_page40-T3", "bbox": [20, 20, 132, 180]}
+  ]
+}

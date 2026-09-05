@@ -1,0 +1,78 @@
+{
+  "_descriptions": {
+    "sources": "相对数据根目录的人工区域文件与原图路径模板；label来自真值文件，不能用作检测规则。",
+    "joint_recall_min": "区域、原始内容、正确答案与解析均正确的最终题目召回下限。",
+    "false_discovery_max_exclusive": "误报加重复占全部输出的比例必须严格小于该值。",
+    "processing_limit_ms": "上传至保存扣除排队的最终处理上限毫秒。",
+    "cv_repeats": "同机每页每种CV路径正式计时次数；交替执行以降低顺序偏差。",
+    "cv_warmups": "每页每种CV路径正式计时前的预热次数，单独记录。",
+    "cv_min_speedup": "逐页速度比的中位数最低值。",
+    "cv_max_regression_ratio": "任何页加速后中位时间相对参考路径允许的最大比例。",
+    "opencv_threads": "本地可复现CV基准使用的OpenCV线程数。",
+    "ocr_max_edge": "仅生成审核旁证的整页OCR最长边。",
+    "preview_max_edge": "审核图像预览的最长边，不影响原始裁图。",
+    "content_rounds": "服务器内容能力实验冻结输入后的独立重复次数。",
+    "content_batch_size": "服务器每次内容请求最多题数；不得跨页混批。",
+    "content_timeout_seconds": "服务器单次内容请求超时秒；内容上限实验不是生产30秒验收。",
+    "content_image_max_edge": "服务器单张编号拼图上传的最长边像素。",
+    "content_tile_width": "内容拼图每格宽度像素。",
+    "content_tile_height": "内容拼图每格高度像素（含编号）。",
+    "content_label_height": "内容拼图编号栏高度像素。",
+    "jpeg_quality": "诊断图片JPEG质量。",
+    "content_oracle_target": "人工完整裁图下内容、答案和解析联合正确率的目标。",
+    "content_pilot_labels": "内容能力首轮历史六页，共28题；已是回归集。",
+    "content_packing": "single为单题原尺寸上限实验；batch为每页拼图吞吐实验，不能混淆两种结果。",
+    "cross_context_scale": "真假叉审核样本相对原始候选框的上下文放大倍数，不影响检测。",
+    "boundary_full_coverage_min": "全候选题框几何上限审计的已标错题覆盖率下限；不能取代人工完整语义审核。",
+    "boundary_sibling_intrusion_min": "候选覆盖另一已标错题面积达此比例则计邻题侵入；未标正确题需人工审核。"
+  },
+  "sources": [
+    {
+      "truth": "truth-analysis-page33-35/truth-regions.json",
+      "image": "truth-analysis-page33-35/{label}-source.jpg"
+    },
+    {
+      "truth": "truth-analysis-page5-7-20/truth-regions.json",
+      "image": "{label}.jpg"
+    },
+    {
+      "truth": "0904pic/truth-regions.json",
+      "image": "0904pic/raw/{label}.jpg"
+    },
+    {
+      "truth": "0905pic/truth-regions.json",
+      "image": "0905pic/raw/{label}.jpg"
+    }
+  ],
+  "joint_recall_min": 0.95,
+  "false_discovery_max_exclusive": 0.1,
+  "processing_limit_ms": 30000,
+  "cv_repeats": 3,
+  "cv_warmups": 1,
+  "cv_min_speedup": 3,
+  "cv_max_regression_ratio": 1.1,
+  "opencv_threads": 1,
+  "ocr_max_edge": 1600,
+  "preview_max_edge": 900,
+  "content_rounds": 3,
+  "content_batch_size": 6,
+  "content_timeout_seconds": 20,
+  "content_image_max_edge": 2048,
+  "content_tile_width": 680,
+  "content_tile_height": 460,
+  "content_label_height": 40,
+  "jpeg_quality": 90,
+  "content_oracle_target": 0.98,
+  "content_pilot_labels": [
+    "page33",
+    "page34",
+    "page35",
+    "page5",
+    "page7",
+    "page20"
+  ],
+  "content_packing": "single",
+  "cross_context_scale": 3,
+  "boundary_full_coverage_min": 0.99,
+  "boundary_sibling_intrusion_min": 0.1
+}

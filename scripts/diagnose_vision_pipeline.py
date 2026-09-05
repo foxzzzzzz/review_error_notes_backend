@@ -645,7 +645,7 @@ def _cross_arm_offsets(
     }
 
 
-def detect_red_cross_candidates(image_path: Path, config: dict) -> dict:
+def detect_red_cross_candidates(image_path: Path, config: dict, *, vectorized: bool = False) -> dict:
     with Image.open(image_path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
         analysis_max_edge = int(config["analysis_max_edge"])
@@ -705,7 +705,14 @@ def detect_red_cross_candidates(image_path: Path, config: dict) -> dict:
     center_min_density = float(config["center_min_density"])
 
     scored_centers = []
-    for center_y, center_x in np.argwhere(red_mask):
+    if vectorized:
+        from scripts.red_cross_scoring import score_cross_centers
+
+        scored_centers = score_cross_centers(
+            red_mask, geometry_mask, arm_offsets, center_radius,
+            center_min_density, arm_min_density,
+        )
+    for center_y, center_x in ([] if vectorized else np.argwhere(red_mask)):
         left = max(0, center_x - center_radius)
         top = max(0, center_y - center_radius)
         right = min(width, center_x + center_radius + 1)
