@@ -1,0 +1,49 @@
+{
+  "rapidocr_version": "3.9.1",
+  "rounds": 3,
+  "warmup_calls": 1,
+  "text_score": 0.0,
+  "use_cls": false,
+  "models": [
+    {
+      "name": "v5_mobile",
+      "path": "models/rapidocr/ch_PP-OCRv5_rec_mobile.onnx",
+      "sha256": "5825fc7ebf84ae7a412be049820b4d86d77620f204a041697b0494669b1742c5",
+      "model_type": "mobile",
+      "ocr_version": "PP-OCRv5"
+    },
+    {
+      "name": "v5_server",
+      "path": "models/rapidocr/ch_PP-OCRv5_rec_server.onnx",
+      "sha256": "e09385400eaaaef34ceff54aeb7c4f0f1fe014c27fa8b9905d4709b65746562a",
+      "model_type": "server",
+      "ocr_version": "PP-OCRv5"
+    },
+    {
+      "name": "v6_small",
+      "path": "../tmp/backend-py312/Lib/site-packages/rapidocr/models/PP-OCRv6_rec_small.onnx",
+      "sha256": "6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884",
+      "model_type": "small",
+      "ocr_version": "PP-OCRv6"
+    }
+  ],
+  "support_models": {
+    "det": {
+      "path": "models/rapidocr/ch_PP-OCRv5_det_mobile.onnx",
+      "sha256": "4d97c44a20d30a81aad087d6a396b08f786c4635742afc391f6621f5c6ae78ae"
+    },
+    "cls": {
+      "path": "models/rapidocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+      "sha256": "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c"
+    }
+  },
+  "_descriptions": {
+    "models": "仅对照本地文字识别器；相对后端根目录的固定路径，执行前逐个SHA256核验；禁止运行时自动下载/切换模型。模型文件不提交Git。",
+    "support_models": "沿用已有检测/方向模型路径，直接识别关闭检测及方向，不改图块；显式路径防止库自动选择/下载。",
+    "rapidocr_version": "固定已安装版本，与历史基线一致。",
+    "rounds": "每个模型每块重复3轮，仅衡量稳定性；不按重复数扩充独立样本量。",
+    "warmup_calls": "每模型预热次数，初始化和预热另计。",
+    "text_score": "保留全部旁证，不以高分证明字形/声调正确。",
+    "use_cls": "与基线一致，关闭方向分类。"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "rounds": 3,
+  "margin": 16,
+  "gap": 16,
+  "label_height": 28,
+  "max_edge": 2048,
+  "timeout_seconds": 20,
+  "expected_endpoint_host": "api.minimaxi.com",
+  "_descriptions": {
+    "rounds": "10题各3轮，共30次MiniMax视觉请求；重复只检查稳定性，不当作30题独立样本。",
+    "margin": "无损PNG画布外边距像素，仅添加白边，不改变原答像素。",
+    "gap": "格子之间白色间隔像素。",
+    "label_height": "原答格外编号栏高度像素，编号不覆盖原笔迹。",
+    "max_edge": "画布最大边像素，超出则停止，不静默缩小原图。",
+    "timeout_seconds": "单次请求超时；不重试，保留失败，不代表整页30秒验收。",
+    "expected_endpoint_host": "只使用已核实的MINIMAX_*视觉主机；不发送独立文本服务的thinking参数。"
+  }
+}

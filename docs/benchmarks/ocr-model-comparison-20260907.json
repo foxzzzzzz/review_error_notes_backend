@@ -1,0 +1,108 @@
+{
+  "development": {
+    "v5_mobile": {
+      "written": {
+        "matches": 18,
+        "observations": 21
+      },
+      "blank": {
+        "matches": 12,
+        "observations": 12
+      },
+      "cue": {
+        "matches": 24,
+        "observations": 33
+      },
+      "joint_questions": 9,
+      "question_observations": 18,
+      "failed": 0,
+      "mean_ms": 14.773662121032514,
+      "max_ms": 25.34409999498166
+    },
+    "v5_server": {
+      "written": {
+        "matches": 21,
+        "observations": 21
+      },
+      "blank": {
+        "matches": 3,
+        "observations": 12
+      },
+      "cue": {
+        "matches": 27,
+        "observations": 33
+      },
+      "joint_questions": 9,
+      "question_observations": 18,
+      "failed": 0,
+      "mean_ms": 473.5725863637609,
+      "max_ms": 549.5319999972708
+    },
+    "v6_small": {
+      "written": {
+        "matches": 21,
+        "observations": 21
+      },
+      "blank": {
+        "matches": 0,
+        "observations": 12
+      },
+      "cue": {
+        "matches": 27,
+        "observations": 33
+      },
+      "joint_questions": 9,
+      "question_observations": 18,
+      "failed": 0,
+      "mean_ms": 13.176839393991306,
+      "max_ms": 25.867700001981575
+    }
+  },
+  "validation": {
+    "v5_mobile": {
+      "written": {
+        "matches": 12,
+        "observations": 15
+      },
+      "blank": {
+        "matches": 3,
+        "observations": 9
+      },
+      "cue": {
+        "matches": 18,
+        "observations": 24
+      },
+      "joint_questions": 6,
+      "question_observations": 12,
+      "failed": 0,
+      "mean_ms": 13.196268750258847,
+      "max_ms": 15.819200001715217
+    },
+    "v6_small": {
+      "written": {
+        "matches": 6,
+        "observations": 15
+      },
+      "blank": {
+        "matches": 0,
+        "observations": 9
+      },
+      "cue": {
+        "matches": 21,
+        "observations": 24
+      },
+      "joint_questions": 0,
+      "question_observations": 12,
+      "failed": 0,
+      "mean_ms": 12.584941666924957,
+      "max_ms": 17.10550000279909
+    }
+  },
+  "baseline_66_outputs_reproduced": true,
+  "development_questions": 6,
+  "validation_questions": 4,
+  "all_predictions_stable_across_three_rounds": true,
+  "decision": "Reject direct model replacement and hybrid based on v6 nonblank reading; prepare MiniMax blind-original capability test only.",
+  "api_requests_locally": 0,
+  "model_download": "One public v5_server ONNX download; hash verified; no user images transmitted."
+}
