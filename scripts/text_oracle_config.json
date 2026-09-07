@@ -1,0 +1,13 @@
+{
+  "rounds": 3,
+  "timeout_seconds": 20,
+  "temperature": 0.3,
+  "max_tokens": 2048,
+  "_descriptions": {
+    "rounds": "6题文本解题重复轮数，6×3=18次实际HTTP尝试，单独统计。",
+    "timeout_seconds": "文本请求超时秒，失败不重试；仍非完整生产30秒验收。",
+    "temperature": "请求采样温度；与当前生产文本调用默认值一致。",
+    "max_tokens": "单次输出token上限；只输出答案与简短可核验错因，不请求推理过程。"
+  },
+  "_model_source": "运行时读取服务器现有LLM_MODEL/LLM_API_BASE/LLM_API_KEY；模型名与主机名记录在结果中，配置不保存密钥。"
+}

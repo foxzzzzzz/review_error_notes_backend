@@ -78,7 +78,7 @@ def pixel_box(box, size):
 
 def ordered_requests(prepared, round_index):
     requests = prepared['requests']
-    if (prepared['scope'] == 'content_context_ab'
+    if (prepared['scope'] in ('content_context_ab', 'content_partition_bc')
             and prepared['config']['counterbalance_arms'] and round_index % 2):
         return [request for index in range(0, len(requests), 2)
                 for request in reversed(requests[index:index + 2])]
@@ -91,10 +91,14 @@ def validate_pairs(prepared):
         raise ValueError('missing pair or duplicate request IDs')
     for index in range(0, len(requests), 2):
         a, b = requests[index:index + 2]
-        if (a.get('arm'), b.get('arm'), a.get('response_schema'), b.get('response_schema')) != (
-                'A', 'B', 'full_content_v2', 'transcription_v2'):
+        partition = prepared['scope'] == 'content_partition_bc'
+        expected = ('B', 'C', 'transcription_v2', 'transcription_v2') if partition else (
+            'A', 'B', 'full_content_v2', 'transcription_v2')
+        if (a.get('arm'), b.get('arm'), a.get('response_schema'), b.get('response_schema')) != expected:
             raise ValueError('invalid paired arm/schema order')
-        for key in ('image', 'image_sha256', 'context_sha256', 'expected_ids', 'expected_slot_ids'):
+        shared_keys = ('source_image_sha256', 'source_context_sha256') if partition else (
+            'image', 'image_sha256', 'context_sha256')
+        for key in shared_keys + ('expected_ids', 'expected_slot_ids'):
             if key not in a or key not in b or a[key] != b[key]:
                 raise ValueError('paired inputs differ: ' + key)
         if set(a['expected_slot_ids']) != set(a['expected_ids']):

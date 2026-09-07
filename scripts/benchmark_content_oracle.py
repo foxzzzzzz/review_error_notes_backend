@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.prepare_convergence_dataset import load_config, sha256, write_json
 from scripts.content_context_experiment import SCHEMAS, ordered_requests, validate_pairs, validate_slots
+from scripts.experiment_telemetry import error_details, instrument_vision, runtime_metadata, utc_now
 
 
 class ContentItem(BaseModel):
@@ -50,7 +51,8 @@ def validate_ids(result, expected):
 
 def execute_request(client, payload, expected, result_model, expected_slot_ids=None):
     started = time.perf_counter()
-    result = {'expected_ids': expected, 'items': [], 'status': 'failed', 'review_status': 'pending'}
+    result = {'expected_ids': expected, 'items': [], 'status': 'failed', 'review_status': 'pending',
+              'started_at_utc': utc_now()}
     try:
         parsed = client._request(payload, result_model, {'operation': 'content_oracle'})
         validate_ids(parsed, expected)
@@ -61,6 +63,8 @@ def execute_request(client, payload, expected, result_model, expected_slot_ids=N
         # Do not stringify arbitrary transport errors: they can contain URLs/credentials.
         result['error_type'] = type(exc).__name__
         result['error_code'] = getattr(exc, 'code', None)
+        result.update(error_details(exc))
+    result['finished_at_utc'] = utc_now()
     result['elapsed_ms'] = (time.perf_counter() - started) * 1000
     return result
 
@@ -130,7 +134,7 @@ def run(prepared_dir, output, allow_draft=False):
     prepared = json.loads(prepared_path.read_text(encoding='utf-8'))
     if not prepared['requests']:
         raise ValueError('empty experiment')
-    is_context = prepared['scope'] == 'content_context_ab'
+    is_context = prepared['scope'] in ('content_context_ab', 'content_partition_bc')
     if is_context:
         validate_pairs(prepared)
     accepted_annotations = ['region-verified', 'label-verified']
@@ -150,11 +154,16 @@ def run(prepared_dir, output, allow_draft=False):
     result_model = CrossResult if prepared['scope'] == 'cross_classification' else ContentResult
     client.max_retries = 0
     client.timeout_seconds = config['content_timeout_seconds']
+    instrument_vision(client)
     output.mkdir(parents=True, exist_ok=False)
     report = {'scope': prepared['scope'], 'prepared_sha256': sha256(prepared_path),
               'dataset_id': prepared['dataset_id'], 'allow_draft': allow_draft,
               'expected_questions_per_round': prepared['expected_questions_per_round'],
-              'review_status': 'pending', 'complete': False, 'results': []}
+              'review_status': 'pending', 'complete': False, 'results': [],
+              'started_at_utc': utc_now(),
+              'runtime': runtime_metadata(client.api_host, ['scripts/benchmark_content_oracle.py',
+                  'scripts/content_context_experiment.py', 'scripts/experiment_telemetry.py',
+                  'app/services/vision_recognition.py'])}
     for round_index in range(config['content_rounds']):
         for request in ordered_requests(prepared, round_index):
             events = []
@@ -170,12 +179,15 @@ def run(prepared_dir, output, allow_draft=False):
                           annotation_status=request['annotation_status'],
                           http_attempts=sum(e['kind'] == 'request' for e in events))
             safe_events = [{k: v for k, v in e.items() if k in {
-                'kind', 'attempt', 'status_code', 'response_body', 'raw', 'error_code'}} for e in events]
+                'kind', 'attempt', 'status_code', 'response_body', 'raw', 'error_code',
+                'started_at_utc', 'finished_at_utc', 'elapsed_ms', 'response_ids',
+                'exception_types', 'transport_error_type'}} for e in events]
             write_json(output / f"round{round_index + 1}-{request['request_id']}-raw.json", safe_events)
             report['results'].append(result)
             write_json(output / 'results.json', report)
             print(json.dumps({k: v for k, v in result.items() if k != 'items'}), flush=True)
     report['complete'] = True
+    report['finished_at_utc'] = utc_now()
     report['http_attempts'] = sum(r['http_attempts'] for r in report['results'])
     write_json(output / 'results.json', report)
     judgments = []

@@ -1,0 +1,12 @@
+{
+  "version": "text-input-cues-v1-20260907",
+  "description": "人工从原图核对的每格题面，用于纯文本定位目标；不包含正确答案。原答从冻结参考读取，答案与参考解析不发送。",
+  "cases": [
+    {"question_id":"page35__T2","slot_prompt_texts":{"s1":"谈","s2":"吐"}},
+    {"question_id":"page33__T6","slot_prompt_texts":{"s1":"dōng","s2":"guā"}},
+    {"question_id":"page5__page5-T3","slot_prompt_texts":{"s1":"hé","s2":"zuò"}},
+    {"question_id":"page7__page7-T2","slot_prompt_texts":{"s1":"zhǔ","s2":"xí"}},
+    {"question_id":"page20__page20-T8","slot_prompt_texts":{"s1":"qiū","s2":"yǐn"}},
+    {"question_id":"page20__page20-T11","slot_prompt_texts":{"s1":"yùn"}}
+  ]
+}
