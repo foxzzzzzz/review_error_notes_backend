@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.prepare_convergence_dataset import load_config, sha256, write_json
+from scripts.content_context_experiment import SCHEMAS, ordered_requests, validate_pairs, validate_slots
 
 
 class ContentItem(BaseModel):
@@ -47,12 +48,14 @@ def validate_ids(result, expected):
         raise ValueError('missing, duplicate or unknown question IDs')
 
 
-def execute_request(client, payload, expected, result_model):
+def execute_request(client, payload, expected, result_model, expected_slot_ids=None):
     started = time.perf_counter()
     result = {'expected_ids': expected, 'items': [], 'status': 'failed', 'review_status': 'pending'}
     try:
         parsed = client._request(payload, result_model, {'operation': 'content_oracle'})
         validate_ids(parsed, expected)
+        if expected_slot_ids is not None:
+            validate_slots(parsed, expected_slot_ids)
         result.update(status='parsed', items=parsed.model_dump(mode='json')['items'])
     except Exception as exc:
         # Do not stringify arbitrary transport errors: they can contain URLs/credentials.
@@ -127,8 +130,14 @@ def run(prepared_dir, output, allow_draft=False):
     prepared = json.loads(prepared_path.read_text(encoding='utf-8'))
     if not prepared['requests']:
         raise ValueError('empty experiment')
+    is_context = prepared['scope'] == 'content_context_ab'
+    if is_context:
+        validate_pairs(prepared)
+    accepted_annotations = ['region-verified', 'label-verified']
+    if is_context:
+        accepted_annotations.append('context-reviewed')
     for request in prepared['requests']:
-        if request['annotation_status'] not in ['region-verified', 'label-verified'] and not allow_draft:
+        if request['annotation_status'] not in accepted_annotations and not allow_draft:
             raise ValueError('unverified crop: review then prepare again, or explicitly use --allow-draft')
         if sha256(prepared_dir / request['image']) != request['image_sha256']:
             raise ValueError('prepared image hash mismatch')
@@ -147,12 +156,16 @@ def run(prepared_dir, output, allow_draft=False):
               'expected_questions_per_round': prepared['expected_questions_per_round'],
               'review_status': 'pending', 'complete': False, 'results': []}
     for round_index in range(config['content_rounds']):
-        for request in prepared['requests']:
+        for request in ordered_requests(prepared, round_index):
             events = []
             client.diagnostic_event_sink = events.append
             data = base64.b64encode((prepared_dir / request['image']).read_bytes()).decode('ascii')
             result = execute_request(client, {'prompt': request['prompt'],
-                'image_url': 'data:image/jpeg;base64,' + data}, request['expected_ids'], result_model)
+                'image_url': 'data:image/jpeg;base64,' + data}, request['expected_ids'],
+                SCHEMAS[request['response_schema']] if is_context else result_model,
+                request['expected_slot_ids'] if is_context else None)
+            if is_context:
+                result.update(arm=request['arm'], response_schema=request['response_schema'])
             result.update(round=round_index + 1, request_id=request['request_id'], label=request['label'],
                           annotation_status=request['annotation_status'],
                           http_attempts=sum(e['kind'] == 'request' for e in events))
@@ -174,6 +187,9 @@ def run(prepared_dir, output, allow_draft=False):
                 'prompt_correct': None, 'student_answer_correct': None,
                 'correct_answer_correct': None, 'explanation_correct': None,
                 'cross_verdict_correct': None, 'notes': None})
+            if is_context:
+                judgments[-1].update(arm=result['arm'], response_schema=result['response_schema'],
+                    joint_content_applicable=result['arm'] == 'A')
     write_json(output / 'judgments-template.json', {'dataset_id': prepared['dataset_id'], 'judgments': judgments})
     return report
 

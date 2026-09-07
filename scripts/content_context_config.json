@@ -1,0 +1,15 @@
+{
+  "_description": "8题上下文配对诊断；仅手动服务器运行时请求 MiniMax，不修改生产配置。",
+  "content_rounds": 3,
+  "_content_rounds": "每题每组重复轮数；8题×2组×3轮=48次请求。",
+  "content_image_max_edge": 2048,
+  "_content_image_max_edge": "输入图最长边上限，像素；只缩小不放大。",
+  "jpeg_quality": 90,
+  "_jpeg_quality": "实际请求 JPEG 质量；两组复用同一文件。",
+  "content_timeout_seconds": 20,
+  "_content_timeout_seconds": "单次 HTTP 超时；诊断串行且不重试，不代表整页30秒验收。",
+  "review_outline_width": 2,
+  "_review_outline_width": "审核图区域线宽，像素；审核图不发给模型。",
+  "counterbalance_arms": true,
+  "_counterbalance_arms": "逐题配对，奇数轮A再B、偶数轮B再A，降低顺序偏差。"
+}

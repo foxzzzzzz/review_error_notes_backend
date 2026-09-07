@@ -1,6 +1,6 @@
 # 收敛能力实验：服务器交接
 
-当前只新增诊断脚本，未接入生产，也未提交代码。先做单项能力检查，再决定是否值得集成；不要再次直接跑一整套串行识别来猜瓶颈。
+2026-09-07更新：原诊断代码已于9ed7286提交并推送，28题×3轮服务器结果已回收。下一轮改用[8题上下文A/B交接](content-context-ab-server-runbook.md)，共48次请求；本页保留原实验步骤和验收口径。用户已确认本轮11文件提交并推送main，不创建tag，未接入生产。
 
 ## 统一验收表
 
@@ -30,7 +30,7 @@
 
 ## 同步范围
 
-同步后端脚本 `benchmark_content_oracle.py`、`content_oracle_prompt.md`、`prepare_convergence_dataset.py`、`convergence_config.json`；真假叉准备另需 `prepare_cross_capability.py` 和 `cross_capability_prompt.md`。运行复用已存在的 `app/services/vision_recognition.py` 及服务器 MiniMax 环境，不改接口和密钥。
+同步后端脚本 `benchmark_content_oracle.py`、`content_context_experiment.py`、`content_oracle_prompt.md`、`prepare_convergence_dataset.py`、`convergence_config.json`；真假叉准备另需 `prepare_cross_capability.py` 和 `cross_capability_prompt.md`。运行复用已存在的 `app/services/vision_recognition.py` 及服务器 MiniMax 环境，不改接口和密钥。
 
 若采用git同步，先确认提交范围、commit message、是否建tag；当前建议只提交本次诊断、测试、计划文档，不提交模型、数据包及原有未跟踪文件。数据包单独传输。
 
