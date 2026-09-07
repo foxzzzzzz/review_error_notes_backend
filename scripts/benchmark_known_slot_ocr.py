@@ -43,12 +43,15 @@ def prepare(source, output, config, regions_path, cues_path):
         original = {s['slot_id']: s for s in case['reference']['answer_slots']}
         if set(original) != set(region['slot_cue_regions']) or set(original) != set(cues[qid]):
             raise ValueError('cue/answer slot mismatch')
+        answer_regions = region.get('answer_regions', {})
+        if not set(answer_regions).issubset(original):
+            raise ValueError('unknown answer region slot')
         with Image.open(file) as image:
             for slot in case['answer_slots']:
                 sid = slot['slot_id']
                 if original[sid]['state'] == 'uncertain':
                     raise ValueError('uncertain original answer is not ground truth')
-                for role, bbox, reference in [('answer', slot['bbox'], original[sid]['text']),
+                for role, bbox, reference in [('answer', answer_regions.get(sid, slot['bbox']), original[sid]['text']),
                         ('cue', region['slot_cue_regions'][sid], cues[qid][sid])]:
                     pixels = pixel_box(bbox, image.size)
                     name = f'{qid}-{role}-{sid}.png'

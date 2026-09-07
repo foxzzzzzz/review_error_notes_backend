@@ -41,3 +41,22 @@ def test_ocr_arms_receive_same_image_without_reference_and_keep_rounds(tmp_path)
     with pytest.raises(ValueError, match='hash'):
         run(tmp_path, tmp_path / 'bad', engine_factory=engine_factory)
     assert not (tmp_path / 'bad').exists()
+
+
+def test_reviewed_answer_region_override_keeps_whole_character(tmp_path):
+    from scripts.benchmark_known_slot_ocr import prepare
+    from scripts.prepare_convergence_dataset import sha256, write_json
+    image = tmp_path / 'source.png'
+    Image.new('RGB', (100, 100), 'white').save(image)
+    write_json(tmp_path / 'prepared.json', {'requests': [{'arm': 'B', 'expected_ids': ['Q'],
+        'image': image.name, 'image_sha256': sha256(image)}]})
+    write_json(tmp_path / 'reference-review.json', {'cases': [{'question_id': 'Q',
+        'answer_slots': [{'slot_id': 's1', 'bbox': [0, 0, 0.4, 1]}],
+        'reference': {'status': 'assistant_reviewed', 'answer_slots': [{'slot_id': 's1', 'state': 'written', 'text': '东'}]}}]})
+    write_json(tmp_path / 'regions.json', {'cases': [{'question_id': 'Q',
+        'slot_cue_regions': {'s1': [0, 0, 1, 0.2]}, 'answer_regions': {'s1': [0, 0, 0.6, 1]}}]})
+    write_json(tmp_path / 'cues.json', {'cases': [{'question_id': 'Q', 'slot_prompt_texts': {'s1': 'dōng'}}]})
+    result = prepare(tmp_path, tmp_path / 'out', {}, tmp_path / 'regions.json', tmp_path / 'cues.json')
+    answer = next(t for t in result['tiles'] if t['role'] == 'answer')
+    assert list(answer['source_pixel_bbox']) == [0, 0, 60, 100]
+    assert answer['reference_text'] == '东'

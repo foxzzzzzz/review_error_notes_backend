@@ -1,0 +1,61 @@
+{
+  "status": "stage_locked_by_user_20260907",
+  "baseline_commit": "1054885d73598d49dffd4e417ba3207892a3439e",
+  "tag": "v0.2.0-text-baseline.1",
+  "tag_status": "created_locally_user_authorized_not_pushed",
+  "scope": "Closed-task standard answer solver and factual local slot comparison; not production vision/end-to-end acceptance.",
+  "input_zip_sha256": "f49b07da2e638179eb0a0d7482d345c0c1495546552f908e57ba3f468835c722",
+  "return_zip_sha256": "087f633b1a839dbc83b5fd32e337894ab89beb5351ef0b6de84f9eec2e77fa17",
+  "source_lf_sha256": {
+    "scripts/standard_answer_experiment.py": "9d9101ba1b7a1829477b06ed629186f8de1f2f84011641e64e875c96d3477c00",
+    "scripts/standard_answer_config.json": "7356c52d64959944ec727a62d3453857053a07b08a5347ee7f8436c32ef3f5f8",
+    "scripts/standard_answer_prompt.md": "708e48841d7566620336e69950cc54eee0c1485387b8ffb5572f9b578a4e2916",
+    "scripts/text_oracle_inputs.json": "c936fc57bb235433e78d2482e9b4f26b70f3134e9c3c3b740bb7d66aa34d6b32",
+    "scripts/benchmark_text_oracle.py": "778bb4fccc4ebfd82458b096e9613f2f5adc8214c14bf832db69b23f211bac83",
+    "scripts/experiment_telemetry.py": "e9b9e319663149a09f97438ac68c0f42c4364f7ab26c32a276db1dcdcde592e1",
+    "scripts/content_context_experiment.py": "d9ae95ccfd7c234b8e1546db441d575adb977a8e3213f24b01b52ee1f8fbbeee",
+    "scripts/prepare_convergence_dataset.py": "4413282c7c60c2918cfb1f3c60fd1cf5db5413e2ded4f29cc11631f81d7a1e41",
+    "app/config.py": "3aeac48a231ade90a0179a32ca77845ed2886aa060b58d2b7f7a985c91a04e12"
+  },
+  "evidence": {
+    "frozen_files_equal": 10,
+    "runtime_hashes_verified": 5,
+    "source_files_local_verified": 9,
+    "unique_questions": 6,
+    "requests": 18,
+    "joint_pass": 18,
+    "correct_standard_slot_observations": 33,
+    "slot_status_counts": {
+      "missing": 12,
+      "wrong": 12,
+      "match": 9
+    },
+    "per_round_pass": {
+      "1": 6,
+      "2": 6,
+      "3": 6
+    },
+    "seconds": {
+      "mean": 1.0225925183234115,
+      "median": 0.9545066892169416,
+      "max": 1.4507436542771757,
+      "sum_requests": 18.406665329821408,
+      "run_wall": 18.437,
+      "round_means": {
+        "1": 1.2217916082590818,
+        "2": 0.8963751029223204,
+        "3": 0.9496108437888324
+      }
+    },
+    "completion_tokens": 963,
+    "scope": "Frozen manually transcribed input, six development cases repeated three times; no vision or end-to-end acceptance.",
+    "decision": "Stage-lock closed-task standard-answer/local-comparison design; visual reading remains unresolved."
+  },
+  "validation_not_covered": [
+    "automatic image transcription",
+    "independent real new-image set",
+    "false discovery rate",
+    "end-to-end per-page latency",
+    "pedagogical reasoning explanations"
+  ]
+}

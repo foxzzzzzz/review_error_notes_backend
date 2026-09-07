@@ -1,0 +1,242 @@
+{
+  "version": "text-expansion-20260907",
+  "description": "4题历史图片新文本扩围＋8题构造对照，分组统计；不是独立真实新图验收。旧求解Prompt与运行配置不变。",
+  "_descriptions": {
+    "provenance": "historical_image为助手逐图审核转写；synthetic_control为人工构造文本，不计真实图准确率。",
+    "standard": "审核专用逐格参考答案，不进入模型请求。",
+    "original": "本地比较原答，空串代表本样本明确空白；不确定图形不纳入此集。",
+    "image_sha256": "冻结真实历史图，图中字格/内容审核与用户整题裁框确认是不同事项。"
+  },
+  "cases": [
+    {
+      "question_id": "page33__T4",
+      "provenance": "historical_image",
+      "task_type": "pinyin_to_characters",
+      "answer_scope": "all_slots",
+      "prompt_text": "fēi cháng",
+      "cues": [
+        "fēi",
+        "cháng"
+      ],
+      "standard": [
+        "非",
+        "常"
+      ],
+      "original": [
+        "飞",
+        "长"
+      ],
+      "image": "crops/page33__T4.png",
+      "image_sha256": "c2fa42ce09c5be09adfd7b659b2fe6d163f8f57af500759eb8e67c7c70129dcb"
+    },
+    {
+      "question_id": "page33__T5",
+      "provenance": "historical_image",
+      "task_type": "pinyin_to_characters",
+      "answer_scope": "all_slots",
+      "prompt_text": "jīng cháng",
+      "cues": [
+        "jīng",
+        "cháng"
+      ],
+      "standard": [
+        "经",
+        "常"
+      ],
+      "original": [
+        "今",
+        "长"
+      ],
+      "image": "crops/page33__T5.png",
+      "image_sha256": "89d0c2f38eb6423455675a8b1f61573fffbf3befbdab13148c8045a917c05686"
+    },
+    {
+      "question_id": "page35__T3",
+      "provenance": "historical_image",
+      "task_type": "pinyin_to_characters",
+      "answer_scope": "all_slots",
+      "prompt_text": "xìng bié",
+      "cues": [
+        "xìng",
+        "bié"
+      ],
+      "standard": [
+        "性",
+        "别"
+      ],
+      "original": [
+        "姓",
+        ""
+      ],
+      "image": "crops/page35__T3.png",
+      "image_sha256": "4899e5763fae1420c1a37f601737a21cba067d3c784ecd8cfe24f1477b5460cb"
+    },
+    {
+      "question_id": "page20__page20-T9",
+      "provenance": "historical_image",
+      "task_type": "pinyin_to_characters",
+      "answer_scope": "all_slots",
+      "prompt_text": "kē dǒu",
+      "cues": [
+        "kē",
+        "dǒu"
+      ],
+      "standard": [
+        "蝌",
+        "蚪"
+      ],
+      "original": [
+        "",
+        ""
+      ],
+      "image": "crops/page20__page20-T9.png",
+      "image_sha256": "ef2e57c8d9f82aa6f72a8af588b3004aed88cf5dc7236aa83086233ef5bdf6b8"
+    },
+    {
+      "question_id": "control-weather",
+      "provenance": "synthetic_control",
+      "task_type": "pinyin_to_characters",
+      "answer_scope": "all_slots",
+      "prompt_text": "tiān qì",
+      "cues": [
+        "tiān",
+        "qì"
+      ],
+      "standard": [
+        "天",
+        "气"
+      ],
+      "original": [
+        "天",
+        "汽"
+      ]
+    },
+    {
+      "question_id": "control-school",
+      "provenance": "synthetic_control",
+      "task_type": "pinyin_to_characters",
+      "answer_scope": "all_slots",
+      "prompt_text": "xué xiào",
+      "cues": [
+        "xué",
+        "xiào"
+      ],
+      "standard": [
+        "学",
+        "校"
+      ],
+      "original": [
+        "学",
+        "校"
+      ]
+    },
+    {
+      "question_id": "control-tomorrow",
+      "provenance": "synthetic_control",
+      "task_type": "pinyin_to_characters",
+      "answer_scope": "all_slots",
+      "prompt_text": "míng tiān",
+      "cues": [
+        "míng",
+        "tiān"
+      ],
+      "standard": [
+        "明",
+        "天"
+      ],
+      "original": [
+        "",
+        ""
+      ]
+    },
+    {
+      "question_id": "control-friend",
+      "provenance": "synthetic_control",
+      "task_type": "pinyin_to_characters",
+      "answer_scope": "all_slots",
+      "prompt_text": "péng you",
+      "cues": [
+        "péng",
+        "you"
+      ],
+      "standard": [
+        "朋",
+        "友"
+      ],
+      "original": [
+        "朋",
+        "有"
+      ]
+    },
+    {
+      "question_id": "control-tone",
+      "provenance": "synthetic_control",
+      "task_type": "characters_to_pinyin",
+      "answer_scope": "all_slots",
+      "prompt_text": "认真",
+      "cues": [
+        "认",
+        "真"
+      ],
+      "standard": [
+        "rèn",
+        "zhēn"
+      ],
+      "original": [
+        "rén",
+        "zhēn"
+      ]
+    },
+    {
+      "question_id": "control-fruit",
+      "provenance": "synthetic_control",
+      "task_type": "characters_to_pinyin",
+      "answer_scope": "all_slots",
+      "prompt_text": "水果",
+      "cues": [
+        "水",
+        "果"
+      ],
+      "standard": [
+        "shuǐ",
+        "guǒ"
+      ],
+      "original": [
+        "shuǐ",
+        "guǒ"
+      ]
+    },
+    {
+      "question_id": "control-sentence-blank",
+      "provenance": "synthetic_control",
+      "task_type": "pinyin_sentence",
+      "answer_scope": "target_slot_only",
+      "prompt_text": "wǒ ài běi jīng。",
+      "cues": [
+        "běi"
+      ],
+      "standard": [
+        "北"
+      ],
+      "original": [
+        ""
+      ]
+    },
+    {
+      "question_id": "control-sentence-correct",
+      "provenance": "synthetic_control",
+      "task_type": "pinyin_sentence",
+      "answer_scope": "target_slot_only",
+      "prompt_text": "xiǎo niǎo zài shù shàng chàng gē。",
+      "cues": [
+        "chàng"
+      ],
+      "standard": [
+        "唱"
+      ],
+      "original": [
+        "唱"
+      ]
+    }
+  ]
+}
