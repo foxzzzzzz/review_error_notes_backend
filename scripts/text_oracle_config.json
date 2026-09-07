@@ -3,11 +3,15 @@
   "timeout_seconds": 20,
   "temperature": 0.3,
   "max_tokens": 2048,
+  "expected_endpoint_host": null,
+  "expected_model": null,
   "_descriptions": {
     "rounds": "6题文本解题重复轮数，6×3=18次实际HTTP尝试，单独统计。",
     "timeout_seconds": "文本请求超时秒，失败不重试；仍非完整生产30秒验收。",
     "temperature": "请求采样温度；与当前生产文本调用默认值一致。",
-    "max_tokens": "单次输出token上限；只输出答案与简短可核验错因，不请求推理过程。"
+    "max_tokens": "单次输出token上限；推理服务可能将思考token计入此预算，不能仅凭Prompt关闭推理。",
+    "expected_endpoint_host": "文本实验预期主机名；非空时必须与服务器LLM_API_BASE匹配，否则零请求退出。null仅用于通用准备模板；正式实验应冻结预期值，不修改MINIMAX_*。",
+    "expected_model": "文本实验预期模型；非空时必须与服务器LLM_MODEL完全匹配，否则零请求退出；正式实验应冻结预期值。"
   },
   "_model_source": "运行时读取服务器现有LLM_MODEL/LLM_API_BASE/LLM_API_KEY；模型名与主机名记录在结果中，配置不保存密钥。"
 }

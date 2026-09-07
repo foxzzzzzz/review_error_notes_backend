@@ -1,0 +1,19 @@
+{
+  "rounds": 3,
+  "timeout_seconds": 20,
+  "temperature": 0.3,
+  "max_tokens": 2048,
+  "expected_endpoint_host": "api.deepseek.com",
+  "expected_model": "deepseek-v4-flash",
+  "thinking": {"type": "disabled"},
+  "_descriptions": {
+    "rounds": "同6题重复3轮，共18次文本调用；失败不补跑。",
+    "timeout_seconds": "单次文本HTTP超时20秒，不是整页时限。",
+    "temperature": "非推理模式采样温度，保持上轮请求值。",
+    "max_tokens": "保持上轮2048预算，观察关闭推理后最终内容及耗时。",
+    "expected_endpoint_host": "仅针对回传text-oracle-results中记录的文本主机；运行时不一致就零请求停止，不修改服务器LLM_API_BASE，也不修改MINIMAX_API_HOST。",
+    "expected_model": "仅匹配回传记录中的文本模型，运行时不一致就停止，不切换LLM_MODEL。",
+    "thinking": "DeepSeek文本实验专属参数，绑定上述主机和模型；绝不能据此修改MiniMax视觉请求。依据api-docs.deepseek.com/guides/thinking_mode/，2026-09-07核查。"
+  },
+  "_scope": "text_solution_oracle_only; production vision remains MiniMax"
+}

@@ -1,0 +1,12 @@
+{
+  "version": "known-slot-six-20260907",
+  "description": "沿用四题已审核原格坐标，新增冬瓜/合作的题面提示区域。坐标相对冻结B图，原答框从reference-review读取。仅用于人工框OCR上限。",
+  "cases": [
+    {"question_id":"page35__T2","slot_cue_regions":{"s1":[0.21,0.72,0.48,0.98],"s2":[0.48,0.72,0.73,0.98]}},
+    {"question_id":"page7__page7-T2","slot_cue_regions":{"s1":[0.14,0.04,0.38,0.27],"s2":[0.4,0.04,0.61,0.27]}},
+    {"question_id":"page20__page20-T8","slot_cue_regions":{"s1":[0.13,0.13,0.46,0.35],"s2":[0.52,0.13,0.81,0.35]}},
+    {"question_id":"page20__page20-T11","slot_cue_regions":{"s1":[0.14,0.39,0.20,0.48]}},
+    {"question_id":"page33__T6","slot_cue_regions":{"s1":[0.24,0.05,0.53,0.3],"s2":[0.6,0.05,0.85,0.3]}},
+    {"question_id":"page5__page5-T3","slot_cue_regions":{"s1":[0.12,0.1,0.34,0.32],"s2":[0.42,0.1,0.68,0.32]}}
+  ]
+}

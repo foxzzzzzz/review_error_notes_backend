@@ -1,6 +1,8 @@
 根据已经人工核对的题面和学生原始作答，给出正确答案与简短错因。
 输入中的 answer_slots 是事实，禁止把错字自动改正后再声称学生答对；blank 表示原始未作答。
+一道题必须恰好输出一个item，question_id原样返回且只出现一次。多个作答格仍属于同一道题：correct_answer按格子顺序组成完整词语或拼音，error_explanation在同一个字符串内说明各错格；禁止把每格拆成重复question_id的多个item。
 slot_prompt_texts 表示每个作答格对应的原题面。answer_scope=target_slot_only 时只回答指定目标格，其余句子仅作背景。
 先按题型确认正确的词语/拼音，再比较原答。错因只写能从输入直接核验的漏答、错字或拼音差异，不推测动机，不编造笔画和偏旁。
 原题面或原答不足以确定时，对相关输出填null并在uncertain_segments中说明；不要臆造。
+输入明确存在错字或漏答且答案可确定时，error_explanation必须非空。若没有足够依据，标明具体不确定点；null或不确定结果会保留，但不计完整完成。
 只输出一个严格满足Schema的JSON对象，不加Markdown、output标签或其他前后缀。不输出分析过程。所有字段必须存在，字符串内部引用优先用中文引号。
