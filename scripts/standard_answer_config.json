@@ -1,0 +1,33 @@
+{
+  "rounds": 3,
+  "timeout_seconds": 20,
+  "temperature": 0.3,
+  "max_tokens": 2048,
+  "expected_endpoint_host": "api.deepseek.com",
+  "expected_model": "deepseek-v4-flash",
+  "thinking": {"type": "disabled"},
+  "allow_outer_json_fence": true,
+  "answer_separators": {"pinyin_to_characters": "", "characters_to_pinyin": " ", "pinyin_sentence": ""},
+  "instructions": {
+    "pinyin_to_characters": "看拼音写词语，结合完整词语确定每格汉字。",
+    "characters_to_pinyin": "给词语中每个汉字注音，保留规范声调。",
+    "pinyin_sentence": "根据完整拼音句子，只填写指定目标格对应的汉字。"
+  },
+  "explanation_templates": {
+    "wrong": "第{index}格应为“{expected}”，原答为“{actual}”。",
+    "missing": "第{index}格未作答，应填“{expected}”。"
+  },
+  "_descriptions": {
+    "rounds": "同6题各3轮；18次请求，不补跑失败。",
+    "timeout_seconds": "每次HTTP超时秒，仍非排队外整页30秒验收。",
+    "temperature": "保持文本V2非推理模式的采样温度。",
+    "max_tokens": "保持V2输出预算；只求逐格标准答案。",
+    "expected_endpoint_host": "仅匹配已核实的独立LLM_*文本主机；不切换服务、不修改MiniMax视觉。",
+    "expected_model": "运行前核对LLM_MODEL，返回模型亦必须一致。",
+    "thinking": "仅绑定上述DeepSeek文本主机与模型的非推理参数；不发送给MiniMax。",
+    "allow_outer_json_fence": "允许移除完整包住一个JSON的单层```json围栏；保留raw并单独统计。不移除其他前后缀、不修内容。",
+    "answer_separators": "支持的闭合答案题型及标准答案展示连接符；仅Unicode NFC和首尾空白规范化，保留声调和原始字形。",
+    "instructions": "仅依据题型向求解器说明任务，不包含学生错答、是否漏答或参考答案。",
+    "explanation_templates": "本地逐格比较的事实说明；不推测动机或编造笔画偏旁。不适用于开放答案的等价性判定。"
+  }
+}
