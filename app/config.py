@@ -32,6 +32,16 @@ class Settings(BaseSettings):
         description="Timeout in seconds for one LLM HTTP request.",
     )
     MINIMAX_API_KEY: str = ""
+    VISION_PROVIDER: Literal["minimax", "deepseek"] = "minimax"
+    DEEPSEEK_VISION_KEY_SOURCE: Literal["dedicated", "text_llm"] = "dedicated"
+    DEEPSEEK_VISION_API_KEY: str = ""
+    DEEPSEEK_VISION_API_BASE: str = "https://api.deepseek.com/v1"
+    DEEPSEEK_VISION_MODEL: str = "deepseek-flash"
+    DEEPSEEK_VISION_THINKING: Literal["enabled", "disabled"] = "disabled"
+    DEEPSEEK_VISION_MAX_TOKENS: int = Field(default=4096, gt=0)
+    DEEPSEEK_VISION_IMAGE_DETAIL: Literal["low", "high", "original", "auto"] = "original"
+    DEEPSEEK_VISION_TIMEOUT_SECONDS: float = Field(default=60, gt=0)
+    DEEPSEEK_VISION_MAX_RETRIES: int = Field(default=2, ge=0)
     MINIMAX_API_HOST: str = ""
     MINIMAX_VISION_TIMEOUT_SECONDS: float = 60
     MINIMAX_VISION_MAX_RETRIES: int = 2

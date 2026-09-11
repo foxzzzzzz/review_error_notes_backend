@@ -1,4 +1,4 @@
-"""Celery task for MiniMax multimodal wrong-question recognition."""
+"""Celery task for configured multimodal wrong-question recognition."""
 
 import json
 import logging
@@ -17,9 +17,9 @@ from app.models.wrong_image import WrongImage
 from app.models.wrong_question import WrongQuestion
 from app.services.error_mark_validation import scan_red_mark_regions
 from app.services.local_ocr_verification import RapidOCRVerifier
+from app.services.vision_provider import create_vision_client
 from app.services.vision_recognition import (
     ImageReviewRequired,
-    MiniMaxVisionClient,
     VisionRecognitionError,
     image_status_for,
     recognize_question_batch,
@@ -164,7 +164,7 @@ def process_image(self, image_id: str, filepath: str):
             max_thinness_ratio=settings.LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO,
         )
         result, question_values = recognize_question_batch(
-            client=MiniMaxVisionClient.from_settings(),
+            client=create_vision_client(),
             image_path=filepath,
             subject_hint=subject_hint,
             confidence_threshold=settings.MINIMAX_CONFIDENCE_THRESHOLD,

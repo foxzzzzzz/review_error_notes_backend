@@ -1,0 +1,20 @@
+{
+  "providers": ["minimax", "deepseek"],
+  "max_total_attempts": 640,
+  "deepseek_api_base": "https://api.deepseek.com/v1",
+  "deepseek_key_source": "text_llm",
+  "deepseek_model": "deepseek-flash",
+  "deepseek_thinking": "disabled",
+  "deepseek_max_tokens": 4096,
+  "deepseek_image_detail": "original",
+  "_descriptions": {
+    "providers": "两家均使用同一冻结输入；奇数序号按此顺序，偶数逆序，降低调用顺序偏差。",
+    "max_total_attempts": "双通道总HTTP硬预算；155例×2轮×2家=620，超限拒绝，不丢样本。",
+    "deepseek_api_base": "DeepSeek图文API基础地址，不含/chat/completions。",
+    "deepseek_key_source": "text_llm显式复用服务器已有LLM_API_KEY且校验LLM_API_BASE主机；dedicated仅读DEEPSEEK_VISION_API_KEY。仅影响此实验。",
+    "deepseek_model": "官方2026-09-10发布说明的V4.1 Flash API名称，记录实际返回model；不能假设别名永久锁定版本。",
+    "deepseek_thinking": "本轮关闭思考；MiniMax未暴露相同开关，报告该协议差异，不宣称内部推理参数相同。",
+    "deepseek_max_tokens": "DeepSeek输出token上限；不额外启用JSON模式或修改prompt。",
+    "deepseek_image_detail": "保持输入图像尺寸。服务内部编码仍可能不同，不能假设内部看到的像素完全相同。"
+  }
+}

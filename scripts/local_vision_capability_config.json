@@ -1,0 +1,28 @@
+{
+  "rounds": 2,
+  "max_http_attempts": 320,
+  "timeout_seconds": 20,
+  "max_consecutive_failures": 3,
+  "context_max_edge": 600,
+  "max_input_edge": 2048,
+  "margin": 16,
+  "label_height": 24,
+  "context_box_width": 3,
+  "positive_recall_min": 0.95,
+  "negative_false_positive_max_exclusive": 0.1,
+  "endpoint_host": "api.minimaxi.com",
+  "_descriptions": {
+    "rounds": "同输入两轮，第二轮逆序；独立评分，不能多数投票。",
+    "max_http_attempts": "整个冻结输入包的HTTP总预算；超限拒绝准备，不删样本。",
+    "timeout_seconds": "单次实际服务调用超时，所有错误原样保留且不重试。",
+    "max_consecutive_failures": "连续传输/解析失败达到此数即中止余下调度并保留未完成状态；鉴权拒绝立即中止。",
+    "context_max_edge": "整页上下文预览长边上限；局部目标图保持原始像素。",
+    "max_input_edge": "最终输入最长边硬上限；超出明确报错，不静默缩小局部字。",
+    "margin": "上下文和局部图四周的留白像素。",
+    "label_height": "中性CONTEXT/TARGET标题预留高度。",
+    "context_box_width": "只在上下文预览标示目标位置的蓝框宽度；局部原图不画框。",
+    "positive_recall_min": "每轮新旧正例分别达到的条件分类正确率门槛；未知和失败仍留在分母。",
+    "negative_false_positive_max_exclusive": "每轮新旧负例分别允许的错误提升比例上界（严格小于）；另报明确排除率及待定。",
+    "endpoint_host": "沿用既有MiniMax视觉服务主机；预检不允许无意切换供应商。"
+  }
+}
