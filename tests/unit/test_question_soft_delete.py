@@ -214,6 +214,7 @@ def test_repeated_delete_keeps_existing_soft_delete_timestamp_and_succeeds():
 def test_confirming_reviewed_question_ignores_soft_deleted_siblings():
     question = SimpleNamespace(
         review_status="needs_review",
+        recognition_pipeline=None,
         image_id=str(uuid4()),
         difficulty=None,
     )

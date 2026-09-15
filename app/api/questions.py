@@ -1,3 +1,4 @@
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal
@@ -19,6 +20,7 @@ from app.schemas.question import (
 )
 from app.config import settings
 from app.tasks.process_image import process_image
+from app.services.chinese_marked_evidence import PIPELINE_NAME
 from app.services.question_image import (
     QuestionImageInvalid,
     QuestionImageNotFound,
@@ -32,6 +34,44 @@ def _normalize_created_from(created_from: datetime) -> datetime:
     if created_from.tzinfo is None:
         return created_from
     return created_from.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _current_evidence_prompt_values(question, raw_json: dict, bundle: dict) -> dict:
+    """Read the current review display without copying observations to legacy keys."""
+    previous_override = bundle.get("human_override") or {}
+    deepseek_content = raw_json.get("deepseek_content") or {}
+    fields = bundle.get("fields") or {}
+
+    def selected(field_name: str) -> str:
+        field = fields.get(field_name) or {}
+        return str(field.get("selected_value") or "").strip()
+
+    question_type = str(question.question_type or "").strip()
+    instruction = (
+        str(previous_override.get("instruction") or "").strip()
+        or selected("printed_instruction")
+        or str(deepseek_content.get("instruction") or "").strip()
+    )
+    prompt_roles = {
+        "write_word": ("printed_pinyin", "printed_prompt", "printed_hanzi"),
+        "write_pinyin": ("printed_hanzi", "printed_prompt", "printed_pinyin"),
+    }.get(
+        question_type,
+        ("printed_prompt", "printed_pinyin", "printed_hanzi"),
+    )
+    prompt_text = str(previous_override.get("prompt_text") or "").strip()
+    if not prompt_text:
+        prompt_text = next(
+            (value for value in (selected(role) for role in prompt_roles) if value),
+            str(deepseek_content.get("prompt_text") or "").strip(),
+        )
+    return {
+        "instruction": instruction,
+        "prompt_text": prompt_text,
+        "question_type": str(
+            previous_override.get("question_type") or question_type
+        ).strip(),
+    }
 
 
 @router.get("", response_model=list[QuestionOut])
@@ -181,7 +221,7 @@ async def decide_image_reviews(
     student: Student = Depends(get_default_student),
     db: AsyncSession = Depends(get_db),
 ):
-    decisions = {str(item.question_id): item.decision for item in data.decisions}
+    decisions = {str(item.question_id): item for item in data.decisions}
     if len(decisions) != len(data.decisions):
         raise HTTPException(status_code=400, detail="Duplicate question decisions")
     image = await db.scalar(
@@ -201,18 +241,211 @@ async def decide_image_reviews(
             WrongQuestion.image_id == image_id,
             WrongQuestion.student_id == student.id,
             WrongQuestion.deleted_at.is_(None),
-            WrongQuestion.collection_status == "pending_review",
         )
         .with_for_update()
     )
     questions = result.scalars().all()
     if len(questions) != len(decisions):
         raise HTTPException(status_code=404, detail="Review question not found")
+    pending_questions = []
     for question in questions:
-        question.collection_status = (
-            "collected" if decisions[str(question.id)] == "collect" else "ignored"
+        decision = decisions[str(question.id)]
+        if (
+            question.recognition_pipeline == PIPELINE_NAME
+            and decision.decision == "collect"
+            and any(
+                value is not None and not value.strip()
+                for value in (
+                    decision.question_type,
+                    decision.instruction,
+                    decision.prompt_text,
+                )
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="prompt corrections must be non-blank when provided",
+            )
+        if question.collection_status == "pending_review":
+            if (
+                question.recognition_pipeline == PIPELINE_NAME
+                and decision.decision == "collect"
+                and not (decision.correct_answer or "").strip()
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="correct_answer is required when collecting a question",
+                )
+            if (
+                question.recognition_pipeline == PIPELINE_NAME
+                and decision.decision == "collect"
+            ):
+                raw_json = question.ocr_raw_json or {}
+                bundle = raw_json.get("evidence_bundle") or {}
+                current_prompt = _current_evidence_prompt_values(
+                    question,
+                    raw_json,
+                    bundle,
+                )
+                final_prompt = {
+                    "instruction": (
+                        decision.instruction.strip()
+                        if decision.instruction is not None
+                        else current_prompt["instruction"]
+                    ),
+                    "prompt_text": (
+                        decision.prompt_text.strip()
+                        if decision.prompt_text is not None
+                        else current_prompt["prompt_text"]
+                    ),
+                    "question_type": (
+                        decision.question_type.strip()
+                        if decision.question_type is not None
+                        else current_prompt["question_type"]
+                    ),
+                }
+                if not all(final_prompt.values()):
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="a complete current prompt is required when collecting a question",
+                    )
+            pending_questions.append(question)
+        else:
+            if question.collection_status == "superseded":
+                raise HTTPException(status_code=409, detail="Review question was superseded")
+            if question.recognition_pipeline != PIPELINE_NAME:
+                raise HTTPException(status_code=404, detail="Review question not found")
+            bundle = (question.ocr_raw_json or {}).get("evidence_bundle", {})
+            history = bundle.get("review_history", [])
+            last_review = history[-1] if history else None
+            correct_answer = (
+                decision.correct_answer.strip()
+                if decision.correct_answer is not None
+                else None
+            )
+            corrections = {
+                key: value.strip()
+                for key, value in (
+                    ("question_type", decision.question_type),
+                    ("instruction", decision.instruction),
+                    ("prompt_text", decision.prompt_text),
+                )
+                if value is not None
+            }
+            new_values = last_review.get("new_values", {}) if last_review else {}
+            if not (
+                question.collection_status
+                == ("collected" if decision.decision == "collect" else "ignored")
+                and question.review_status == "confirmed"
+                and last_review
+                and last_review.get("decision") == decision.decision
+                and new_values.get("correct_answer") == correct_answer
+                and all(new_values.get(key) == corrections.get(key) for key in (
+                    "question_type",
+                    "instruction",
+                    "prompt_text",
+                ))
+            ):
+                raise HTTPException(status_code=409, detail="Review decision conflicts with terminal state")
+    if not pending_questions:
+        remaining = await db.scalar(
+            select(WrongQuestion.id)
+            .where(
+                WrongQuestion.image_id == image.id,
+                WrongQuestion.collection_status == "pending_review",
+                WrongQuestion.deleted_at.is_(None),
+            )
+            .limit(1)
         )
-        question.review_status = "confirmed"
+        return {
+            "collected": sum(item.decision == "collect" for item in decisions.values()),
+            "ignored": sum(item.decision == "ignore" for item in decisions.values()),
+            "remaining": bool(remaining),
+        }
+    for question in pending_questions:
+        decision = decisions[str(question.id)]
+        if question.recognition_pipeline == PIPELINE_NAME:
+            correct_answer = (
+                decision.correct_answer.strip()
+                if decision.correct_answer is not None
+                else None
+            )
+            corrections = {
+                key: value.strip()
+                for key, value in (
+                    ("question_type", decision.question_type),
+                    ("instruction", decision.instruction),
+                    ("prompt_text", decision.prompt_text),
+                )
+                if value is not None
+            }
+            raw_json = deepcopy(question.ocr_raw_json or {})
+            bundle = deepcopy(raw_json.get("evidence_bundle") or {})
+            previous_override = deepcopy(bundle.get("human_override") or {})
+            current_prompt = _current_evidence_prompt_values(
+                question,
+                raw_json,
+                bundle,
+            )
+            old_values = {
+                "correct_answer": question.ocr_answer,
+                "question_type": question.question_type,
+                "instruction": current_prompt["instruction"] or None,
+                "prompt_text": current_prompt["prompt_text"] or None,
+            }
+            if corrections:
+                bundle["human_override"] = {**previous_override, **corrections}
+            if decision.decision == "collect":
+                confirmed_prompt = {
+                    "instruction": corrections.get("instruction")
+                    or current_prompt["instruction"],
+                    "prompt_text": corrections.get("prompt_text")
+                    or current_prompt["prompt_text"],
+                    "question_type": corrections.get("question_type")
+                    or current_prompt["question_type"],
+                    "source": "human",
+                    "actor_id": str(student.id),
+                }
+                if not all(
+                    confirmed_prompt[key]
+                    for key in ("instruction", "prompt_text", "question_type")
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="a complete current prompt is required when collecting a question",
+                    )
+                bundle["human_confirmed_prompt"] = confirmed_prompt
+                question.ocr_answer = correct_answer
+                question.question_type = confirmed_prompt["question_type"]
+                question.mark_status = "confirmed"
+                question.question_evidence_status = "confirmed"
+                question.answer_status = "confirmed"
+                question.collection_status = "collected"
+            else:
+                question.collection_status = "ignored"
+            question.review_status = "confirmed"
+            bundle.setdefault("review_history", []).append(
+                {
+                    "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "human",
+                    "actor_id": str(student.id),
+                    "decision": decision.decision,
+                    "old_values": old_values,
+                    "new_values": {
+                        "correct_answer": correct_answer,
+                        "question_type": corrections.get("question_type"),
+                        "instruction": corrections.get("instruction"),
+                        "prompt_text": corrections.get("prompt_text"),
+                    },
+                }
+            )
+            raw_json["evidence_bundle"] = bundle
+            question.ocr_raw_json = raw_json
+        else:
+            question.collection_status = (
+                "collected" if decision.decision == "collect" else "ignored"
+            )
+            question.review_status = "confirmed"
 
     await db.flush()
     remaining = await db.scalar(
@@ -228,8 +461,8 @@ async def decide_image_reviews(
         image.status = "confirmed"
     await db.commit()
     return {
-        "collected": sum(item == "collect" for item in decisions.values()),
-        "ignored": sum(item == "ignore" for item in decisions.values()),
+        "collected": sum(item.decision == "collect" for item in decisions.values()),
+        "ignored": sum(item.decision == "ignore" for item in decisions.values()),
         "remaining": bool(remaining),
     }
 
@@ -380,6 +613,27 @@ async def update_question(
     q = result.scalar_one_or_none()
     if not q:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
+    if (
+        q.recognition_pipeline == PIPELINE_NAME
+        and data.model_dump(exclude_unset=True).get("review_status") == "confirmed"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Use the review-decision endpoint to confirm this question",
+        )
+    if (
+        q.recognition_pipeline == PIPELINE_NAME
+        and "ocr_text" in data.model_dump(exclude_unset=True)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Student handwriting must not be overwritten through this endpoint",
+        )
+    if q.recognition_pipeline == PIPELINE_NAME:
+        for k, v in data.model_dump(exclude_unset=True).items():
+            setattr(q, k, v)
+        await db.commit()
+        return {"ok": True}
     was_needs_review = q.review_status == "needs_review"
     image = None
     if was_needs_review:

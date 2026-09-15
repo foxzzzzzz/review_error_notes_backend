@@ -28,9 +28,11 @@ from app.schemas.sheet import (
 )
 from app.services.practice_question import (
     MissingPracticePromptError,
+    UnconfirmedPracticeAnswerError,
     build_printable_questions,
     order_questions,
 )
+from app.services.chinese_marked_evidence import eligible_questions_statement
 from app.services.practice_results import (
     PracticeResultValidationError,
     apply_group_result,
@@ -179,12 +181,7 @@ async def create_sheet(
         raise HTTPException(status_code=400, detail="Duplicate question IDs are not allowed")
 
     question_result = await db.execute(
-        select(WrongQuestion).where(
-            WrongQuestion.id.in_(data.question_ids),
-            WrongQuestion.student_id == student.id,
-            WrongQuestion.deleted_at.is_(None),
-            WrongQuestion.collection_status == "collected",
-        )
+        eligible_questions_statement(data.question_ids, student.id)
     )
     questions = order_questions(question_result.scalars().all(), data.question_ids)
     if len(questions) != len(data.question_ids):
@@ -199,6 +196,11 @@ async def create_sheet(
                 f"有 {exc.count} 道错题缺少结构化题干，"
                 "请重新上传图片识别后再出卷"
             ),
+        ) from exc
+    except UnconfirmedPracticeAnswerError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="所选错题答案尚未确认，请确认后再出卷",
         ) from exc
 
     if data.derived_per_original > 0 and not settings.LLM_API_KEY:

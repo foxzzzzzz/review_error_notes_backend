@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 
 def _values(*, raw_text, answer, review_status="confirmed", reliable_mark=False):
     return SimpleNamespace(
@@ -165,3 +167,160 @@ def test_keeps_pending_candidate_when_its_content_differs_from_collected_candida
     assert discard_pending_duplicates_of_collected(
         [collected, pending_other_question]
     ) == [collected, pending_other_question]
+
+
+def _evidence_candidate(
+    *,
+    mark_id,
+    geometry=None,
+    text="相同学生文本",
+    answer="相同建议答案",
+):
+    return {
+        "recognition_pipeline": "chinese_marked_evidence_v1",
+        "collection_status": "pending_review",
+        "ocr_text": text,
+        "ocr_answer": answer,
+        "question_type": "write_word",
+        "ocr_raw_json": {
+            "evidence_bundle": {
+                "identity": {
+                    "image_id": "image-8",
+                    "mark_id": mark_id,
+                    "question_geometry": geometry
+                    or {"bbox": [0.1, 0.2, 0.3, 0.4]},
+                }
+            }
+        },
+    }
+
+
+def test_evidence_dedup_keeps_same_text_for_different_marks():
+    from app.tasks.process_image import discard_pending_duplicates_of_collected
+
+    first = _evidence_candidate(mark_id=1)
+    second = _evidence_candidate(mark_id=2)
+
+    assert discard_pending_duplicates_of_collected([first, second]) == [first, second]
+
+
+def test_evidence_dedup_collapses_exact_identity_and_keeps_first():
+    from app.tasks.process_image import discard_pending_duplicates_of_collected
+
+    first = _evidence_candidate(mark_id=1, text="first")
+    duplicate = _evidence_candidate(mark_id=1, text="changed", answer="changed")
+
+    assert discard_pending_duplicates_of_collected([first, duplicate]) == [first]
+
+
+def test_evidence_identity_canonicalizes_geometry_keys_and_numeric_forms():
+    from app.tasks.process_image import candidate_identity_for
+
+    first = _evidence_candidate(
+        mark_id=1,
+        geometry={
+            "bbox": [-0.0, 0.1, 1, 0.4],
+            "mark": {"confidence": 1.0, "mark_id": 1},
+        },
+    )
+    reordered = _evidence_candidate(
+        mark_id=1,
+        geometry={
+            "mark": {"mark_id": 1.0, "confidence": 1},
+            "bbox": [0, 0.1, 1.0, 0.4],
+        },
+        text="unrelated text",
+        answer="unrelated answer",
+    )
+
+    assert candidate_identity_for(first) == candidate_identity_for(reordered)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        None,
+        {},
+        {
+            "image_id": "",
+            "mark_id": 1,
+            "question_geometry": {"bbox": [0.1, 0.2, 0.3, 0.4]},
+        },
+        {
+            "image_id": "   ",
+            "mark_id": 1,
+            "question_geometry": {"bbox": [0.1, 0.2, 0.3, 0.4]},
+        },
+        {
+            "image_id": "image-8",
+            "mark_id": -1,
+            "question_geometry": {"bbox": [0.1, 0.2, 0.3, 0.4]},
+        },
+        {"image_id": "image-8", "mark_id": 1},
+        {
+            "image_id": "image-8",
+            "mark_id": True,
+            "question_geometry": {"bbox": [0.1, 0.2, 0.3, 0.4]},
+        },
+        {
+            "image_id": "image-8",
+            "mark_id": 1,
+            "question_geometry": {"bbox": [float("nan"), 0.2, 0.3, 0.4]},
+        },
+        {
+            "image_id": "image-8",
+            "mark_id": 1,
+            "question_geometry": {"question_bbox": [0.1, True, 0.3, 0.4]},
+        },
+        {
+            "image_id": "image-8",
+            "mark_id": 1,
+            "question_geometry": {"answer_bbox": [-0.1, 0.2, 0.3, 0.4]},
+        },
+        {
+            "image_id": "image-8",
+            "mark_id": 1,
+            "question_geometry": {"prompt_bbox": [0.3, 0.2, 0.3, 0.4]},
+        },
+        {
+            "image_id": "image-8",
+            "mark_id": 1,
+            "question_geometry": {
+                "bbox": [0.1, 0.2, 0.3, 0.4],
+                "mark": {"bbox": [0.1, 0.2, 1.1, 0.4]},
+            },
+        },
+    ],
+)
+def test_malformed_evidence_identity_never_falls_back_to_text(identity):
+    from app.tasks.process_image import candidate_identity_for
+
+    candidate = _evidence_candidate(mark_id=1)
+    candidate["ocr_raw_json"]["evidence_bundle"]["identity"] = identity
+
+    with pytest.raises(ValueError, match="evidence identity"):
+        candidate_identity_for(candidate)
+
+
+def test_evidence_identity_allows_diagnostic_booleans_with_valid_bboxes():
+    from app.tasks.process_image import candidate_identity_for
+
+    candidate = _evidence_candidate(
+        mark_id=1,
+        geometry={
+            "bbox": [0.1, 0.2, 0.3, 0.4],
+            "question_bbox": [0.1, 0.2, 0.3, 0.4],
+            "answer_bbox": None,
+            "prompt_bbox": [0.1, 0.2, 0.2, 0.3],
+            "mark": {
+                "bbox": [0.15, 0.25, 0.2, 0.3],
+                "cross_bbox": None,
+                "circle_bbox": [0.14, 0.24, 0.21, 0.31],
+            },
+            "localization": {"geometry_diagnostic": {"passed": True}},
+        },
+    )
+
+    identity = candidate_identity_for(candidate)
+
+    assert identity[0] == "chinese_marked_evidence_v1"

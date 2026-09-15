@@ -115,3 +115,17 @@ def test_image_recognition_correction_revision_follows_sheet_duration():
     source = revision.read_text(encoding="utf-8")
     assert 'down_revision: Union[str, None] = "0006"' in source
     assert '"recognition_correction"' in source
+
+
+def test_chinese_marked_evidence_revision_follows_cancelled_status():
+    source = (VERSIONS / "0009_chinese_marked_evidence_status.py").read_text("utf-8")
+
+    assert 'down_revision: Union[str, None] = "0008"' in source
+    for field in (
+        "recognition_pipeline",
+        "mark_status",
+        "question_evidence_status",
+        "answer_status",
+    ):
+        assert f'op.add_column("wrong_questions", sa.Column("{field}", sa.String' in source
+        assert f'op.drop_column("wrong_questions", "{field}")' in source

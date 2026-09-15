@@ -17,7 +17,6 @@ from app.config import settings
 from app.models.practice_sheet import PracticeSheet
 from app.models.sheet_item import SheetItem
 from app.models.student import Student
-from app.models.wrong_question import WrongQuestion
 from app.services.derivative import (
     DerivativeBatchInput,
     DerivativeGenerationError,
@@ -28,9 +27,11 @@ from app.services.pdf_storage import remove_generated_pdf
 from app.services.practice_question import (
     MissingPracticePromptError,
     PrintableQuestion,
+    UnconfirmedPracticeAnswerError,
     build_printable_questions,
     order_questions,
 )
+from app.services.chinese_marked_evidence import eligible_questions_statement
 from app.tasks.celery_app import celery_app
 
 
@@ -114,12 +115,7 @@ class SheetGenerationRepository:
             config = dict(sheet.config_json or {})
             question_ids = [str(item) for item in config.get("question_ids", [])]
             result = db.execute(
-                select(WrongQuestion).where(
-                    WrongQuestion.id.in_(question_ids),
-                    WrongQuestion.student_id == sheet.student_id,
-                    WrongQuestion.deleted_at.is_(None),
-                    WrongQuestion.collection_status == "collected",
-                )
+                eligible_questions_statement(question_ids, sheet.student_id)
             )
             questions = order_questions(result.scalars().all(), question_ids)
             if not question_ids or len(questions) != len(question_ids):
@@ -250,7 +246,14 @@ def generation_failure_for(error: Exception, phase: str) -> tuple[str, str]:
         return "sheet_generation_timeout", "错题集生成超时，请重试或减少题目数量"
     if isinstance(error, DerivativeGenerationError):
         return "sheet_derivative_failed", "衍生题生成失败，请重试或调整为仅原题"
-    if isinstance(error, (MissingPracticePromptError, SheetGenerationInputError)):
+    if isinstance(
+        error,
+        (
+            MissingPracticePromptError,
+            SheetGenerationInputError,
+            UnconfirmedPracticeAnswerError,
+        ),
+    ):
         return "sheet_questions_unavailable", "部分错题已不可用，请重新选择后生成"
     if phase == "pdf":
         return "sheet_pdf_failed", "错题集 PDF 生成失败，请稍后重试"

@@ -3,6 +3,40 @@ import pytest
 from app.services.vision_recognition import ErrorMark, LocalizationItem, VisionItem
 
 
+@pytest.mark.parametrize(
+    ("enabled", "subjects", "subject", "correction", "expected"),
+    [
+        (False, "chinese", "chinese", None, False),
+        (True, "chinese", "math", None, False),
+        (True, "chinese", "english", None, False),
+        (True, "chinese", None, None, False),
+        (True, "", "chinese", None, False),
+        (True, " Chinese , math ", "CHINESE", None, True),
+        (True, "chinese", "chinese", "force_unmarked", False),
+    ],
+)
+def test_chinese_marked_evidence_request_gate(
+    monkeypatch, enabled, subjects, subject, correction, expected
+):
+    from app.tasks import process_image as process_image_module
+
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_ENABLED",
+        enabled,
+    )
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_SUBJECTS",
+        subjects,
+    )
+
+    assert process_image_module.evidence_mode_requested_for(
+        subject,
+        correction,
+    ) is expected
+
+
 def test_worker_registers_complete_foreign_key_model_graph():
     import ast
     from pathlib import Path
@@ -394,3 +428,559 @@ def test_task_logs_safe_localization_counts_without_recognized_text(caplog):
     assert '"returned_count":2' in caplog.text
     assert '"reliable_mark_count":1' in caplog.text
     assert "学生隐私作答" not in caplog.text
+
+
+def test_task_persists_placeholder_evidence_after_deadline_without_result_item(
+    monkeypatch,
+    caplog,
+):
+    from types import SimpleNamespace
+
+    from app.tasks import process_image as process_image_module
+
+    image = SimpleNamespace(
+        id="image-8",
+        student_id="student-8",
+        subject="chinese",
+        grade=3,
+        semester=1,
+        status="pending",
+        question_count=0,
+        recognition_correction=None,
+        error_code=None,
+        error_message=None,
+    )
+    added = []
+    commits = []
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def scalar(self, _statement):
+            return image
+
+        def add(self, question):
+            added.append(question)
+
+        def commit(self):
+            commits.append(image.status)
+
+    class FakeEngine:
+        def __init__(self):
+            self.disposed = False
+
+        def dispose(self):
+            self.disposed = True
+
+    engine = FakeEngine()
+    actual_client = object()
+    actual_ocr = object()
+    captured = {}
+    persisted_kwargs = []
+
+    def evidence_value(mark_id):
+        return {
+            "recognition_pipeline": "chinese_marked_evidence_v1",
+            "mark_status": "needs_review",
+            "question_evidence_status": "insufficient",
+            "answer_status": "unresolved",
+            "collection_status": "pending_review",
+            "review_status": "needs_review",
+            "ocr_text": None,
+            "ocr_answer": None,
+            "subject": "chinese",
+            "question_type": None,
+            "tags": [],
+            "difficulty": None,
+            "crop_region": {"mark_ids": [mark_id]},
+            "ocr_raw_json": {
+                "evidence_bundle": {
+                    "schema_version": 1,
+                    "identity": {
+                        "image_id": "image-8",
+                        "mark_id": mark_id,
+                        "question_geometry": {"bbox": [0.1, 0.2, 0.3, 0.4]},
+                    },
+                },
+                "three_stage": {"recognition_pipeline": "three_stage"},
+                "local_ocr_page": {"status": "disabled", "duration_ms": 0.0},
+            },
+        }
+
+    values = [evidence_value(0), evidence_value(1)]
+
+    def fake_recognize_question_batch(**kwargs):
+        captured.update(kwargs)
+        return (
+            SimpleNamespace(
+                items=[],
+                ignored_text=[],
+                recognition_pipeline="chinese_marked_evidence_v1",
+            ),
+            values,
+        )
+
+    ticks = iter([100.0, 102.0, 108.0, 110.0])
+    monkeypatch.setattr(process_image_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_SUBJECTS",
+        "chinese",
+    )
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_PAGE_TIMEOUT_SECONDS",
+        3.0,
+    )
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_OCR_CROP_RECHECK_LIMIT",
+        1,
+    )
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_LOCALIZATION_RECHECK_LIMIT",
+        2,
+    )
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "LOCAL_OCR_CROP_RECHECK_LIMIT",
+        7,
+    )
+    monkeypatch.setattr(process_image_module, "create_engine", lambda _url: engine)
+    monkeypatch.setattr(process_image_module, "Session", lambda _engine: FakeSession())
+    monkeypatch.setattr(
+        process_image_module,
+        "scan_red_mark_regions",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="detected",
+            regions=[],
+            duration_ms=1.0,
+        ),
+    )
+    monkeypatch.setattr(
+        process_image_module,
+        "create_vision_client",
+        lambda: actual_client,
+    )
+    monkeypatch.setattr(
+        process_image_module,
+        "RapidOCRVerifier",
+        lambda **_kwargs: actual_ocr,
+    )
+    monkeypatch.setattr(
+        process_image_module,
+        "recognize_question_batch",
+        fake_recognize_question_batch,
+    )
+
+    def fake_wrong_question(**kwargs):
+        persisted_kwargs.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(process_image_module, "WrongQuestion", fake_wrong_question)
+
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        process_image_module.process_image.run("image-8", "worksheet.jpg")
+
+    assert captured["client"] is actual_client
+    assert captured["ocr_verifier"] is actual_ocr
+    assert captured["evidence_mode"] is True
+    assert captured["image_id"] == "image-8"
+    assert captured["deadline"] == 103.0
+    assert captured["ocr_crop_recheck_limit"] == 7
+    assert captured["evidence_ocr_crop_recheck_limit"] == 1
+    assert captured["evidence_localization_recheck_limit"] == 2
+    assert len(added) == len(persisted_kwargs) == 2
+    assert image.question_count == 2
+    assert image.status == "needs_review"
+    assert commits == ["segmented", "needs_review"]
+    for source, persisted in zip(values, persisted_kwargs):
+        assert persisted["recognition_pipeline"] == source["recognition_pipeline"]
+        assert persisted["mark_status"] == source["mark_status"]
+        assert persisted["question_evidence_status"] == source["question_evidence_status"]
+        assert persisted["answer_status"] == source["answer_status"]
+        assert persisted["collection_status"] == source["collection_status"]
+        assert persisted["ocr_raw_json"]["evidence_bundle"] == source["ocr_raw_json"]["evidence_bundle"]
+        timing = persisted["ocr_raw_json"]["evidence_timing"]
+        assert timing == {
+            "before_persistence": {
+                "timeout_seconds": 3.0,
+                "elapsed_seconds": 2.0,
+                "remaining_seconds": 1.0,
+                "exhausted": False,
+            },
+            "pre_commit": {
+                "timeout_seconds": 3.0,
+                "elapsed_seconds": 8.0,
+                "remaining_seconds": 0.0,
+                "exhausted": True,
+            },
+        }
+    assert '"elapsed_seconds":10.0' in caplog.text
+    assert '"remaining_seconds":0.0' in caplog.text
+    assert '"exhausted":true' in caplog.text
+    assert engine.disposed is True
+
+
+def test_process_actual_unmarked_is_identical_when_evidence_is_requested(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    from app.services.local_ocr_verification import OCRPageEvidence, OCRVerification
+    from app.services.vision_recognition import (
+        LocalizationItem,
+        LocalizationResult,
+        VisionItem,
+        VisionResult,
+    )
+    from app.tasks import process_image as process_image_module
+
+    image_path = tmp_path / "white-page.jpg"
+    Image.new("RGB", (600, 300), "white").save(image_path)
+
+    class UnmarkedClient:
+        def __init__(self):
+            self.recognize_calls = 0
+            self.localize_calls = 0
+
+        def recognize(
+            self,
+            image_path,
+            subject_hint=None,
+            recognition_correction=None,
+            recognition_mode="marked",
+            local_red_regions=None,
+        ):
+            self.recognize_calls += 1
+            return VisionResult(
+                items=[
+                    VisionItem(
+                        raw_text=f"学生答案{index}",
+                        instruction="填写答案",
+                        prompt_text=f"题目{index}",
+                        normalized_text=None,
+                        answer=f"参考答案{index}",
+                        subject="chinese",
+                        question_type="fill_blank",
+                        tags=[],
+                        difficulty=2,
+                        confidence=0.99 - index / 100,
+                        uncertain_segments=[],
+                    )
+                    for index in range(3)
+                ],
+                error_marks=[],
+                ignored_text=[],
+            )
+
+        def localize(self, image_path, items, error_marks):
+            self.localize_calls += 1
+            assert error_marks == []
+            return LocalizationResult(
+                items=[
+                    LocalizationItem(
+                        index=index,
+                        matched=True,
+                        mark_ids=[],
+                        bbox=[
+                            0.05,
+                            0.05 + index * 0.3,
+                            0.95,
+                            0.25 + index * 0.3,
+                        ],
+                        observed_prompt_text=item.prompt_text,
+                        observed_raw_text=item.raw_text,
+                        confidence=0.95,
+                    )
+                    for index, item in enumerate(items)
+                ]
+            )
+
+    class CountingOCR:
+        enabled = True
+        line_confidence_threshold = 0.85
+        min_effective_characters = 2
+        support_similarity_threshold = 0.8
+        contradiction_similarity_threshold = 0.9
+
+        def __init__(self):
+            self.page_calls = 0
+            self.crop_calls = 0
+
+        def recognize_page(self, _image_path, _max_edge):
+            self.page_calls += 1
+            return OCRPageEvidence(status="available", lines=[])
+
+        def verify_crop(self, *_args, **_kwargs):
+            self.crop_calls += 1
+            return OCRVerification(status="inconclusive")
+
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_SUBJECTS",
+        "chinese",
+    )
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "LOCAL_OCR_CROP_RECHECK_LIMIT",
+        2,
+    )
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_OCR_CROP_RECHECK_LIMIT",
+        0,
+    )
+
+    def run_flag(enabled):
+        claimed_image = SimpleNamespace(
+            id=f"image-unmarked-{enabled}",
+            student_id="student-8",
+            subject="chinese",
+            grade=3,
+            semester=1,
+            status="pending",
+            question_count=0,
+            recognition_correction=None,
+            error_code=None,
+            error_message=None,
+        )
+        persisted = []
+        client = UnmarkedClient()
+        verifier = CountingOCR()
+
+        class FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def scalar(self, _statement):
+                return claimed_image
+
+            def add(self, question):
+                persisted.append(question)
+
+            def commit(self):
+                pass
+
+        class FakeEngine:
+            def dispose(self):
+                pass
+
+        monkeypatch.setattr(
+            process_image_module.settings,
+            "CHINESE_MARKED_EVIDENCE_ENABLED",
+            enabled,
+        )
+        monkeypatch.setattr(
+            process_image_module,
+            "create_engine",
+            lambda _url: FakeEngine(),
+        )
+        monkeypatch.setattr(
+            process_image_module,
+            "Session",
+            lambda _engine: FakeSession(),
+        )
+        monkeypatch.setattr(
+            process_image_module,
+            "create_vision_client",
+            lambda: client,
+        )
+        monkeypatch.setattr(
+            process_image_module,
+            "RapidOCRVerifier",
+            lambda **_kwargs: verifier,
+        )
+        monkeypatch.setattr(
+            process_image_module,
+            "WrongQuestion",
+            lambda **kwargs: SimpleNamespace(**kwargs),
+        )
+
+        process_image_module.process_image.run(
+            claimed_image.id,
+            str(image_path),
+        )
+        return {
+            "page_calls": verifier.page_calls,
+            "crop_calls": verifier.crop_calls,
+            "statuses": [question.collection_status for question in persisted],
+            "persisted_count": len(persisted),
+            "question_count": claimed_image.question_count,
+            "image_status": claimed_image.status,
+            "recognize_calls": client.recognize_calls,
+            "localize_calls": client.localize_calls,
+        }
+
+    disabled = run_flag(False)
+    requested_but_unmarked = run_flag(True)
+
+    assert disabled == requested_but_unmarked == {
+        "page_calls": 1,
+        "crop_calls": 2,
+        "statuses": ["pending_review", "pending_review", "pending_review"],
+        "persisted_count": 3,
+        "question_count": 3,
+        "image_status": "needs_review",
+        "recognize_calls": 1,
+        "localize_calls": 1,
+    }
+
+
+def test_process_evidence_neutralizes_real_rapidocr_none_score_and_persists(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    from app.services.local_ocr_verification import RapidOCRVerifier
+    from app.services import vision_recognition
+    from app.tasks import process_image as process_image_module
+
+    image_path = tmp_path / "marked-page.jpg"
+    Image.new("RGB", (200, 100), "white").save(image_path)
+    image = SimpleNamespace(
+        id="image-none-score",
+        student_id="student-8",
+        subject="chinese",
+        grade=3,
+        semester=1,
+        status="pending",
+        question_count=0,
+        recognition_correction=None,
+        error_code=None,
+        error_message=None,
+    )
+    persisted = []
+    captured = {}
+
+    class Engine:
+        def __call__(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                txts=["OCR line"],
+                scores=[None],
+                boxes=None,
+            )
+
+    verifier = RapidOCRVerifier(
+        enabled=True,
+        library_version="3.9.1",
+        engine_name="rapidocr",
+        model_version="PP-OCRv5",
+        model_type="mobile",
+        model_path=None,
+        max_pixels=40_000_000,
+        line_confidence_threshold=0.85,
+        min_effective_characters=2,
+        support_similarity_threshold=0.8,
+        contradiction_similarity_threshold=0.9,
+        engine_factory=Engine,
+    )
+
+    def fake_three_stage(**kwargs):
+        captured.update(kwargs)
+        return [
+            {
+                "recognition_pipeline": "chinese_marked_evidence_v1",
+                "mark_status": "needs_review",
+                "question_evidence_status": "insufficient",
+                "answer_status": "unresolved",
+                "collection_status": "pending_review",
+                "review_status": "needs_review",
+                "ocr_text": None,
+                "ocr_answer": None,
+                "subject": "chinese",
+                "question_type": None,
+                "tags": [],
+                "difficulty": None,
+                "crop_region": {"mark_ids": [0]},
+                "ocr_raw_json": {
+                    "evidence_bundle": {
+                        "schema_version": 1,
+                        "identity": {
+                            "image_id": image.id,
+                            "mark_id": 0,
+                            "question_geometry": {
+                                "bbox": [0.1, 0.2, 0.3, 0.4]
+                            },
+                        },
+                    }
+                },
+            }
+        ], {}, [], {"recognition_pipeline": "three_stage"}
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def scalar(self, _statement):
+            return image
+
+        def add(self, question):
+            persisted.append(question)
+
+        def commit(self):
+            pass
+
+    class FakeEngine:
+        def dispose(self):
+            pass
+
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_SUBJECTS",
+        "chinese",
+    )
+    monkeypatch.setattr(
+        process_image_module,
+        "scan_red_mark_regions",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="detected",
+            regions=[],
+            duration_ms=0.0,
+        ),
+    )
+    monkeypatch.setattr(process_image_module, "create_engine", lambda _url: FakeEngine())
+    monkeypatch.setattr(process_image_module, "Session", lambda _engine: FakeSession())
+    monkeypatch.setattr(process_image_module, "create_vision_client", object)
+    monkeypatch.setattr(process_image_module, "RapidOCRVerifier", lambda **_kwargs: verifier)
+    monkeypatch.setattr(vision_recognition, "recognize_marked_three_stage", fake_three_stage)
+    monkeypatch.setattr(
+        process_image_module,
+        "WrongQuestion",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+    process_image_module.process_image.run(image.id, str(image_path))
+
+    assert captured["ocr_page_evidence"].status == "unavailable"
+    assert captured["ocr_page_evidence"].error_code == "page_ocr_invalid"
+    assert len(persisted) == image.question_count == 1
+    assert persisted[0].collection_status == "pending_review"
+    assert image.status == "needs_review"

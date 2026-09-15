@@ -338,6 +338,194 @@ def test_stage_three_content_has_stable_mark_id_but_no_bbox():
     assert "bbox" not in item.model_dump()
 
 
+def _source_aware_observation(source_class="printed"):
+    return {
+        "source": "deepseek",
+        "source_class": source_class,
+        "text": "看拼音写词语",
+        "bbox": [0.1, 0.2, 0.4, 0.3],
+        "confidence": 0.91,
+    }
+
+
+def test_content_recognition_item_preserves_source_aware_observations_and_mark_id():
+    from app.services.vision_recognition import ContentRecognitionItem
+
+    item = ContentRecognitionItem.model_validate(
+        {
+            "mark_id": 7,
+            **_valid_payload()["items"][0],
+            "printed_instruction": _source_aware_observation(),
+            "printed_prompt": _source_aware_observation(),
+            "printed_pinyin": _source_aware_observation(),
+            "printed_hanzi": _source_aware_observation(),
+            "student_handwriting": _source_aware_observation("student_handwriting"),
+            "teacher_correction": _source_aware_observation("teacher_correction"),
+            "uncertain_observations": [_source_aware_observation("unknown")],
+        }
+    )
+
+    assert item.mark_id == 7
+    assert item.printed_prompt.text == "看拼音写词语"
+    assert item.student_handwriting.bbox == [0.1, 0.2, 0.4, 0.3]
+    assert item.teacher_correction.confidence == 0.91
+    assert item.uncertain_observations[0].source_class == "unknown"
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        {**_source_aware_observation(), "extra": "not allowed"},
+        {**_source_aware_observation(), "source": "rapidocr"},
+        {**_source_aware_observation(), "text": "  "},
+        {**_source_aware_observation(), "bbox": [0.1, 0.2, 0.1, 0.3]},
+        {**_source_aware_observation(), "bbox": [0.4, 0.2, 0.1, 0.3]},
+        {**_source_aware_observation(), "bbox": [-0.1, 0.2, 0.4, 0.3]},
+        {**_source_aware_observation(), "bbox": [0.1, 0.2, 1.1, 0.3]},
+        {**_source_aware_observation(), "bbox": [0.1, 0.2, 0.4]},
+        {**_source_aware_observation(), "bbox": [True, 0.2, 0.4, 0.3]},
+        {**_source_aware_observation(), "bbox": [0.1, 0.2, float("nan"), 0.3]},
+        {**_source_aware_observation(), "bbox": [0.1, 0.2, float("inf"), 0.3]},
+        {**_source_aware_observation(), "bbox": [0.1, 0.2, 1, 0.3]},
+        {**_source_aware_observation(), "confidence": -0.1},
+        {**_source_aware_observation(), "confidence": 1.1},
+        {**_source_aware_observation(), "confidence": float("nan")},
+        {**_source_aware_observation(), "confidence": float("inf")},
+        {**_source_aware_observation(), "confidence": 1},
+        {**_source_aware_observation(), "confidence": True},
+    ],
+)
+def test_content_observation_rejects_invalid_strict_values(observation):
+    from app.services.vision_recognition import ContentObservation
+
+    with pytest.raises(ValidationError):
+        ContentObservation.model_validate(observation)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "source_class"),
+    [
+        ("printed_instruction", "student_handwriting"),
+        ("printed_prompt", "teacher_correction"),
+        ("printed_pinyin", "unknown"),
+        ("printed_hanzi", "student_handwriting"),
+        ("student_handwriting", "printed"),
+        ("teacher_correction", "printed"),
+        ("uncertain_observations", "printed"),
+    ],
+)
+def test_content_observation_fields_reject_role_source_class_contradictions(
+    field_name,
+    source_class,
+):
+    from app.services.vision_recognition import ContentRecognitionItem
+
+    value = _source_aware_observation(source_class)
+    if field_name == "uncertain_observations":
+        value = [value]
+    with pytest.raises(ValidationError):
+        ContentRecognitionItem.model_validate(
+            {
+                "mark_id": 7,
+                **_valid_payload()["items"][0],
+                field_name: value,
+            }
+        )
+
+
+def test_content_recognition_legacy_item_without_observations_still_parses():
+    from app.services.vision_recognition import ContentRecognitionItem
+
+    item = ContentRecognitionItem.model_validate(
+        {"mark_id": 7, **_valid_payload()["items"][0]}
+    )
+
+    assert item.mark_id == 7
+    assert item.printed_prompt is None
+    assert item.uncertain_observations == []
+
+
+def test_content_validation_keeps_valid_sibling_when_observation_or_mark_id_is_invalid():
+    from app.services.vision_recognition import (
+        ContentRecognitionResult,
+        _validate_response_result,
+    )
+
+    valid_item = {
+        "mark_id": 0,
+        **_valid_payload()["items"][0],
+        "student_handwriting": _source_aware_observation("student_handwriting"),
+    }
+    result = _validate_response_result(
+        {
+            "items": [
+                valid_item,
+                {
+                    "mark_id": 1,
+                    **_valid_payload()["items"][0],
+                    "student_handwriting": _source_aware_observation("printed"),
+                },
+                {**_valid_payload()["items"][0]},
+                {"mark_id": "wrong", **_valid_payload()["items"][0]},
+            ]
+        },
+        ContentRecognitionResult,
+        {"operation": "content_recognition"},
+    )
+
+    assert [item.mark_id for item in result.items] == [0]
+    assert [item["mark_id"] for item in result.invalid_item_diagnostics] == [1, None, None]
+
+    with pytest.raises(ValidationError):
+        ContentRecognitionResult.model_validate(
+            {"items": [valid_item, {**valid_item}]}
+        )
+
+
+def test_content_prompt_locks_source_separation_contract_and_preserves_prior_prompts():
+    from hashlib import sha256
+
+    from app.services.vision_recognition import (
+        CONTENT_RECOGNITION_PROMPT,
+        MARK_DETECTION_PROMPT,
+        MARK_QUESTION_LOCALIZATION_PROMPT,
+        RECOGNITION_PROMPT,
+    )
+
+    for required in (
+        "学生作答格中的文字按 student_handwriting 输出",
+        "老师红笔文字按 teacher_correction 输出",
+        "题目要求、提示、拼音、汉字",
+        "unknown",
+        "不得因为候选能组成常见词、通过词典/拼音校验或看起来合理，就把手写内容改成 printed",
+        "answer 只是可空建议，不代表已确认正确答案；不得自动补全",
+        "不得修改 mark_id",
+        "不得修改或重新分配题目坐标/红标",
+        "bbox 必须为有限 float，使用 [left, top, right, bottom]，范围在 [0,1] 且有正面积",
+        "坐标相对于对应 mark_id 面板中去除 mark_id 标签/拼图空白后的独立题目照片区域，不是整张拼图，也不是重新定位 question bbox/红标",
+        "新观察字段只可记录照片中直接可见的印刷文字或笔迹；不可见时分别填 null 或 []",
+        "不得将生成、推断的 legacy instruction、prompt_text 或 answer 包装成新观察",
+        "printed_instruction",
+        "printed_prompt",
+        "printed_pinyin",
+        "printed_hanzi",
+        "student_handwriting",
+        "teacher_correction",
+        "uncertain_observations",
+    ):
+        assert required in CONTENT_RECOGNITION_PROMPT
+
+    assert sha256(MARK_DETECTION_PROMPT.encode()).hexdigest() == (
+        "5b00f53410eb22b5f5c8cfd756923fb4c8702c567297966cb7b8e000e581d7a1"
+    )
+    assert sha256(MARK_QUESTION_LOCALIZATION_PROMPT.encode()).hexdigest() == (
+        "327b8cac4382f5f5b7205df4a77dff64c5cc249957059dbdc9cefedaca6da9aa"
+    )
+    assert sha256(RECOGNITION_PROMPT.encode()).hexdigest() == (
+        "e595c5e37e1ca4a1fe297b9fc0c09965faa1451aa46fc1946f125cd6948a8aec"
+    )
+
+
 @pytest.mark.parametrize(
     ("model_difficulty", "expected_difficulty"),
     [

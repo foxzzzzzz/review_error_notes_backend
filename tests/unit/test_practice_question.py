@@ -15,6 +15,8 @@ def _question(**raw_overrides):
         ocr_text="shǔan",
         ocr_answer="jì suàn",
         ocr_raw_json=raw,
+        recognition_pipeline=None,
+        answer_status=None,
     )
 
 
@@ -93,3 +95,63 @@ def test_batch_builder_reports_all_unprintable_questions():
         build_printable_questions([_question(), invalid_one, invalid_two])
 
     assert exc_info.value.count == 2
+
+
+def test_rejects_unconfirmed_answer_from_chinese_marked_evidence_pipeline():
+    from app.services.chinese_marked_evidence import PIPELINE_NAME
+    from app.services.practice_question import (
+        UnconfirmedPracticeAnswerError,
+        build_printable_question,
+    )
+
+    question = _question()
+    question.recognition_pipeline = PIPELINE_NAME
+    question.answer_status = "suggested"
+
+    with pytest.raises(UnconfirmedPracticeAnswerError):
+        build_printable_question(question)
+
+
+def test_new_pipeline_reads_only_human_confirmed_prompt_snapshot():
+    from app.services.chinese_marked_evidence import PIPELINE_NAME
+    from app.services.practice_question import build_printable_question
+
+    question = _question(
+        instruction="自动观察要求",
+        prompt_text="自动观察提示",
+        question_type="other",
+    )
+    question.recognition_pipeline = PIPELINE_NAME
+    question.answer_status = "confirmed"
+    question.ocr_raw_json["evidence_bundle"] = {
+        "human_confirmed_prompt": {
+            "instruction": "看拼音写词语",
+            "prompt_text": "yǎn jìng",
+            "question_type": "write_word",
+            "source": "human",
+            "actor_id": "student-1",
+        }
+    }
+
+    result = build_printable_question(question)
+
+    assert result.instruction == "看拼音写词语"
+    assert result.prompt_text == "yǎn jìng"
+    assert result.question_type == "write_word"
+    assert "自动观察" not in result.display_text
+
+
+def test_new_pipeline_rejects_missing_human_prompt_even_with_legacy_top_level():
+    from app.services.chinese_marked_evidence import PIPELINE_NAME
+    from app.services.practice_question import (
+        MissingPracticePromptError,
+        build_printable_question,
+    )
+
+    question = _question()
+    question.recognition_pipeline = PIPELINE_NAME
+    question.answer_status = "confirmed"
+    question.ocr_raw_json["evidence_bundle"] = {}
+
+    with pytest.raises(MissingPracticePromptError):
+        build_printable_question(question)

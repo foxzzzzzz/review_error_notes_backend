@@ -6,6 +6,8 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel
 
+from app.services.chinese_marked_evidence import PIPELINE_NAME, is_downstream_eligible
+
 
 QuestionType = Literal[
     "write_pinyin",
@@ -29,6 +31,10 @@ class MissingPracticePromptError(ValueError):
     def __init__(self, count: int = 1):
         self.count = count
         super().__init__(f"{count} question(s) are missing structured practice prompts")
+
+
+class UnconfirmedPracticeAnswerError(ValueError):
+    """Raised when marked-evidence recognition has no confirmed answer."""
 
 
 class PrintableQuestion(BaseModel):
@@ -71,10 +77,29 @@ def build_printable_questions(questions) -> list[PrintableQuestion]:
 
 def build_printable_question(question) -> PrintableQuestion:
     """Convert structured recognition fields without exposing the student's answer."""
+    if not is_downstream_eligible(question):
+        raise UnconfirmedPracticeAnswerError()
     raw = question.ocr_raw_json or {}
-    instruction = str(raw.get("instruction") or "").strip()
-    prompt_text = str(raw.get("prompt_text") or "").strip()
-    question_type = str(raw.get("question_type") or "other").strip()
+    if getattr(question, "recognition_pipeline", None) == PIPELINE_NAME:
+        bundle = raw.get("evidence_bundle") if isinstance(raw, dict) else None
+        prompt = (
+            bundle.get("human_confirmed_prompt")
+            if isinstance(bundle, dict)
+            else None
+        )
+        if (
+            not isinstance(prompt, dict)
+            or prompt.get("source") != "human"
+            or not str(prompt.get("actor_id") or "").strip()
+        ):
+            raise MissingPracticePromptError()
+        instruction = str(prompt.get("instruction") or "").strip()
+        prompt_text = str(prompt.get("prompt_text") or "").strip()
+        question_type = str(prompt.get("question_type") or "").strip()
+    else:
+        instruction = str(raw.get("instruction") or "").strip()
+        prompt_text = str(raw.get("prompt_text") or "").strip()
+        question_type = str(raw.get("question_type") or "other").strip()
     if not instruction or not prompt_text:
         raise MissingPracticePromptError()
     if question_type not in QUESTION_TYPES:

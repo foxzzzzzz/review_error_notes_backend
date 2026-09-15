@@ -72,12 +72,76 @@ def test_factory_defaults_to_minimax_and_never_falls_back(monkeypatch):
 
 def test_worker_uses_provider_factory_and_compose_passes_settings():
     from pathlib import Path
+    import re
     from app.config import Settings
     root=Path(__file__).parents[2]
-    assert 'client=create_vision_client()' in (root/'app/tasks/process_image.py').read_text(encoding='utf-8')
+    worker_source = (root/'app/tasks/process_image.py').read_text(encoding='utf-8')
+    assert re.search(r'vision_client\s*=\s*create_vision_client\(\)', worker_source)
+    assert re.search(r'client\s*=\s*vision_client', worker_source)
     fields=[n for n in Settings.model_fields if n.startswith('DEEPSEEK_VISION_') or n=='VISION_PROVIDER']
     assert fields
     compose=(root/'docker-compose.yml').read_text(encoding='utf-8')
     example=(root/'.env.example').read_text(encoding='utf-8')
     for field in fields:
         assert field+':' in compose and field+'=' in example
+
+
+def test_default_configuration_creates_deepseek_with_text_key(monkeypatch):
+    from app.config import Settings
+    from app.services import vision_provider as provider
+    from app.services import deepseek_vision
+    config = Settings(_env_file=None, LLM_API_KEY='test-only', LLM_API_BASE='https://api.deepseek.com/v1')
+    monkeypatch.setattr(provider, 'settings', config)
+    monkeypatch.setattr(deepseek_vision, 'settings', config)
+    client = provider.create_vision_client()
+    assert isinstance(client, deepseek_vision.DeepSeekVisionClient)
+    assert client.api_key == 'test-only'
+    config.LLM_API_KEY = ''
+    with pytest.raises(ValueError, match='credential'):
+        provider.create_vision_client()
+
+
+def test_deepseek_localized_content_uses_source_aware_prompt_and_parses_observations(tmp_path):
+    image = tmp_path / 'crop.png'
+    Image.new('RGB', (160, 240), 'white').save(image)
+    captured = {}
+    content = {
+        'items': [{
+            'mark_id': 4,
+            'raw_text': 'qing ting',
+            'instruction': '看词语写拼音',
+            'prompt_text': '蜻蜓',
+            'normalized_text': None,
+            'answer': None,
+            'subject': 'chinese',
+            'question_type': 'write_pinyin',
+            'tags': [],
+            'difficulty': 2,
+            'confidence': 0.9,
+            'uncertain_segments': [],
+            'student_handwriting': {
+                'source': 'deepseek',
+                'source_class': 'student_handwriting',
+                'text': 'qing ting',
+                'bbox': [0.2, 0.3, 0.5, 0.4],
+                'confidence': 0.88,
+            },
+        }]
+    }
+
+    def respond(request):
+        captured['body'] = json.loads(request.content)
+        return httpx.Response(200, json={
+            'model': 'deepseek-flash',
+            'choices': [
+                {'message': {'content': json.dumps(content)}, 'finish_reason': 'stop'}
+            ],
+        })
+
+    result = deepseek_client(respond).recognize_localized_content(str(image), [4])
+
+    prompt = captured['body']['messages'][0]['content'][0]['text']
+    assert '学生作答格中的文字按 student_handwriting 输出' in prompt
+    assert 'teacher_correction' in prompt
+    assert result.items[0].mark_id == 4
+    assert result.items[0].student_handwriting.text == 'qing ting'

@@ -12,6 +12,10 @@ class QuestionOut(BaseModel):
     ocr_text: Optional[str]
     ocr_answer: Optional[str]
     ocr_raw_json: Optional[dict]
+    recognition_pipeline: Optional[str] = None
+    mark_status: Optional[str] = None
+    question_evidence_status: Optional[str] = None
+    answer_status: Optional[str] = None
     crop_region: Optional[dict] = None
     question_type: Optional[str]
     tags: list[str]
@@ -37,6 +41,10 @@ class QuestionUpdate(BaseModel):
 class ReviewDecision(BaseModel):
     question_id: UUID
     decision: Literal["collect", "ignore"]
+    correct_answer: str | None = Field(default=None, max_length=1000)
+    question_type: str | None = Field(default=None, max_length=20)
+    instruction: str | None = Field(default=None, max_length=500)
+    prompt_text: str | None = Field(default=None, max_length=5000)
 
 
 class ReviewDecisionRequest(BaseModel):

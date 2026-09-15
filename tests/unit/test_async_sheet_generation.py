@@ -690,6 +690,8 @@ def _question(question_id):
                 "question_type": "calculation",
             },
             "ocr_answer": "2",
+            "recognition_pipeline": None,
+            "answer_status": None,
         },
     )()
 
@@ -720,6 +722,361 @@ def test_create_sheet_commits_pending_record_before_dispatch(monkeypatch):
     assert sheet.generation_total == 1
     assert sheet.generation_completed == 0
     assert dispatched == [str(sheet.id)]
+
+
+def test_create_sheet_rejects_unconfirmed_chinese_marked_evidence_question(monkeypatch):
+    from app.api import sheets as sheets_api
+    from app.schemas.sheet import SheetCreate
+    from app.services.chinese_marked_evidence import PIPELINE_NAME
+
+    question = _question("question-id")
+    question.recognition_pipeline = PIPELINE_NAME
+    question.answer_status = "suggested"
+    db = _CreateSheetDb([question])
+    monkeypatch.setattr(sheets_api, "enqueue_sheet_generation", lambda _sheet_id: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            sheets_api.create_sheet(
+                SheetCreate(question_ids=["question-id"], derived_per_original=0),
+                student=type("Student", (), {"id": "student-id"})(),
+                db=db,
+            )
+        )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == "所选错题答案尚未确认，请确认后再出卷"
+    assert db.added == []
+
+
+def test_downstream_eligibility_clause_filters_records_with_sqlite():
+    from sqlalchemy import Column, MetaData, String, Table, create_engine, insert, select
+    from sqlalchemy.sql.util import ClauseAdapter
+
+    from app.services.chinese_marked_evidence import downstream_eligibility_clause
+
+    metadata = MetaData()
+    questions = Table(
+        "eligible_questions",
+        metadata,
+        Column("id", String, primary_key=True),
+        Column("recognition_pipeline", String),
+        Column("answer_status", String),
+    )
+    engine = create_engine("sqlite://")
+    metadata.create_all(engine)
+    clause = ClauseAdapter(questions, adapt_on_names=True).traverse(
+        downstream_eligibility_clause()
+    )
+    rows = [
+        {"id": "legacy-null", "recognition_pipeline": None, "answer_status": None},
+        {"id": "other", "recognition_pipeline": "legacy_ocr_v2", "answer_status": "suggested"},
+        {"id": "suggested", "recognition_pipeline": "chinese_marked_evidence_v1", "answer_status": "suggested"},
+        {"id": "unresolved", "recognition_pipeline": "chinese_marked_evidence_v1", "answer_status": "unresolved"},
+        {"id": "new-null", "recognition_pipeline": "chinese_marked_evidence_v1", "answer_status": None},
+        {"id": "confirmed", "recognition_pipeline": "chinese_marked_evidence_v1", "answer_status": "confirmed"},
+    ]
+
+    with engine.begin() as connection:
+        connection.execute(insert(questions), rows)
+        eligible_ids = connection.scalars(
+            select(questions.c.id).where(clause).order_by(questions.c.id)
+        ).all()
+
+    assert eligible_ids == ["confirmed", "legacy-null", "other"]
+
+
+def test_worker_maps_unconfirmed_practice_answer_to_questions_unavailable():
+    from app.services.practice_question import UnconfirmedPracticeAnswerError
+    from app.tasks.generate_sheet import execute_sheet_generation
+
+    class Repository:
+        failed = None
+
+        def claim(self, _sheet_id):
+            raise UnconfirmedPracticeAnswerError()
+
+        def fail(self, _sheet_id, code, message):
+            self.failed = (code, message)
+
+    repository = Repository()
+
+    asyncio.run(
+        execute_sheet_generation(
+            "sheet-id",
+            repository=repository,
+            pdf_remover=lambda _path: None,
+        )
+    )
+
+    assert repository.failed == (
+        "sheet_questions_unavailable",
+        "部分错题已不可用，请重新选择后生成",
+    )
+
+
+def _eligibility_session_factory():
+    from sqlalchemy import create_engine
+    from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+    from sqlalchemy.ext.compiler import compiles
+    from sqlalchemy.orm import sessionmaker
+
+    @compiles(JSONB, "sqlite")
+    def compile_jsonb(_type, _compiler, **_kwargs):
+        return "JSON"
+
+    @compiles(ARRAY, "sqlite")
+    def compile_array(_type, _compiler, **_kwargs):
+        return "JSON"
+
+    from app.models import Base
+    from app.models.account import Account  # noqa: F401
+    from app.models.practice_sheet import PracticeSheet  # noqa: F401
+    from app.models.student import Student  # noqa: F401
+    from app.models.wrong_image import WrongImage  # noqa: F401
+    from app.models.wrong_question import WrongQuestion
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def test_eligibility_session_factory_restores_wrong_question_tags_default():
+    from app.models.wrong_question import WrongQuestion
+
+    original_default = WrongQuestion.__table__.c.tags.default
+
+    _eligibility_session_factory()
+
+    assert WrongQuestion.__table__.c.tags.default is original_default
+
+
+def _populate_eligibility_records(session_factory):
+    from app.models.account import Account
+    from app.models.practice_sheet import PracticeSheet
+    from app.models.student import Student
+    from app.models.wrong_image import WrongImage
+    from app.models.wrong_question import WrongQuestion
+    from app.services.chinese_marked_evidence import PIPELINE_NAME
+
+    account_id = uuid4()
+    student_id = uuid4()
+    image_id = uuid4()
+    definitions = [
+        ("legacy", None, None),
+        ("other", "legacy_ocr_v2", "suggested"),
+        ("suggested", PIPELINE_NAME, "suggested"),
+        ("unresolved", PIPELINE_NAME, "unresolved"),
+        ("new-null", PIPELINE_NAME, None),
+        ("confirmed", PIPELINE_NAME, "confirmed"),
+    ]
+    tags_column = WrongQuestion.__table__.c.tags
+    original_default = tags_column.default
+    try:
+        tags_column.default = None
+        with session_factory() as db:
+            db.add(Account(id=account_id))
+            db.add(Student(id=student_id, account_id=account_id, display_name="学生"))
+            db.add(
+                WrongImage(
+                    id=image_id,
+                    student_id=student_id,
+                    original_url="image.png",
+                    grade=1,
+                    semester=1,
+                )
+            )
+            questions = {}
+            for name, pipeline, answer_status in definitions:
+                raw_json = {
+                    "instruction": "计算",
+                    "prompt_text": "1 + 1",
+                    "question_type": "calculation",
+                }
+                if pipeline == PIPELINE_NAME and answer_status == "confirmed":
+                    raw_json = {
+                        "evidence_bundle": {
+                            "human_confirmed_prompt": {
+                                "instruction": "计算",
+                                "prompt_text": "1 + 1",
+                                "question_type": "calculation",
+                                "source": "human",
+                                "actor_id": str(student_id),
+                            }
+                        }
+                    }
+                question = WrongQuestion(
+                    id=uuid4(),
+                    student_id=student_id,
+                    image_id=image_id,
+                    semester=1,
+                    grade=1,
+                    ocr_raw_json=raw_json,
+                    ocr_answer="2",
+                    tags=None,
+                    recognition_pipeline=pipeline,
+                    answer_status=answer_status,
+                    question_type=(
+                        "calculation"
+                        if pipeline == PIPELINE_NAME and answer_status == "confirmed"
+                        else None
+                    ),
+                )
+                questions[name] = question
+                db.add(question)
+            db.flush()
+            sheets = {}
+            for name, question in questions.items():
+                sheet = PracticeSheet(
+                    student_id=student_id,
+                    generation_status="pending",
+                    config_json={
+                        "question_ids": [str(question.id)],
+                        "derived_per_original": 0,
+                        "difficulty_boost": 2,
+                    },
+                )
+                sheets[name] = sheet
+                db.add(sheet)
+            db.commit()
+    finally:
+        tags_column.default = original_default
+    return student_id, questions, sheets
+
+
+def _sqlite_execute(session, statement):
+    from uuid import UUID
+
+    parameters = {}
+    for key, value in statement.compile().params.items():
+        if isinstance(value, list):
+            parameters[key] = [UUID(str(item)) for item in value]
+        elif isinstance(value, str):
+            try:
+                parameters[key] = UUID(value)
+            except ValueError:
+                parameters[key] = value
+        else:
+            parameters[key] = value
+    return session.execute(statement, parameters)
+
+
+class _SqliteSession:
+    def __init__(self, session):
+        self.session = session
+
+    def __enter__(self):
+        self.session.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self.session.__exit__(*args)
+
+    def scalar(self, statement):
+        return _sqlite_execute(self.session, statement).scalar()
+
+    def execute(self, statement):
+        return _sqlite_execute(self.session, statement)
+
+    def commit(self):
+        self.session.commit()
+
+
+def test_worker_claim_executes_eligibility_query_against_real_session():
+    from app.services.chinese_marked_evidence import eligible_questions_statement
+    from app.tasks.generate_sheet import (
+        SheetGenerationInputError,
+        SheetGenerationRepository,
+    )
+
+    session_factory = _eligibility_session_factory()
+    student_id, questions, sheets = _populate_eligibility_records(session_factory)
+    with session_factory() as db:
+        eligible = _sqlite_execute(
+            db,
+            eligible_questions_statement(
+                [str(question.id) for question in questions.values()],
+                student_id,
+            ),
+        ).scalars().all()
+
+    assert {str(question.id) for question in eligible} == {
+        str(questions["legacy"].id),
+        str(questions["other"].id),
+        str(questions["confirmed"].id),
+    }
+    with pytest.raises(SheetGenerationInputError, match="unavailable"):
+        SheetGenerationRepository(lambda: _SqliteSession(session_factory())).claim(
+            str(sheets["suggested"].id)
+        )
+    repository = SheetGenerationRepository(lambda: _SqliteSession(session_factory()))
+    assert repository.claim(
+        str(sheets["legacy"].id)
+    ) is not None
+    assert repository.claim(
+        str(sheets["confirmed"].id)
+    ) is not None
+
+
+def test_create_sheet_executes_eligibility_query_against_real_session(monkeypatch):
+    from app.api import sheets as sheets_api
+    from app.schemas.sheet import SheetCreate
+
+    class AsyncQueryDb:
+        def __init__(self, session):
+            self.session = session
+            self.added = []
+
+        async def execute(self, statement):
+            return _sqlite_execute(self.session, statement)
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            pass
+
+        async def refresh(self, value):
+            value.id = value.id or uuid4()
+            value.created_at = datetime(2026, 8, 17, 12, 0, 0)
+            value.updated_at = datetime(2026, 8, 17, 12, 0, 0)
+
+    session_factory = _eligibility_session_factory()
+    student_id, questions, _sheets = _populate_eligibility_records(session_factory)
+    student = type("Student", (), {"id": student_id})()
+    monkeypatch.setattr(sheets_api, "enqueue_sheet_generation", lambda _sheet_id: None)
+
+    with session_factory() as session:
+        db = AsyncQueryDb(session)
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                sheets_api.create_sheet(
+                    SheetCreate(
+                        question_ids=[str(questions["unresolved"].id)],
+                        derived_per_original=0,
+                    ),
+                    student=student,
+                    db=db,
+                )
+            )
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Some selected questions are unavailable"
+
+    for name in ("legacy", "confirmed"):
+        with session_factory() as session:
+            db = AsyncQueryDb(session)
+            sheet = asyncio.run(
+                sheets_api.create_sheet(
+                    SheetCreate(
+                        question_ids=[str(questions[name].id)],
+                        derived_per_original=0,
+                    ),
+                    student=student,
+                    db=db,
+                )
+            )
+        assert len(db.added) == 1
+        assert sheet.generation_total == 1
 
 
 class _OwnedSheetDb:

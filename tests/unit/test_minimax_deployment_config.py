@@ -46,6 +46,15 @@ EXPECTED_ADAPTIVE_EVIDENCE_SETTINGS = {
 }
 
 
+EXPECTED_CHINESE_MARKED_EVIDENCE_SETTINGS = {
+    "CHINESE_MARKED_EVIDENCE_ENABLED": "false",
+    "CHINESE_MARKED_EVIDENCE_SUBJECTS": "chinese",
+    "CHINESE_MARKED_EVIDENCE_PAGE_TIMEOUT_SECONDS": "30",
+    "CHINESE_MARKED_EVIDENCE_LOCALIZATION_RECHECK_LIMIT": "1",
+    "CHINESE_MARKED_EVIDENCE_OCR_CROP_RECHECK_LIMIT": "3",
+}
+
+
 def test_worker_receives_every_minimax_setting_without_a_secret_value():
     compose = (BACKEND_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
@@ -161,6 +170,33 @@ def test_adaptive_local_evidence_settings_are_bounded():
         Settings(_env_file=None, MINIMAX_CONTENT_BATCH_SIZE=0)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, CELERY_WORKER_CONCURRENCY=17)
+
+
+def test_chinese_marked_evidence_settings_are_validated_and_deployed():
+    settings = Settings(_env_file=None)
+
+    assert settings.CHINESE_MARKED_EVIDENCE_ENABLED is False
+    assert settings.CHINESE_MARKED_EVIDENCE_SUBJECTS == "chinese"
+    assert settings.CHINESE_MARKED_EVIDENCE_PAGE_TIMEOUT_SECONDS == 30
+    assert settings.CHINESE_MARKED_EVIDENCE_LOCALIZATION_RECHECK_LIMIT == 1
+    assert settings.CHINESE_MARKED_EVIDENCE_OCR_CROP_RECHECK_LIMIT == 3
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, CHINESE_MARKED_EVIDENCE_PAGE_TIMEOUT_SECONDS=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, CHINESE_MARKED_EVIDENCE_PAGE_TIMEOUT_SECONDS=121)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, CHINESE_MARKED_EVIDENCE_LOCALIZATION_RECHECK_LIMIT=4)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, CHINESE_MARKED_EVIDENCE_OCR_CROP_RECHECK_LIMIT=21)
+
+    compose = (BACKEND_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    env_example = (BACKEND_ROOT / ".env.example").read_text(encoding="utf-8")
+    for service in ("api", "worker"):
+        section = compose.split(f"  {service}:", 1)[1]
+        for name, default in EXPECTED_CHINESE_MARKED_EVIDENCE_SETTINGS.items():
+            assert f"{name}: ${{{name}:-{default}}}" in section
+            assert f"{name}={default}" in env_example
 
 
 def test_worker_passes_correction_group_settings_to_recognition_batch():

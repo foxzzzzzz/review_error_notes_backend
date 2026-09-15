@@ -14,7 +14,7 @@ import time
 import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, List, Literal, Optional
+from typing import TYPE_CHECKING, Callable, List, Literal, Optional
 
 import httpx
 from PIL import Image, ImageOps
@@ -49,6 +49,9 @@ from app.services.question_image import (
 )
 from app.services.recognition_policy import decide_candidate
 from app.services.tag_normalization import normalize_tags
+
+if TYPE_CHECKING:
+    from app.services.local_ocr_verification import OCRPageEvidence
 
 
 VISION_PATH = "/v1/coding_plan/vlm"
@@ -140,14 +143,18 @@ CONTENT_RECOGNITION_PROMPT = """你是小学错题内容识别器。图片由若
 
 要求：
 1. 每个输入 mark_id 恰好返回一次，不得修改 mark_id，不得增加图片中不存在的题目。
-2. 识别题目要求、印刷提示、学生实际作答、建议正确答案、科目、题型、标签、难度和置信度。
-3. 未作答时 raw_text 必须是空字符串；证据不足的片段写入 uncertain_segments。
-4. 不得修改题目坐标，不得识别或重新分配红色标记。
-5. subject 只能是 "math"、"chinese"、"english" 之一。
-6. question_type 只能是 "write_pinyin"、"write_word"、"fill_blank"、"calculation"、"other" 之一；无法确定时使用 "other"。
-7. instruction 和 prompt_text 都不得为空或 null。看不到完整章节标题时，根据裁图内可见题型生成简洁 instruction；确实没有独立印刷提示时，将 prompt_text 写为“题目提示未完整显示”，并把 prompt_text 加入 uncertain_segments。
-8. 只返回严格 JSON：{"items":[{"mark_id":0,"raw_text":"图片中的学生作答","instruction":"图片中的题目要求","prompt_text":"图片中的印刷提示","normalized_text":null,"answer":"建议正确答案","subject":"chinese","question_type":"other","tags":[],"difficulty":3,"confidence":0.95,"uncertain_segments":[]}]}；示例值只说明结构，必须按裁图替换。
-9. 最外层必须是对象，根字段必须是 "items"；即使只有一道题，也必须放入 items 数组。
+2. 识别题目要求、印刷提示、学生实际作答、建议正确答案、科目、题型、标签、难度和置信度。印刷题面分别记录题目要求、提示、拼音、汉字。
+3. 每个空间观察均包含 source="deepseek"、source_class、text、bbox 和 confidence。学生作答格中的文字按 student_handwriting 输出；老师红笔文字按 teacher_correction 输出；看不清或来源不确定时使用 unknown 并写入 uncertain_observations。
+4. 所有新 observation 的 bbox 必须为有限 float，使用 [left, top, right, bottom]，范围在 [0,1] 且有正面积。坐标相对于对应 mark_id 面板中去除 mark_id 标签/拼图空白后的独立题目照片区域，不是整张拼图，也不是重新定位 question bbox/红标。
+5. 新观察字段只可记录照片中直接可见的印刷文字或笔迹；不可见时分别填 null 或 []。不得将生成、推断的 legacy instruction、prompt_text 或 answer 包装成新观察。
+6. 不得因为候选能组成常见词、通过词典/拼音校验或看起来合理，就把手写内容改成 printed。answer 只是可空建议，不代表已确认正确答案；不得自动补全。
+7. 未作答时 raw_text 必须是空字符串；证据不足的片段写入 uncertain_segments。
+8. 不得修改题目坐标，也不得修改 mark_id，也不得修改或重新分配题目坐标/红标。
+9. subject 只能是 "math"、"chinese"、"english" 之一。
+10. question_type 只能是 "write_pinyin"、"write_word"、"fill_blank"、"calculation"、"other" 之一；无法确定时使用 "other"。
+11. instruction 和 prompt_text 都不得为空或 null。看不到完整章节标题时，根据裁图内可见题型生成简洁 instruction；确实没有独立印刷提示时，将 prompt_text 写为“题目提示未完整显示”，并把 prompt_text 加入 uncertain_segments。
+12. 只返回严格 JSON：{"items":[{"mark_id":0,"raw_text":"图片中的学生作答","instruction":"图片中的题目要求","prompt_text":"图片中的印刷提示","normalized_text":null,"answer":null,"subject":"chinese","question_type":"other","tags":[],"difficulty":3,"confidence":0.95,"uncertain_segments":[],"printed_instruction":{"source":"deepseek","source_class":"printed","text":"图片中的题目要求","bbox":[0.1,0.1,0.8,0.2],"confidence":0.95},"printed_prompt":{"source":"deepseek","source_class":"printed","text":"图片中的印刷提示","bbox":[0.1,0.2,0.8,0.3],"confidence":0.95},"printed_pinyin":null,"printed_hanzi":null,"student_handwriting":{"source":"deepseek","source_class":"student_handwriting","text":"图片中的学生作答","bbox":[0.1,0.3,0.8,0.4],"confidence":0.95},"teacher_correction":null,"uncertain_observations":[]}]}；示例值只说明结构，必须按裁图替换。
+13. 最外层必须是对象，根字段必须是 "items"；即使只有一道题，也必须放入 items 数组。
 
 输入 mark_ids：__MARK_IDS__
 """
@@ -441,8 +448,74 @@ class RegionalMarkDetectionResult(BaseModel):
         return self
 
 
+class ContentObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    source: Literal["deepseek"]
+    source_class: Literal[
+        "printed", "student_handwriting", "teacher_correction", "unknown"
+    ]
+    text: str
+    bbox: List[float]
+    confidence: float
+
+    @field_validator("text")
+    @classmethod
+    def text_must_not_be_blank(cls, value):
+        if not value.strip():
+            raise ValueError("observation text must not be blank")
+        return value
+
+    @field_validator("bbox", mode="before")
+    @classmethod
+    def bbox_must_use_strict_finite_floats(cls, value):
+        if (
+            not isinstance(value, list)
+            or len(value) != 4
+            or any(type(coordinate) is not float for coordinate in value)
+            or any(not math.isfinite(coordinate) for coordinate in value)
+        ):
+            raise ValueError("bbox must contain four finite float coordinates")
+        return validate_normalized_bbox(value)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def confidence_must_be_a_finite_normalized_float(cls, value):
+        if type(value) is not float or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("confidence must be a finite normalized float")
+        return value
+
+
 class ContentRecognitionItem(VisionItem):
     mark_id: int = Field(ge=0)
+    printed_instruction: Optional[ContentObservation] = None
+    printed_prompt: Optional[ContentObservation] = None
+    printed_pinyin: Optional[ContentObservation] = None
+    printed_hanzi: Optional[ContentObservation] = None
+    student_handwriting: Optional[ContentObservation] = None
+    teacher_correction: Optional[ContentObservation] = None
+    uncertain_observations: List[ContentObservation] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def observation_roles_must_match_fields(self):
+        expected_roles = {
+            "printed_instruction": "printed",
+            "printed_prompt": "printed",
+            "printed_pinyin": "printed",
+            "printed_hanzi": "printed",
+            "student_handwriting": "student_handwriting",
+            "teacher_correction": "teacher_correction",
+        }
+        for field_name, source_class in expected_roles.items():
+            observation = getattr(self, field_name)
+            if observation is not None and observation.source_class != source_class:
+                raise ValueError(f"{field_name} source_class must be {source_class}")
+        if any(
+            observation.source_class != "unknown"
+            for observation in self.uncertain_observations
+        ):
+            raise ValueError("uncertain observations must use source_class unknown")
+        return self
 
 
 class ContentRecognitionResult(BaseModel):
@@ -1664,12 +1737,23 @@ def _localize_circle_mark_context(
     edge_margin_ratio: float,
     fallback_min_width_ratio: float,
     fallback_min_height_ratio: float,
+    evidence_mode: bool = False,
+    deadline: float | None = None,
 ) -> tuple[LocalizationItem, List[dict]]:
     circle_bbox = mark.circle_bbox or mark.bbox
     attempts = []
     last_context = None
     last_confidence = mark.confidence
     for attempt_index in range(retry_count + 1):
+        if evidence_mode and deadline is not None and time.monotonic() >= deadline:
+            attempts.append(
+                {
+                    "attempt": attempt_index + 1,
+                    "failure_reasons": ["deadline_exhausted"],
+                    "edge_touched": False,
+                }
+            )
+            break
         context = render_mark_context(
             image_path,
             circle_bbox,
@@ -1686,21 +1770,28 @@ def _localize_circle_mark_context(
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temporary:
                 temporary.write(context.image_bytes)
                 temporary_path = temporary.name
-            result = client.locate_marked_question_context(
-                temporary_path,
-                _mark_in_context(mark, context.page_bbox),
-                correction=(
-                    {"previous_failure_reasons": attempts[-1]["failure_reasons"]}
-                    if attempts
-                    else None
-                ),
-            )
-            item = next(
-                (candidate for candidate in result.items if candidate.mark_id == mark.mark_id),
-                None,
-            )
+            if evidence_mode and deadline is not None and time.monotonic() >= deadline:
+                failure_reasons = ["deadline_exhausted"]
+            else:
+                result = client.locate_marked_question_context(
+                    temporary_path,
+                    _mark_in_context(mark, context.page_bbox),
+                    correction=(
+                        {"previous_failure_reasons": attempts[-1]["failure_reasons"]}
+                        if attempts
+                        else None
+                    ),
+                )
+                item = next(
+                    (candidate for candidate in result.items if candidate.mark_id == mark.mark_id),
+                    None,
+                )
         except VisionRecognitionError as exc:
             failure_reasons = [exc.code]
+        except (httpx.TimeoutException, TimeoutError):
+            if not evidence_mode:
+                raise
+            failure_reasons = ["vision_timeout"]
         finally:
             if temporary_path is not None:
                 Path(temporary_path).unlink(missing_ok=True)
@@ -1804,6 +1895,405 @@ def _localize_circle_mark_context(
     )
 
 
+def _mark_neighborhood_localization(
+    *,
+    image_path: str,
+    mark: ErrorMark,
+    padding_ratio: float,
+    image_max_edge: int,
+    image_jpeg_quality: int,
+    image_max_pixels: int,
+    min_width_ratio: float,
+    min_height_ratio: float,
+) -> LocalizationItem:
+    """Build a review-only crop around a confirmed mark without another model call."""
+    context = render_mark_context(
+        image_path,
+        mark.bbox,
+        padding_ratio=padding_ratio,
+        max_edge=image_max_edge,
+        jpeg_quality=image_jpeg_quality,
+        max_pixels=image_max_pixels,
+    )
+    return LocalizationItem(
+        index=0,
+        matched=True,
+        mark_ids=[mark.mark_id],
+        bbox=expand_bbox_to_minimum_context(
+            context.page_bbox,
+            min_width_ratio=min_width_ratio,
+            min_height_ratio=min_height_ratio,
+        ),
+        geometry_diagnostic={
+            "passed": False,
+            "failure_reasons": ["mark_localization_unavailable"],
+        },
+        bbox_source="mark_neighborhood_fallback",
+        localization_status="needs_review",
+        confidence=mark.confidence,
+    )
+
+
+def _padded_question_page_bbox(
+    image_path: str,
+    question_bbox: List[float],
+    padding_ratio: float,
+) -> List[float]:
+    """Return the exact page extent used for a question panel's photo area."""
+    left, top, right, bottom = validate_normalized_bbox(question_bbox)
+    width = right - left
+    height = bottom - top
+    padded = [
+        max(0.0, left - width * padding_ratio),
+        max(0.0, top - height * padding_ratio),
+        min(1.0, right + width * padding_ratio),
+        min(1.0, bottom + height * padding_ratio),
+    ]
+    with Image.open(image_path) as source:
+        page_width, page_height = ImageOps.exif_transpose(source).size
+    pixel_left = max(0, min(page_width - 1, math.floor(padded[0] * page_width)))
+    pixel_top = max(0, min(page_height - 1, math.floor(padded[1] * page_height)))
+    pixel_right = max(
+        pixel_left + 1,
+        min(page_width, math.ceil(padded[2] * page_width)),
+    )
+    pixel_bottom = max(
+        pixel_top + 1,
+        min(page_height, math.ceil(padded[3] * page_height)),
+    )
+    return [
+        pixel_left / page_width,
+        pixel_top / page_height,
+        pixel_right / page_width,
+        pixel_bottom / page_height,
+    ]
+
+
+def _is_deepseek_evidence_client(client) -> bool:
+    """Trust source-aware observations only from the actual DeepSeek adapter."""
+    from app.services.deepseek_vision import DeepSeekVisionClient
+
+    return isinstance(client, DeepSeekVisionClient)
+
+
+def _positive_area_intersection(first: List[float], second: List[float]) -> bool:
+    return max(first[0], second[0]) < min(first[2], second[2]) and max(
+        first[1], second[1]
+    ) < min(first[3], second[3])
+
+
+def _valid_page_observation_bbox(value) -> List[float] | None:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 4
+        or any(
+            isinstance(coordinate, bool)
+            or not isinstance(coordinate, (int, float))
+            or not math.isfinite(coordinate)
+            for coordinate in value
+        )
+    ):
+        return None
+    bbox = [float(coordinate) for coordinate in value]
+    if not (0 <= bbox[0] < bbox[2] <= 1 and 0 <= bbox[1] < bbox[3] <= 1):
+        return None
+    return bbox
+
+
+def _content_evidence_observations(
+    content_item: ContentRecognitionItem | None,
+    panel_page_bbox: List[float],
+):
+    from app.services.chinese_marked_evidence import EvidenceObservation
+
+    if content_item is None:
+        return []
+    role_fields = {
+        "printed_instruction": "printed_instruction",
+        "printed_prompt": "printed_prompt",
+        "printed_pinyin": "printed_pinyin",
+        "printed_hanzi": "printed_hanzi",
+        "student_handwriting": "student_answer",
+        "teacher_correction": "teacher_correction",
+    }
+    observations = []
+    for field_name, role in role_fields.items():
+        observation = getattr(content_item, field_name)
+        if observation is None:
+            continue
+        observations.append(
+            EvidenceObservation(
+                source="deepseek",
+                source_class=observation.source_class,
+                text=observation.text,
+                bbox=[
+                    float(value)
+                    for value in local_bbox_to_page(
+                        observation.bbox,
+                        panel_page_bbox,
+                    )
+                ],
+                confidence=float(observation.confidence),
+                role=role,
+            )
+        )
+    for observation in content_item.uncertain_observations:
+        observations.append(
+            EvidenceObservation(
+                source="deepseek",
+                source_class="unknown",
+                text=observation.text,
+                bbox=[
+                    float(value)
+                    for value in local_bbox_to_page(
+                        observation.bbox,
+                        panel_page_bbox,
+                    )
+                ],
+                confidence=float(observation.confidence),
+                role="unknown",
+            )
+        )
+    return observations
+
+
+def _ocr_evidence_for_question(ocr_page_evidence, question_bbox: List[float]):
+    from app.services.chinese_marked_evidence import EvidenceObservation
+
+    if ocr_page_evidence is None or ocr_page_evidence.status != "available":
+        return [], []
+    observations = []
+    selected_lines = []
+    for line in ocr_page_evidence.lines:
+        bbox = _valid_page_observation_bbox(line.bbox)
+        if (
+            bbox is None
+            or not line.text.strip()
+            or not _positive_area_intersection(bbox, question_bbox)
+        ):
+            continue
+        observations.append(
+            EvidenceObservation(
+                source="ocr",
+                source_class="unknown",
+                text=line.text,
+                bbox=bbox,
+                confidence=float(line.confidence),
+                role="unknown",
+            )
+        )
+        selected_lines.append(
+            {"text": line.text, "confidence": line.confidence, "bbox": bbox}
+        )
+    return observations, selected_lines
+
+
+def _evidence_question_geometry(
+    localization: LocalizationItem,
+    mark: ErrorMark,
+) -> dict:
+    return {
+        "bbox": list(localization.bbox),
+        "question_bbox": list(localization.bbox),
+        "answer_bbox": (
+            list(localization.answer_bbox)
+            if localization.answer_bbox is not None
+            else None
+        ),
+        "prompt_bbox": (
+            list(localization.prompt_bbox)
+            if localization.prompt_bbox is not None
+            else None
+        ),
+        "localization": {
+            "bbox_source": localization.bbox_source,
+            "localization_status": localization.localization_status,
+            "confidence": localization.confidence,
+            "geometry_diagnostic": localization.geometry_diagnostic,
+        },
+        "mark": mark.model_dump(mode="json"),
+    }
+
+
+def _evidence_values_for_marks(
+    *,
+    client,
+    image_path: str,
+    image_id,
+    subject_hint: str | None,
+    located_by_mark: dict[int, LocalizationItem],
+    marks_by_id: dict[int, ErrorMark],
+    content_by_mark: dict[int, ContentRecognitionItem],
+    ocr_page_evidence,
+    crop_context_padding_ratio: float,
+    diagnostic: dict,
+):
+    from app.services.chinese_marked_evidence import (
+        assemble_question_evidence,
+        build_pending_evidence_values,
+    )
+
+    trusted_deepseek = _is_deepseek_evidence_client(client)
+    values = []
+    localizations = {}
+    for index, mark_id in enumerate(sorted(located_by_mark)):
+        localization = located_by_mark[mark_id]
+        mark = marks_by_id[mark_id]
+        content_item = content_by_mark.get(mark_id)
+        panel_page_bbox = _padded_question_page_bbox(
+            image_path,
+            localization.bbox,
+            crop_context_padding_ratio,
+        )
+        deepseek_observations = (
+            _content_evidence_observations(content_item, panel_page_bbox)
+            if trusted_deepseek
+            else []
+        )
+        ocr_observations, selected_ocr_lines = _ocr_evidence_for_question(
+            ocr_page_evidence,
+            localization.bbox,
+        )
+        localization_structure_observation = {
+            "student_answer_bbox": localization.answer_bbox,
+            "printed_prompt_bbox": localization.prompt_bbox,
+        }
+        localization_structure_observation = {
+            key: list(value)
+            for key, value in localization_structure_observation.items()
+            if value is not None
+        }
+        structure_observation = dict(localization_structure_observation)
+        role_routing_hints = {
+            observation.role: list(observation.bbox)
+            for observation in deepseek_observations
+            if observation.role.startswith("printed_")
+        }
+        question_geometry = _evidence_question_geometry(localization, mark)
+        mark_status = (
+            "confirmed"
+            if localization.localization_status == "verified"
+            else "needs_review"
+        )
+        bundle = assemble_question_evidence(
+            image_id=image_id,
+            mark_id=mark_id,
+            question_geometry=question_geometry,
+            deepseek_observations=deepseek_observations,
+            ocr_observations=ocr_observations,
+            structure_observation=structure_observation,
+            role_routing_hints=role_routing_hints,
+            suggested_answer_candidate=(
+                content_item.answer if content_item is not None else None
+            ),
+            mark_status=mark_status,
+        )
+        display_bbox = marker_focused_display_bbox(
+            localization_bbox=localization.bbox,
+            mark_ids=[mark_id],
+            marks=marks_by_id,
+            padding_ratio=crop_context_padding_ratio,
+        )
+        crop_region = {
+            "bbox": display_bbox,
+            "localization_bbox": list(localization.bbox),
+            "bbox_format": "normalized_ltrb",
+            "bbox_source": localization.bbox_source,
+            "bbox_confidence": localization.confidence,
+            "localization_status": localization.localization_status,
+            "display_context_padding_ratio": crop_context_padding_ratio,
+            "mark_ids": [mark_id],
+            "index": index,
+        }
+        matching_content_errors = [
+            item
+            for item in diagnostic["content_error_diagnostics"]
+            if mark_id in item["mark_ids"]
+        ]
+        matching_invalid_items = [
+            item
+            for item in diagnostic["content_invalid_item_diagnostics"]
+            if item.get("mark_id") == mark_id
+        ]
+        if content_item is not None:
+            content_diagnostic = {"status": "available"}
+            if matching_invalid_items:
+                content_diagnostic["prior_invalid_items"] = matching_invalid_items
+        elif matching_content_errors:
+            content_diagnostic = {
+                "status": "error",
+                "errors": matching_content_errors,
+            }
+        elif matching_invalid_items:
+            content_diagnostic = {
+                "status": "invalid",
+                "invalid_items": matching_invalid_items,
+            }
+        elif diagnostic["content_deadline_exhausted"]:
+            content_diagnostic = {"status": "deadline_exhausted"}
+        else:
+            content_diagnostic = {"status": "missing"}
+        ocr_page_status = (
+            {
+                "status": ocr_page_evidence.status,
+                "duration_ms": ocr_page_evidence.duration_ms,
+                "error_code": ocr_page_evidence.error_code,
+                "prepared_size": ocr_page_evidence.prepared_size,
+            }
+            if ocr_page_evidence is not None
+            else {"status": "not_provided"}
+        )
+        student_text = None
+        if content_item is not None:
+            if trusted_deepseek and content_item.student_handwriting is not None:
+                student_text = content_item.student_handwriting.text
+            elif content_item.raw_text.strip():
+                student_text = content_item.raw_text
+        value = build_pending_evidence_values(
+            bundle,
+            student_text=student_text,
+            question_type=(
+                content_item.question_type if content_item is not None else None
+            ),
+            crop_region=crop_region,
+            subject=(
+                content_item.subject if content_item is not None else subject_hint
+            ),
+            tags=content_item.tags if content_item is not None else [],
+            difficulty=content_item.difficulty if content_item is not None else None,
+            raw_evidence={
+                "schema_version": 1,
+                "mark": mark.model_dump(mode="json"),
+                "localization": localization.model_dump(mode="json"),
+                "localization_structure_observation": (
+                    localization_structure_observation
+                ),
+                "structure_observation": structure_observation,
+                "role_routing_hints": role_routing_hints,
+                "panel_page_bbox": panel_page_bbox,
+                "deepseek_observations_trusted": bool(
+                    trusted_deepseek and content_item is not None
+                ),
+                "deepseek_content": (
+                    content_item.model_dump(mode="json")
+                    if trusted_deepseek and content_item is not None
+                    else None
+                ),
+                "untrusted_content": (
+                    content_item.model_dump(mode="json")
+                    if not trusted_deepseek and content_item is not None
+                    else None
+                ),
+                "content_diagnostic": content_diagnostic,
+                "ocr_page": ocr_page_status,
+                "selected_ocr_lines": selected_ocr_lines,
+            },
+        )
+        values.append(value)
+        localizations[index] = localization.model_copy(update={"index": index})
+    return values, localizations
+
+
 def recognize_marked_three_stage(
     *,
     client,
@@ -1838,8 +2328,16 @@ def recognize_marked_three_stage(
     evidence_context_min_height_ratio: float = 0.14,
     local_red_evidence_regions: Optional[List[RedMarkRegion]] = None,
     local_red_rescue_min_pixels: int = 80,
-) -> tuple[VisionResult, dict[int, LocalizationItem], List[ErrorMark], dict]:
+    evidence_mode: bool = False,
+    image_id: str | int | None = None,
+    ocr_page_evidence: OCRPageEvidence | None = None,
+    deadline: float | None = None,
+) -> tuple[VisionResult | list[dict], dict[int, LocalizationItem], List[ErrorMark], dict]:
     """Run isolated mark, geometry, and content stages for a marked page."""
+    if evidence_mode and image_id is None:
+        raise ValueError("image_id is required in evidence mode")
+    if evidence_mode and not isinstance(image_id, (str, int)):
+        image_id = str(image_id)
     diagnostic = {
         "recognition_pipeline": "three_stage",
         "mark_llm_ms": 0.0,
@@ -1861,6 +2359,29 @@ def recognize_marked_three_stage(
         "unlocalized_mark_ids": [],
         "missing_content_mark_ids": [],
     }
+    if evidence_mode:
+        diagnostic.update(
+            {
+                "content_error_diagnostics": [],
+                "content_deadline_exhausted": False,
+                "localization_error_diagnostics": [],
+                "mark_error_diagnostics": [],
+                "deadline_exhausted_stage": None,
+            }
+        )
+
+    def evidence_deadline_expired(stage: str) -> bool:
+        expired = bool(
+            evidence_mode
+            and deadline is not None
+            and time.monotonic() >= deadline
+        )
+        if expired:
+            diagnostic["content_deadline_exhausted"] = True
+            diagnostic["deadline_exhausted_stage"] = (
+                diagnostic.get("deadline_exhausted_stage") or stage
+            )
+        return expired
     started = time.perf_counter()
     evidence_regions = (
         [region.model_copy(deep=True) for region in local_red_evidence_regions]
@@ -1900,6 +2421,8 @@ def recognize_marked_three_stage(
         client, "detect_marks_in_regions"
     )
     for mark_attempt in range(mark_stage_retry_count + 1):
+        if evidence_deadline_expired("mark_detection"):
+            break
         diagnostic["mark_llm_attempts"] += 1
         if mark_attempt and targeted_detection_available:
             region_sheet = render_numbered_region_sheet(
@@ -1919,13 +2442,36 @@ def recognize_marked_three_stage(
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temporary:
                     temporary.write(region_sheet.image_bytes)
                     temporary_path = temporary.name
-                regional_result = client.detect_marks_in_regions(
-                    temporary_path,
-                    sorted(region_sheet.page_bboxes),
-                    correction=(
-                        "上次整页检测不完整；必须逐个检查全部编号区域，并输出完整红圈和完整红叉。"
-                    ),
-                )
+                if evidence_deadline_expired("mark_detection"):
+                    break
+                try:
+                    regional_result = client.detect_marks_in_regions(
+                        temporary_path,
+                        sorted(region_sheet.page_bboxes),
+                        correction=(
+                            "上次整页检测不完整；必须逐个检查全部编号区域，并输出完整红圈和完整红叉。"
+                        ),
+                    )
+                except (
+                    VisionRecognitionError,
+                    httpx.TimeoutException,
+                    TimeoutError,
+                ) as exc:
+                    if not evidence_mode or not valid_marks:
+                        raise
+                    diagnostic["mark_error_diagnostics"].append(
+                        {
+                            "attempt": mark_attempt + 1,
+                            "entry": "targeted",
+                            "error_code": (
+                                exc.code
+                                if isinstance(exc, VisionRecognitionError)
+                                else "vision_timeout"
+                            ),
+                            "diagnostic": safe_recognition_diagnostic(exc),
+                        }
+                    )
+                    break
             finally:
                 if temporary_path is not None:
                     Path(temporary_path).unlink(missing_ok=True)
@@ -1946,16 +2492,37 @@ def recognize_marked_three_stage(
             diagnostic["targeted_mark_llm_attempts"] += 1
             diagnostic["targeted_region_count"] = len(region_sheet.page_bboxes)
         else:
-            detected = client.detect_marks(
-                image_path,
-                local_red_regions,
-                correction=(
-                    "上次仍有本地红色候选区域未被覆盖，请重点复查这些区域并只输出独立几何形状："
-                    + json.dumps(uncovered_regions, separators=(",", ":"))
-                    if mark_attempt
-                    else None
-                ),
-            )
+            try:
+                detected = client.detect_marks(
+                    image_path,
+                    local_red_regions,
+                    correction=(
+                        "上次仍有本地红色候选区域未被覆盖，请重点复查这些区域并只输出独立几何形状："
+                        + json.dumps(uncovered_regions, separators=(",", ":"))
+                        if mark_attempt
+                        else None
+                    ),
+                )
+            except (
+                VisionRecognitionError,
+                httpx.TimeoutException,
+                TimeoutError,
+            ) as exc:
+                if not evidence_mode or not valid_marks:
+                    raise
+                diagnostic["mark_error_diagnostics"].append(
+                    {
+                        "attempt": mark_attempt + 1,
+                        "entry": "direct",
+                        "error_code": (
+                            exc.code
+                            if isinstance(exc, VisionRecognitionError)
+                            else "vision_timeout"
+                        ),
+                        "diagnostic": safe_recognition_diagnostic(exc),
+                    }
+                )
+                break
         diagnostic["mark_primitive_count"] = len(detected.error_marks)
         attempt_marks, _rejected_mark_ids, _mark_diagnostics = filter_valid_error_marks(
             image_path,
@@ -2062,6 +2629,8 @@ def recognize_marked_three_stage(
         else []
     )
     for mark in context_marks:
+        if evidence_deadline_expired("mark_localization"):
+            break
         localization, attempt_diagnostics = _localize_circle_mark_context(
             client=client,
             image_path=image_path,
@@ -2079,6 +2648,8 @@ def recognize_marked_three_stage(
             edge_margin_ratio=localization_edge_margin_ratio,
             fallback_min_width_ratio=evidence_context_min_width_ratio,
             fallback_min_height_ratio=evidence_context_min_height_ratio,
+            evidence_mode=evidence_mode,
+            deadline=deadline,
         )
         diagnostic["localization_llm_attempts"] += len(attempt_diagnostics)
         if mark.mark_id in review_required_mark_ids:
@@ -2101,7 +2672,6 @@ def recognize_marked_three_stage(
     for localization_attempt in range(localization_stage_retry_count + 1):
         if not legacy_marks:
             break
-        diagnostic["localization_llm_attempts"] += 1
         missing_before = sorted(
             mark.mark_id
             for mark in legacy_marks
@@ -2109,15 +2679,34 @@ def recognize_marked_three_stage(
         )
         if not missing_before:
             break
-        location_result = client.locate_marked_questions(
-            image_path,
-            [marks_by_id[mark_id] for mark_id in missing_before],
-            correction=(
-                {"missing_mark_ids": missing_before}
-                if localization_attempt
-                else None
-            ),
-        )
+        if evidence_deadline_expired("mark_localization"):
+            break
+        diagnostic["localization_llm_attempts"] += 1
+        try:
+            location_result = client.locate_marked_questions(
+                image_path,
+                [marks_by_id[mark_id] for mark_id in missing_before],
+                correction=(
+                    {"missing_mark_ids": missing_before}
+                    if localization_attempt
+                    else None
+                ),
+            )
+        except (VisionRecognitionError, httpx.TimeoutException, TimeoutError) as exc:
+            if not evidence_mode:
+                raise
+            diagnostic["localization_error_diagnostics"].append(
+                {
+                    "mark_ids": missing_before,
+                    "error_code": (
+                        exc.code
+                        if isinstance(exc, VisionRecognitionError)
+                        else "vision_timeout"
+                    ),
+                    "diagnostic": safe_recognition_diagnostic(exc),
+                }
+            )
+            break
         for item in location_result.items:
             if (
                 item.mark_id not in missing_before
@@ -2135,6 +2724,8 @@ def recognize_marked_three_stage(
                 matched=True,
                 mark_ids=[item.mark_id],
                 bbox=item.bbox,
+                answer_bbox=item.answer_bbox if evidence_mode else None,
+                prompt_bbox=item.prompt_bbox if evidence_mode else None,
                 geometry_diagnostic={
                     "passed": True,
                     "failure_reasons": [],
@@ -2150,6 +2741,28 @@ def recognize_marked_three_stage(
                 ),
                 confidence=item.confidence,
             )
+    if evidence_mode:
+        placeholder_mark_ids = sorted(set(marks_by_id) - set(located_by_mark))
+        for mark_id in placeholder_mark_ids:
+            located_by_mark[mark_id] = _mark_neighborhood_localization(
+                image_path=image_path,
+                mark=marks_by_id[mark_id],
+                padding_ratio=circle_context_padding_ratio,
+                image_max_edge=image_max_edge,
+                image_jpeg_quality=image_jpeg_quality,
+                image_max_pixels=image_max_pixels,
+                min_width_ratio=evidence_context_min_width_ratio,
+                min_height_ratio=evidence_context_min_height_ratio,
+            )
+            diagnostic["per_mark_localization"].append(
+                {
+                    "mark_id": mark_id,
+                    "attempts": [],
+                    "bbox_source": "mark_neighborhood_fallback",
+                    "localization_status": "needs_review",
+                }
+            )
+        diagnostic["localization_placeholder_mark_ids"] = placeholder_mark_ids
     for mark in valid_marks:
         if mark.mark_type != "cross" or mark.mark_id in located_by_mark:
             continue
@@ -2223,6 +2836,8 @@ def recognize_marked_three_stage(
         for _content_attempt in range(content_stage_retry_count + 1):
             if not pending_ids:
                 break
+            if evidence_deadline_expired("content_recognition"):
+                break
             sheet_content = render_numbered_question_sheet(
                 image_path,
                 [(mark_id, located_by_mark[mark_id].bbox) for mark_id in pending_ids],
@@ -2236,12 +2851,34 @@ def recognize_marked_three_stage(
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temporary:
                     temporary.write(sheet_content)
                     temporary_path = temporary.name
+                if evidence_deadline_expired("content_recognition"):
+                    break
                 diagnostic["content_llm_attempts"] += 1
-                content_result = client.recognize_localized_content(
-                    temporary_path,
-                    pending_ids,
-                    subject_hint,
-                )
+                try:
+                    content_result = client.recognize_localized_content(
+                        temporary_path,
+                        pending_ids,
+                        subject_hint,
+                    )
+                except (
+                    VisionRecognitionError,
+                    httpx.TimeoutException,
+                    TimeoutError,
+                ) as exc:
+                    if not evidence_mode:
+                        raise
+                    diagnostic["content_error_diagnostics"].append(
+                        {
+                            "mark_ids": list(pending_ids),
+                            "error_code": (
+                                exc.code
+                                if isinstance(exc, VisionRecognitionError)
+                                else "vision_timeout"
+                            ),
+                            "diagnostic": safe_recognition_diagnostic(exc),
+                        }
+                    )
+                    break
             finally:
                 if temporary_path is not None:
                     Path(temporary_path).unlink(missing_ok=True)
@@ -2273,23 +2910,55 @@ def recognize_marked_three_stage(
             pending_ids = [
                 mark_id for mark_id in pending_ids if mark_id not in content_by_mark
             ]
+        if diagnostic.get("content_deadline_exhausted"):
+            break
     diagnostic["content_llm_ms"] = round((time.perf_counter() - started) * 1000, 2)
     diagnostic["content_item_count"] = len(content_by_mark)
     diagnostic["missing_content_mark_ids"] = sorted(
         set(located_by_mark) - set(content_by_mark)
     )
-    if not content_by_mark:
+    if not content_by_mark and not evidence_mode:
         raise ImageReviewRequired(
             "red_marks_unresolved",
             "系统找到错题区域，但没有获得可确认的题目内容。",
             diagnostic={"operation": "content_recognition", **diagnostic},
         )
 
+    if evidence_mode:
+        values, localizations = _evidence_values_for_marks(
+            client=client,
+            image_path=image_path,
+            image_id=image_id,
+            subject_hint=subject_hint,
+            located_by_mark=located_by_mark,
+            marks_by_id=marks_by_id,
+            content_by_mark=content_by_mark,
+            ocr_page_evidence=ocr_page_evidence,
+            crop_context_padding_ratio=crop_context_padding_ratio,
+            diagnostic=diagnostic,
+        )
+        return values, localizations, valid_marks, diagnostic
+
     items = []
     localizations = {}
     for index, mark_id in enumerate(sorted(content_by_mark)):
         content_item = content_by_mark[mark_id]
-        items.append(VisionItem.model_validate(content_item.model_dump(exclude={"mark_id"})))
+        items.append(
+            VisionItem.model_validate(
+                content_item.model_dump(
+                    exclude={
+                        "mark_id",
+                        "printed_instruction",
+                        "printed_prompt",
+                        "printed_pinyin",
+                        "printed_hanzi",
+                        "student_handwriting",
+                        "teacher_correction",
+                        "uncertain_observations",
+                    }
+                )
+            )
+        )
         located = located_by_mark[mark_id]
         localizations[index] = located.model_copy(update={"index": index})
     return (
@@ -2348,7 +3017,12 @@ def recognize_question_batch(
     localization_edge_margin_ratio: float = 0.02,
     local_red_group_max_gap_ratio: float = 0.03,
     local_red_group_max_area_ratio: float = 0.08,
-) -> tuple[VisionResult, List[dict]]:
+    evidence_mode: bool = False,
+    image_id: str | int | None = None,
+    deadline: float | None = None,
+    evidence_ocr_crop_recheck_limit: int | None = None,
+    evidence_localization_recheck_limit: int | None = None,
+) -> tuple[VisionResult | SimpleNamespace, List[dict]]:
     """Recognize, localize, and apply adaptive local evidence policy."""
     legacy_mode = local_red_scan is None
     scan_detected = bool(local_red_scan and local_red_scan.status == "detected")
@@ -2356,6 +3030,114 @@ def recognize_question_batch(
     local_red_regions = [
         list(region.bbox) for region in (local_red_scan.regions if local_red_scan else [])
     ]
+
+    def recognize_evidence_pipeline():
+        from app.services.chinese_marked_evidence import PIPELINE_NAME
+        from app.services.local_ocr_verification import OCRPageEvidence
+
+        ocr_page_evidence = None
+        ocr_page_diagnostic = {
+            "status": "not_provided",
+            "crop_recheck_limit": evidence_ocr_crop_recheck_limit,
+            "crop_recheck_count": 0,
+        }
+        deadline_exhausted_before_ocr = bool(
+            deadline is not None and time.monotonic() >= deadline
+        )
+        if deadline_exhausted_before_ocr:
+            ocr_page_diagnostic["status"] = "skipped_deadline"
+        elif hasattr(ocr_verifier, "recognize_page"):
+            try:
+                ocr_page_evidence = ocr_verifier.recognize_page(
+                    image_path,
+                    ocr_full_page_max_edge,
+                )
+            except (httpx.TimeoutException, TimeoutError):
+                ocr_page_evidence = OCRPageEvidence(
+                    status="unavailable",
+                    error_code="page_ocr_timeout",
+                )
+            except (ValidationError, TypeError, ValueError):
+                ocr_page_evidence = OCRPageEvidence(
+                    status="unavailable",
+                    error_code="page_ocr_invalid",
+                )
+            ocr_page_diagnostic.update(
+                {
+                    "status": ocr_page_evidence.status,
+                    "duration_ms": ocr_page_evidence.duration_ms,
+                    "error_code": ocr_page_evidence.error_code,
+                    "prepared_size": ocr_page_evidence.prepared_size,
+                }
+            )
+        (
+            three_stage_result,
+            _three_stage_localizations,
+            _three_stage_marks,
+            three_stage_diagnostic,
+        ) = recognize_marked_three_stage(
+            client=client,
+            image_path=image_path,
+            subject_hint=subject_hint,
+            local_red_regions=local_red_regions,
+            mark_confidence_threshold=mark_confidence_threshold,
+            red_pixel_min_ratio=red_pixel_min_ratio,
+            red_pixel_expansion_ratio=red_pixel_expansion_ratio,
+            pair_max_distance_ratio=pair_max_distance_ratio,
+            pair_max_relative_distance_ratio=pair_max_relative_distance_ratio,
+            pair_min_margin_ratio=pair_min_margin_ratio,
+            dedup_iou_threshold=dedup_iou_threshold,
+            crop_context_padding_ratio=crop_context_padding_ratio,
+            circle_context_padding_ratio=circle_context_padding_ratio,
+            evidence_context_min_width_ratio=evidence_context_min_width_ratio,
+            evidence_context_min_height_ratio=evidence_context_min_height_ratio,
+            answer_min_circle_overlap_ratio=answer_min_circle_overlap_ratio,
+            answer_min_answer_overlap_ratio=answer_min_answer_overlap_ratio,
+            answer_hard_min_circle_coverage_ratio=answer_hard_min_circle_coverage_ratio,
+            answer_max_center_offset_ratio=answer_max_center_offset_ratio,
+            answer_max_overflow_ratio=answer_max_overflow_ratio,
+            localization_edge_margin_ratio=localization_edge_margin_ratio,
+            local_red_group_max_gap_ratio=local_red_group_max_gap_ratio,
+            local_red_group_max_area_ratio=local_red_group_max_area_ratio,
+            image_max_edge=image_max_edge,
+            image_jpeg_quality=image_jpeg_quality,
+            image_max_pixels=image_max_pixels,
+            mark_stage_retry_count=mark_stage_retry_count,
+            localization_stage_retry_count=(
+                evidence_localization_recheck_limit
+                if evidence_localization_recheck_limit is not None
+                else localization_stage_retry_count
+            ),
+            content_stage_retry_count=content_stage_retry_count,
+            content_batch_size=content_batch_size,
+            local_red_evidence_regions=(
+                list(local_red_scan.regions) if local_red_scan is not None else None
+            ),
+            local_red_rescue_min_pixels=local_red_rescue_min_pixels,
+            evidence_mode=True,
+            image_id=image_id,
+            ocr_page_evidence=ocr_page_evidence,
+            deadline=deadline,
+        )
+        for values in three_stage_result:
+            values["ocr_raw_json"]["three_stage"] = dict(three_stage_diagnostic)
+            values["ocr_raw_json"]["local_ocr_page"] = dict(ocr_page_diagnostic)
+            values["ocr_raw_json"]["recognition_mode"] = "marked"
+            values["ocr_raw_json"]["evidence_deadline"] = {
+                "provided": deadline is not None,
+                "exhausted_before_ocr": deadline_exhausted_before_ocr,
+            }
+        return (
+            SimpleNamespace(
+                items=[],
+                ignored_text=[],
+                recognition_pipeline=PIPELINE_NAME,
+            ),
+            three_stage_result,
+        )
+
+    if evidence_mode and mode == "marked":
+        return recognize_evidence_pipeline()
 
     if three_stage_enabled and mode == "marked":
         (
@@ -2398,6 +3180,10 @@ def recognize_question_batch(
                 list(local_red_scan.regions) if local_red_scan is not None else None
             ),
             local_red_rescue_min_pixels=local_red_rescue_min_pixels,
+            evidence_mode=False,
+            image_id=None,
+            ocr_page_evidence=None,
+            deadline=None,
         )
 
         class PrecomputedThreeStageClient:
@@ -2515,6 +3301,8 @@ def recognize_question_batch(
 
     if mode == "unmarked" and valid_marks and force_mode != "unmarked":
         mode = "marked"
+        if evidence_mode:
+            return recognize_evidence_pipeline()
     elif legacy_mode and not valid_marks:
         mode = "unmarked"
     marks_by_id = {mark.mark_id: mark for mark in valid_marks}

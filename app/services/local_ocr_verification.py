@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unicodedata
 import logging
+import math
 import time
 from difflib import SequenceMatcher
 from importlib.metadata import version
@@ -292,15 +293,20 @@ class RapidOCRVerifier:
                 continue
             normalized_bbox = None
             if box is not None and width and height:
-                points = list(box)
-                xs = [float(point[0]) for point in points]
-                ys = [float(point[1]) for point in points]
-                normalized_bbox = [
-                    max(0.0, min(xs) / width),
-                    max(0.0, min(ys) / height),
-                    min(1.0, max(xs) / width),
-                    min(1.0, max(ys) / height),
-                ]
+                try:
+                    points = list(box)
+                    xs = [float(point[0]) for point in points]
+                    ys = [float(point[1]) for point in points]
+                    if not xs or not all(math.isfinite(value) for value in xs + ys):
+                        raise ValueError("invalid OCR polygon")
+                    left = max(0.0, min(1.0, min(xs) / width))
+                    top = max(0.0, min(1.0, min(ys) / height))
+                    right = max(0.0, min(1.0, max(xs) / width))
+                    bottom = max(0.0, min(1.0, max(ys) / height))
+                    if right > left and bottom > top:
+                        normalized_bbox = [left, top, right, bottom]
+                except (IndexError, OverflowError, TypeError, ValueError):
+                    pass
             lines.append(
                 OCRLine(
                     text=str(text),
@@ -322,7 +328,7 @@ class RapidOCRVerifier:
         try:
             import numpy
 
-            return engine(numpy.asarray(image), use_cls=False), None
+            return engine(numpy.asarray(image), use_det=True, use_cls=False, use_rec=True), None
         except Exception as exc:
             logger.warning(
                 "local_ocr_unavailable error_code=inference_failed error_type=%s",
@@ -362,6 +368,58 @@ class RapidOCRVerifier:
             prepared_size=list(image.size),
         )
 
+    def recognize_crop(self, image_path: str, bbox: List[float]) -> OCRPageEvidence:
+        if not self.enabled:
+            return OCRPageEvidence(status="disabled")
+        started = time.perf_counter()
+        try:
+            crop = load_cropped_rgb_image(
+                image_path,
+                bbox,
+                max_pixels=self.max_pixels,
+            )
+        except Exception:
+            return OCRPageEvidence(
+                status="unavailable",
+                duration_ms=(time.perf_counter() - started) * 1000,
+                error_code="image_preparation_failed",
+            )
+        result, error_code = self._run_engine(crop)
+        duration_ms = (time.perf_counter() - started) * 1000
+        if error_code:
+            return OCRPageEvidence(
+                status="unavailable",
+                duration_ms=duration_ms,
+                error_code=error_code,
+                prepared_size=list(crop.size),
+            )
+        left, top, right, bottom = bbox
+        width = right - left
+        height = bottom - top
+        lines = []
+        for line in self._lines_from_result(result, crop.size):
+            if line.bbox is None:
+                lines.append(line)
+                continue
+            lines.append(
+                line.model_copy(
+                    update={
+                        "bbox": [
+                            left + line.bbox[0] * width,
+                            top + line.bbox[1] * height,
+                            left + line.bbox[2] * width,
+                            top + line.bbox[3] * height,
+                        ]
+                    }
+                )
+            )
+        return OCRPageEvidence(
+            status="available",
+            lines=lines,
+            duration_ms=duration_ms,
+            prepared_size=list(crop.size),
+        )
+
     def verify_crop(
         self,
         image_path: str,
@@ -370,27 +428,15 @@ class RapidOCRVerifier:
         items: Sequence[VisionItem],
     ) -> OCRVerification:
         started = time.perf_counter()
-        if not self.enabled:
+        page = self.recognize_crop(image_path, bbox)
+        if page.status == "disabled":
             return _disabled()
-        try:
-            crop = load_cropped_rgb_image(
-                image_path,
-                bbox,
-                max_pixels=self.max_pixels,
-            )
-        except Exception:
-            return _unavailable("image_preparation_failed").model_copy(
+        if page.status == "unavailable":
+            return _unavailable(page.error_code or "image_preparation_failed").model_copy(
                 update={"duration_ms": (time.perf_counter() - started) * 1000}
             )
-        result, error_code = self._run_engine(crop)
-        if error_code:
-            return _unavailable(error_code).model_copy(
-                update={"duration_ms": (time.perf_counter() - started) * 1000}
-            )
-        lines = self._lines_from_result(result)
-
         verification = classify_ocr_lines(
-            lines=lines,
+            lines=page.lines,
             target_index=target_index,
             items=items,
             line_confidence_threshold=self.line_confidence_threshold,
