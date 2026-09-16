@@ -244,7 +244,7 @@ if ! sudo docker compose run --rm --no-deps -T \
   -v "$NEW_IMAGE:/comparison-inputs/new-image:ro" \
   -v "$PROTECTED_IMAGE:/comparison-inputs/protected-image:ro" \
   --entrypoint python worker -X utf8 -B \
-  /app/scripts/deepseek_raw_page_comparison.py \
+  -m scripts.deepseek_raw_page_comparison \
   --prompt /app/config/deepseek-raw-page-comparison-prompt.md \
   --output-dir /comparison/raw-direct \
   --page "$(basename "${OLD_IMAGE%.*}")" /comparison-inputs/old-image \

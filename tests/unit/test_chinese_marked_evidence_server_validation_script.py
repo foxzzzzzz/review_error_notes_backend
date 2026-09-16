@@ -60,6 +60,18 @@ class ServerValidationScriptTest(unittest.TestCase):
         self.assertIn("id, ocr_text, ocr_answer, question_type", script)
         self.assertNotIn("id, question_text, ocr_answer, question_type", script)
 
+    def test_raw_comparison_runs_as_module_from_backend_root(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "-m scripts.deepseek_raw_page_comparison",
+            script,
+        )
+        self.assertNotIn(
+            "/app/scripts/deepseek_raw_page_comparison.py",
+            script,
+        )
+
     def test_check_inputs_accepts_three_existing_images_without_printing_token(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -255,7 +267,7 @@ fi
 if [[ "$*" == *" psql "* && "$*" == *" -At "* ]]; then printf '0\n'; exit 0; fi
 if [[ "$*" == *" psql "* ]]; then printf 'fake database report\n'; exit 0; fi
 if [[ "$*" == *"docker logs"* ]]; then printf 'evidence_recognition_to_commit fake\n'; exit 0; fi
-if [[ "$*" == *"docker compose run"*"deepseek_raw_page_comparison.py"* ]]; then
+if [[ "$*" == *"docker compose run"*"scripts.deepseek_raw_page_comparison"* ]]; then
   previous=''
   for argument in "$@"; do
     if [[ "$previous" == '-v' && "$argument" == *':/comparison' ]]; then
