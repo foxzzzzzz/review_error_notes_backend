@@ -12,12 +12,16 @@ POLL_SECONDS="${POLL_SECONDS:-2}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-180}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PWD}"
 ACCESS_TOKEN="${ACCESS_TOKEN:-}"
+OLD_TRUTH_COUNT="${OLD_TRUTH_COUNT:-}"
+NEW_TRUTH_COUNT="${NEW_TRUTH_COUNT:-}"
+PROTECTED_TRUTH_COUNT="${PROTECTED_TRUTH_COUNT:-}"
 CHECK_INPUTS_ONLY=false
 HUMAN_REVIEW_MODE=ask
 KEEP_CONTAINERS=false
 RESULT_DIR=""
 RETURN_ARCHIVE=""
 VALIDATION_FAILED=false
+RAW_COMPARISON_FAILED=false
 
 usage() {
   cat <<'EOF'
@@ -37,6 +41,9 @@ Options:
   --poll-seconds N          Status polling interval (default: 2)
   --timeout-seconds N       Total polling timeout (default: 180)
   --output-dir DIR          Archive destination (default: current directory)
+  --old-truth-count N       Human-audited old-page wrong-question count
+  --new-truth-count N       Human-audited new-page wrong-question count
+  --protected-truth-count N Human-audited protected-page wrong-question count
   --human-review            Require one interactive human confirmation
   --skip-human-review       Package automatic-stage evidence only
   --keep-containers         Do not remove shadow API/worker after success
@@ -69,6 +76,9 @@ while [[ $# -gt 0 ]]; do
     --poll-seconds) need_value "$@"; POLL_SECONDS="$2"; shift 2 ;;
     --timeout-seconds) need_value "$@"; TIMEOUT_SECONDS="$2"; shift 2 ;;
     --output-dir) need_value "$@"; OUTPUT_DIR="$2"; shift 2 ;;
+    --old-truth-count) need_value "$@"; OLD_TRUTH_COUNT="$2"; shift 2 ;;
+    --new-truth-count) need_value "$@"; NEW_TRUTH_COUNT="$2"; shift 2 ;;
+    --protected-truth-count) need_value "$@"; PROTECTED_TRUTH_COUNT="$2"; shift 2 ;;
     --human-review) HUMAN_REVIEW_MODE=require; shift ;;
     --skip-human-review) HUMAN_REVIEW_MODE=skip; shift ;;
     --keep-containers) KEEP_CONTAINERS=true; shift ;;
@@ -123,6 +133,11 @@ BASE_URL="${BASE_URL%/}"
 [[ "$SEMESTER" =~ ^[12]$ ]] || die "SEMESTER must be 1 or 2: $SEMESTER"
 [[ "$POLL_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "POLL_SECONDS must be a positive integer: $POLL_SECONDS"
 [[ "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "TIMEOUT_SECONDS must be a positive integer: $TIMEOUT_SECONDS"
+for truth_variable in OLD_TRUTH_COUNT NEW_TRUTH_COUNT PROTECTED_TRUTH_COUNT; do
+  truth_value="${!truth_variable}"
+  [[ -z "$truth_value" || "$truth_value" =~ ^[0-9]+$ ]] \
+    || die "$truth_variable must be a non-negative integer: $truth_value"
+done
 [[ -n "$ACCESS_TOKEN" ]] || die 'ACCESS_TOKEN must not be empty'
 
 printf 'Input validation passed\n'
@@ -130,6 +145,8 @@ printf '  OLD_IMAGE=%s\n  NEW_IMAGE=%s\n  PROTECTED_IMAGE=%s\n' \
   "$OLD_IMAGE" "$NEW_IMAGE" "$PROTECTED_IMAGE"
 printf '  BASE_URL=%s\n  SHADOW_DB=%s\n  GRADE=%s\n  SEMESTER=%s\n' \
   "$BASE_URL" "$SHADOW_DB" "$GRADE" "$SEMESTER"
+printf '  OLD_TRUTH_COUNT=%s\n  NEW_TRUTH_COUNT=%s\n  PROTECTED_TRUTH_COUNT=%s\n' \
+  "${OLD_TRUTH_COUNT:-null}" "${NEW_TRUTH_COUNT:-null}" "${PROTECTED_TRUTH_COUNT:-null}"
 
 if [[ "$CHECK_INPUTS_ONLY" == true ]]; then
   exit 0
@@ -162,8 +179,9 @@ package_results() {
   local exit_code="$1"
   [[ -n "$RESULT_DIR" && -d "$RESULT_DIR" ]] || return 0
   collect_logs
-  printf '{"commit":"%s","exit_code":%s,"human_review_mode":"%s","shadow_db":"%s"}\n' \
-    "$EXPECTED_COMMIT" "$exit_code" "$HUMAN_REVIEW_MODE" "$SHADOW_DB" > "$RESULT_DIR/run-summary.json"
+  printf '{"commit":"%s","exit_code":%s,"human_review_mode":"%s","shadow_db":"%s","raw_comparison_failed":%s}\n' \
+    "$EXPECTED_COMMIT" "$exit_code" "$HUMAN_REVIEW_MODE" "$SHADOW_DB" \
+    "$RAW_COMPARISON_FAILED" > "$RESULT_DIR/run-summary.json"
   if grep -RIlF -- "$ACCESS_TOKEN" "$RESULT_DIR" >/dev/null 2>&1; then
     printf 'ERROR: access token detected in result files; archive was not created\n' >&2
     return 1
@@ -213,6 +231,32 @@ verify_shadow_broker_isolation() {
 }
 
 verify_shadow_broker_isolation
+
+worker_stage_audit="$(sudo docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  evidence-shadow-worker 2>/dev/null | awk -F= '$1 == "CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED" {print tolower($2); exit}')"
+[[ "$worker_stage_audit" == true ]] \
+  || die 'evidence-shadow-worker must set CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED=true'
+
+printf 'Running raw-page DeepSeek comparison before the processed pipeline\n'
+if ! sudo docker compose run --rm --no-deps -T \
+  -v "$RESULT_DIR:/comparison" \
+  -v "$OLD_IMAGE:/comparison-inputs/old-image:ro" \
+  -v "$NEW_IMAGE:/comparison-inputs/new-image:ro" \
+  -v "$PROTECTED_IMAGE:/comparison-inputs/protected-image:ro" \
+  --entrypoint python worker -X utf8 -B \
+  /app/scripts/deepseek_raw_page_comparison.py \
+  --prompt /app/config/deepseek-raw-page-comparison-prompt.md \
+  --output-dir /comparison/raw-direct \
+  --page "$(basename "${OLD_IMAGE%.*}")" /comparison-inputs/old-image \
+    "$(basename "$OLD_IMAGE")" "${OLD_TRUTH_COUNT:-null}" \
+  --page "$(basename "${NEW_IMAGE%.*}")" /comparison-inputs/new-image \
+    "$(basename "$NEW_IMAGE")" "${NEW_TRUTH_COUNT:-null}" \
+  --page "$(basename "${PROTECTED_IMAGE%.*}")" /comparison-inputs/protected-image \
+    "$(basename "$PROTECTED_IMAGE")" "${PROTECTED_TRUTH_COUNT:-null}"; then
+  RAW_COMPARISON_FAILED=true
+  VALIDATION_FAILED=true
+  printf 'Raw-page DeepSeek comparison failed; processed pipeline will continue.\n' >&2
+fi
 
 auth_header=( -H "Authorization: Bearer $ACCESS_TOKEN" )
 
@@ -268,6 +312,54 @@ curl --fail --silent --show-error "${auth_header[@]}" \
   | jq --arg old "$OLD_IMAGE_ID" --arg new "$NEW_IMAGE_ID" --arg protected "$PROTECTED_IMAGE_ID" \
       '[.[] | select(.image_id == $old or .image_id == $new or .image_id == $protected)]' \
   | tee "$RESULT_DIR/review-images.json" >/dev/null
+
+truth_json_value() {
+  local value="$1"
+  if [[ -n "$value" ]]; then printf '%s' "$value"; else printf 'null'; fi
+}
+
+jq -n \
+  --arg old_label "$(basename "${OLD_IMAGE%.*}")" \
+  --arg new_label "$(basename "${NEW_IMAGE%.*}")" \
+  --arg protected_label "$(basename "${PROTECTED_IMAGE%.*}")" \
+  --arg old_source_name "$(basename "$OLD_IMAGE")" \
+  --arg new_source_name "$(basename "$NEW_IMAGE")" \
+  --arg protected_source_name "$(basename "$PROTECTED_IMAGE")" \
+  --arg old_id "$OLD_IMAGE_ID" --arg new_id "$NEW_IMAGE_ID" --arg protected_id "$PROTECTED_IMAGE_ID" \
+  --argjson old_truth "$(truth_json_value "$OLD_TRUTH_COUNT")" \
+  --argjson new_truth "$(truth_json_value "$NEW_TRUTH_COUNT")" \
+  --argjson protected_truth "$(truth_json_value "$PROTECTED_TRUTH_COUNT")" \
+  '[
+    {label:$old_label,image_id:$old_id,image_path:"/audit-inputs/old-image",source_name:$old_source_name,truth_count:$old_truth},
+    {label:$new_label,image_id:$new_id,image_path:"/audit-inputs/new-image",source_name:$new_source_name,truth_count:$new_truth},
+    {label:$protected_label,image_id:$protected_id,image_path:"/audit-inputs/protected-image",source_name:$protected_source_name,truth_count:$protected_truth}
+  ]' > "$RESULT_DIR/stage-audit-pages.json"
+
+sudo docker compose run --rm --no-deps -T \
+  -v "$RESULT_DIR:/audit" \
+  -v "$OLD_IMAGE:/audit-inputs/old-image:ro" \
+  -v "$NEW_IMAGE:/audit-inputs/new-image:ro" \
+  -v "$PROTECTED_IMAGE:/audit-inputs/protected-image:ro" \
+  --entrypoint python worker -X utf8 -B \
+  /app/scripts/chinese_marked_evidence_stage_audit.py \
+  --review-images /audit/review-images.json \
+  --pages-json /audit/stage-audit-pages.json \
+  --output-dir /audit/stage-audit
+
+{
+  printf '# 同图A/B识别结果索引\n\n'
+  printf '三页人工真值：旧样本=%s，新样本=%s，保护样本=%s。人工真值不进入模型请求。\n\n' \
+    "${OLD_TRUTH_COUNT:-未提供}" "${NEW_TRUTH_COUNT:-未提供}" "${PROTECTED_TRUTH_COUNT:-未提供}"
+  printf '## A：当前完整流水线\n\n'
+  printf -- '- 分阶段计数、耗时及膨胀：`stage-audit/summary.md`\n'
+  printf -- '- 每页bbox叠框及证据：`stage-audit/<页名>/`\n'
+  printf -- '- 后台候选原始数据：`review-images.json`、`automatic-candidates.txt`\n\n'
+  printf '## B：DeepSeek原图直读\n\n'
+  printf -- '- 请求汇总：`raw-direct/summary.md`、`summary.csv`、`summary.json`\n'
+  printf -- '- 每页原始回答和API响应：`raw-direct/<页名>/answer.md`、`response.json`\n'
+  printf -- '- 请求元数据：`raw-direct/<页名>/metadata.json`\n\n'
+  printf '两套结果必须按人工真值复核检出、漏检、误检和内容字段；自然语言回答更详细不等于正确。\n'
+} > "$RESULT_DIR/comparison-index.md"
 
 sql_capture() {
   local output_file="$1" sql="$2"

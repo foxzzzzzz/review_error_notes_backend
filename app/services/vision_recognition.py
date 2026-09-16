@@ -787,6 +787,47 @@ def bbox_area(bbox: List[float]) -> float:
     return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
 
 
+def _audit_bbox_matches(
+    first: List[float], second: List[float], *, threshold: float
+) -> bool:
+    intersection_width = max(0.0, min(first[2], second[2]) - max(first[0], second[0]))
+    intersection_height = max(0.0, min(first[3], second[3]) - max(first[1], second[1]))
+    intersection = intersection_width * intersection_height
+    smallest = min(bbox_area(first), bbox_area(second))
+    return smallest > 0 and intersection / smallest >= threshold
+
+
+def _audit_merged_mark_sources(
+    marks: List[ErrorMark],
+    attempt_marks: list[dict],
+    *,
+    dedup_iou_threshold: float,
+) -> list[dict]:
+    """Attach diagnostic attempt lineage, including components absorbed by composites."""
+    records = []
+    for mark in marks:
+        source_refs = []
+        for item in attempt_marks:
+            source_bbox = item.get("bbox")
+            if source_bbox is None:
+                continue
+            target_bbox = mark.bbox
+            if mark.mark_type == "cross_circle" and item.get("mark_type") == "cross":
+                target_bbox = mark.cross_bbox
+            elif mark.mark_type == "cross_circle" and item.get("mark_type") == "circle":
+                target_bbox = mark.circle_bbox
+            elif item.get("mark_type") != mark.mark_type:
+                continue
+            if target_bbox is not None and _audit_bbox_matches(
+                source_bbox,
+                target_bbox,
+                threshold=dedup_iou_threshold,
+            ):
+                source_refs.append(item["source_ref"])
+        records.append({**mark.model_dump(mode="json"), "source_refs": source_refs})
+    return records
+
+
 def bbox_contains_center(container: List[float], candidate: List[float]) -> bool:
     center_x = (candidate[0] + candidate[2]) / 2
     center_y = (candidate[1] + candidate[3]) / 2
@@ -2332,6 +2373,7 @@ def recognize_marked_three_stage(
     image_id: str | int | None = None,
     ocr_page_evidence: OCRPageEvidence | None = None,
     deadline: float | None = None,
+    stage_audit_enabled: bool = False,
 ) -> tuple[VisionResult | list[dict], dict[int, LocalizationItem], List[ErrorMark], dict]:
     """Run isolated mark, geometry, and content stages for a marked page."""
     if evidence_mode and image_id is None:
@@ -2412,6 +2454,97 @@ def recognize_marked_three_stage(
         }
         for index, region in enumerate(grouped_evidence)
     ]
+    if stage_audit_enabled:
+        red_components = [
+            {
+                "component_id": index,
+                "bbox": list(region.bbox),
+                "pixel_count": region.pixel_count,
+                "area_ratio": region.area_ratio,
+                "thinness_ratio": region.thinness_ratio,
+            }
+            for index, region in enumerate(evidence_regions)
+        ]
+        diagnostic["stage_audit"] = {
+            "schema_version": 1,
+            "red_components": red_components,
+            "evidence_groups": [
+                {
+                    "region_id": region_id,
+                    "bbox": list(group.bbox),
+                    "pixel_count": group.pixel_count,
+                    "member_component_ids": [
+                        component["component_id"]
+                        for component in red_components
+                        if _bbox_contains_bbox(group.bbox, component["bbox"])
+                    ],
+                }
+                for region_id, group in enumerate(grouped_evidence)
+            ],
+            "ocr_lines": [
+                {
+                    "ocr_line_id": index,
+                    "text": line.text,
+                    "confidence": line.confidence,
+                    "bbox": list(line.bbox) if line.bbox is not None else None,
+                }
+                for index, line in enumerate(
+                    ocr_page_evidence.lines
+                    if ocr_page_evidence is not None
+                    and ocr_page_evidence.status == "available"
+                    else []
+                )
+            ],
+            "mark_attempts": [],
+            "merged_primitives": [],
+            "mark_events": [],
+            "localizations": [],
+        }
+
+    def audit_merged_primitives(marks: List[ErrorMark]) -> list[dict]:
+        attempt_marks = [
+            item
+            for attempt in diagnostic["stage_audit"]["mark_attempts"]
+            for item in attempt["marks"]
+            if item["accepted"]
+        ]
+        return _audit_merged_mark_sources(
+            marks,
+            attempt_marks,
+            dedup_iou_threshold=dedup_iou_threshold,
+        )
+
+    def audit_mark_events(events: List[ErrorMark], merged: List[ErrorMark]) -> list[dict]:
+        records = []
+        for event in events:
+            member_ids = []
+            for primitive in merged:
+                target_bbox = event.bbox
+                target_type = event.mark_type
+                if event.mark_type == "cross_circle":
+                    if primitive.mark_type == "cross":
+                        target_bbox = event.cross_bbox
+                        target_type = "cross"
+                    elif primitive.mark_type == "circle":
+                        target_bbox = event.circle_bbox
+                        target_type = "circle"
+                if (
+                    target_bbox is not None
+                    and primitive.mark_type == target_type
+                    and _audit_bbox_matches(
+                        primitive.bbox,
+                        target_bbox,
+                        threshold=dedup_iou_threshold,
+                    )
+                ):
+                    member_ids.append(primitive.mark_id)
+            records.append(
+                {
+                    **event.model_dump(mode="json"),
+                    "member_merged_mark_ids": member_ids,
+                }
+            )
+        return records
     valid_attempts = []
     valid_marks = []
     grouping_diagnostic = {}
@@ -2424,7 +2557,10 @@ def recognize_marked_three_stage(
         if evidence_deadline_expired("mark_detection"):
             break
         diagnostic["mark_llm_attempts"] += 1
+        detected_region_ids = {}
+        attempt_entry = "direct"
         if mark_attempt and targeted_detection_available:
+            attempt_entry = "targeted"
             region_sheet = render_numbered_region_sheet(
                 image_path,
                 [
@@ -2475,14 +2611,22 @@ def recognize_marked_three_stage(
             finally:
                 if temporary_path is not None:
                     Path(temporary_path).unlink(missing_ok=True)
+            eligible_regional_marks = [
+                mark
+                for mark in regional_result.error_marks
+                if mark.region_id in region_sheet.page_bboxes
+            ]
             mapped_marks = [
                 _regional_mark_to_page(
                     mark,
                     region_sheet.page_bboxes[mark.region_id],
                 )
-                for mark in regional_result.error_marks
-                if mark.region_id in region_sheet.page_bboxes
+                for mark in eligible_regional_marks
             ]
+            detected_region_ids = {
+                index: mark.region_id
+                for index, mark in enumerate(eligible_regional_marks)
+            }
             detected = MarkDetectionResult(
                 error_marks=[
                     mark.model_copy(update={"mark_id": index})
@@ -2524,7 +2668,7 @@ def recognize_marked_three_stage(
                 )
                 break
         diagnostic["mark_primitive_count"] = len(detected.error_marks)
-        attempt_marks, _rejected_mark_ids, _mark_diagnostics = filter_valid_error_marks(
+        attempt_marks, rejected_mark_ids, mark_diagnostics = filter_valid_error_marks(
             image_path,
             detected.error_marks,
             confidence_threshold=mark_confidence_threshold,
@@ -2533,6 +2677,38 @@ def recognize_marked_three_stage(
             component_fallback_enabled=False,
             component_pair_max_distance_ratio=pair_max_distance_ratio,
         )
+        if stage_audit_enabled:
+            accepted_mark_ids = {mark.mark_id for mark in attempt_marks}
+            diagnostic["stage_audit"]["mark_attempts"].append(
+                {
+                    "attempt": mark_attempt + 1,
+                    "entry": attempt_entry,
+                    "marks": [
+                        {
+                            "source_ref": f"attempt-{mark_attempt + 1}:{mark.mark_id}",
+                            "original_mark_id": mark.mark_id,
+                            "region_id": detected_region_ids.get(mark.mark_id),
+                            "mark_type": mark.mark_type,
+                            "bbox": list(mark.bbox),
+                            "cross_bbox": (
+                                list(mark.cross_bbox)
+                                if mark.cross_bbox is not None
+                                else None
+                            ),
+                            "circle_bbox": (
+                                list(mark.circle_bbox)
+                                if mark.circle_bbox is not None
+                                else None
+                            ),
+                            "confidence": mark.confidence,
+                            "accepted": mark.mark_id in accepted_mark_ids,
+                        }
+                        for mark in detected.error_marks
+                    ],
+                    "rejected_mark_ids": list(rejected_mark_ids),
+                    "filter_diagnostics": mark_diagnostics,
+                }
+            )
         valid_attempts.append(attempt_marks)
         merged_primitives, merge_diagnostic = merge_error_mark_attempts(
             valid_attempts,
@@ -2545,6 +2721,13 @@ def recognize_marked_three_stage(
             pair_max_relative_distance_ratio=pair_max_relative_distance_ratio,
             pair_min_margin_ratio=pair_min_margin_ratio,
         )
+        if stage_audit_enabled:
+            diagnostic["stage_audit"]["merged_primitives"] = (
+                audit_merged_primitives(merged_primitives)
+            )
+            diagnostic["stage_audit"]["mark_events"] = audit_mark_events(
+                valid_marks, merged_primitives
+            )
         uncovered_regions = [
             region
             for region in local_red_regions
@@ -2605,6 +2788,10 @@ def recognize_marked_three_stage(
         }
         for mark in valid_marks
     ]
+    if stage_audit_enabled:
+        diagnostic["stage_audit"]["mark_events"] = audit_mark_events(
+            valid_marks, merged_primitives
+        )
     if not valid_marks:
         raise ImageReviewRequired(
             "red_marks_unresolved",
@@ -2821,6 +3008,10 @@ def recognize_marked_three_stage(
         }
         for mark_id, localization in sorted(located_by_mark.items())
     ]
+    if stage_audit_enabled:
+        diagnostic["stage_audit"]["localizations"] = list(
+            diagnostic["localized_question_geometry"]
+        )
     if not located_by_mark:
         raise ImageReviewRequired(
             "red_marks_unresolved",
@@ -3022,6 +3213,7 @@ def recognize_question_batch(
     deadline: float | None = None,
     evidence_ocr_crop_recheck_limit: int | None = None,
     evidence_localization_recheck_limit: int | None = None,
+    stage_audit_enabled: bool = False,
 ) -> tuple[VisionResult | SimpleNamespace, List[dict]]:
     """Recognize, localize, and apply adaptive local evidence policy."""
     legacy_mode = local_red_scan is None
@@ -3118,15 +3310,27 @@ def recognize_question_batch(
             image_id=image_id,
             ocr_page_evidence=ocr_page_evidence,
             deadline=deadline,
+            stage_audit_enabled=stage_audit_enabled,
         )
+        persisted_diagnostic = {
+            key: value
+            for key, value in three_stage_diagnostic.items()
+            if key != "stage_audit"
+        }
         for values in three_stage_result:
-            values["ocr_raw_json"]["three_stage"] = dict(three_stage_diagnostic)
+            values["ocr_raw_json"]["three_stage"] = dict(persisted_diagnostic)
             values["ocr_raw_json"]["local_ocr_page"] = dict(ocr_page_diagnostic)
             values["ocr_raw_json"]["recognition_mode"] = "marked"
             values["ocr_raw_json"]["evidence_deadline"] = {
                 "provided": deadline is not None,
                 "exhausted_before_ocr": deadline_exhausted_before_ocr,
             }
+        if stage_audit_enabled and three_stage_result:
+            stage_audit = dict(three_stage_diagnostic.get("stage_audit", {}))
+            stage_audit["red_scan_ms"] = (
+                local_red_scan.duration_ms if local_red_scan is not None else None
+            )
+            three_stage_result[0]["ocr_raw_json"]["stage_audit"] = stage_audit
         return (
             SimpleNamespace(
                 items=[],

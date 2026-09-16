@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     CHINESE_MARKED_EVIDENCE_PAGE_TIMEOUT_SECONDS: float = Field(default=30, gt=0, le=120)
     CHINESE_MARKED_EVIDENCE_LOCALIZATION_RECHECK_LIMIT: int = Field(default=1, ge=0, le=3)
     CHINESE_MARKED_EVIDENCE_OCR_CROP_RECHECK_LIMIT: int = Field(default=3, ge=0, le=20)
+    CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED: bool = Field(
+        default=False,
+        description="Persist per-stage bbox and lineage diagnostics for validation runs",
+    )
     MINIMAX_CONFIDENCE_THRESHOLD: float = 0.85
     MINIMAX_MARK_CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0, le=1)
     MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0, le=1)

@@ -170,6 +170,7 @@ def _run_batch(
     evidence_ocr_crop_recheck_limit=None,
     localization_stage_retry_count=1,
     evidence_localization_recheck_limit=None,
+    stage_audit_enabled=False,
 ):
     from app.services.vision_recognition import recognize_question_batch
 
@@ -184,6 +185,7 @@ def _run_batch(
             "evidence_mode": evidence_mode,
             "image_id": image_id,
             "deadline": deadline,
+            "stage_audit_enabled": stage_audit_enabled,
         }
         if evidence_ocr_crop_recheck_limit is not None:
             evidence_kwargs["evidence_ocr_crop_recheck_limit"] = (
@@ -335,6 +337,7 @@ def _run_evidence_three_stage(
     mark_stage_retry_count=0,
     localization_stage_retry_count=0,
     local_red_evidence_regions=None,
+    stage_audit_enabled=False,
 ):
     from app.services.vision_recognition import recognize_marked_three_stage
 
@@ -361,7 +364,114 @@ def _run_evidence_three_stage(
         ocr_page_evidence=ocr_page_evidence,
         deadline=deadline,
         local_red_evidence_regions=local_red_evidence_regions,
+        stage_audit_enabled=stage_audit_enabled,
     )
+
+
+def test_three_stage_audit_preserves_red_components_and_full_page_ocr(tmp_path):
+    from app.services.error_mark_validation import RedMarkRegion
+    from app.services.local_ocr_verification import OCRLine, OCRPageEvidence
+    from app.services.vision_recognition import ContentRecognitionResult
+
+    client = _EvidenceStageClient(
+        content_result=ContentRecognitionResult(
+            items=[_evidence_content_item(0), _evidence_content_item(1)]
+        )
+    )
+    red_region = RedMarkRegion(
+        bbox=[0.2, 0.2, 0.3, 0.35],
+        pixel_count=123,
+        area_ratio=0.015,
+        thinness_ratio=1.5,
+    )
+    ocr_page = OCRPageEvidence(
+        status="available",
+        lines=[
+            OCRLine(
+                text="看拼音写词语",
+                confidence=0.96,
+                bbox=[0.1, 0.1, 0.4, 0.2],
+            )
+        ],
+        duration_ms=4.5,
+        prepared_size=[400, 300],
+    )
+
+    _values, _localizations, _marks, diagnostic = _run_evidence_three_stage(
+        tmp_path,
+        client,
+        ocr_page_evidence=ocr_page,
+        local_red_evidence_regions=[red_region],
+        stage_audit_enabled=True,
+    )
+
+    audit = diagnostic["stage_audit"]
+    assert audit["red_components"] == [
+        {
+            "component_id": 0,
+            "bbox": [0.2, 0.2, 0.3, 0.35],
+            "pixel_count": 123,
+            "area_ratio": 0.015,
+            "thinness_ratio": 1.5,
+        }
+    ]
+    assert audit["ocr_lines"] == [
+        {
+            "ocr_line_id": 0,
+            "text": "看拼音写词语",
+            "confidence": 0.96,
+            "bbox": [0.1, 0.1, 0.4, 0.2],
+        }
+    ]
+    assert audit["mark_attempts"][0]["entry"] == "direct"
+    assert audit["mark_attempts"][0]["attempt"] == 1
+    assert audit["merged_primitives"][0]["source_refs"] == ["attempt-1:0"]
+    assert audit["mark_events"][0]["member_merged_mark_ids"] == [0]
+
+
+def test_stage_audit_composite_preserves_absorbed_cross_and_circle_sources():
+    from app.services.vision_recognition import (
+        ErrorMark,
+        _audit_merged_mark_sources,
+    )
+
+    composite = ErrorMark(
+        mark_id=0,
+        mark_type="cross_circle",
+        bbox=[0.1, 0.1, 0.4, 0.4],
+        cross_bbox=[0.2, 0.2, 0.3, 0.3],
+        circle_bbox=[0.1, 0.1, 0.4, 0.4],
+        confidence=0.95,
+    )
+    attempt_marks = [
+        {
+            "source_ref": "attempt-1:0",
+            "mark_type": "cross_circle",
+            "bbox": [0.1, 0.1, 0.4, 0.4],
+            "cross_bbox": [0.2, 0.2, 0.3, 0.3],
+            "circle_bbox": [0.1, 0.1, 0.4, 0.4],
+        },
+        {
+            "source_ref": "attempt-2:0",
+            "mark_type": "cross",
+            "bbox": [0.2, 0.2, 0.3, 0.3],
+        },
+        {
+            "source_ref": "attempt-2:1",
+            "mark_type": "circle",
+            "bbox": [0.1, 0.1, 0.4, 0.4],
+        },
+    ]
+
+    records = _audit_merged_mark_sources(
+        [composite], attempt_marks, dedup_iou_threshold=0.8
+    )
+
+    assert records[0]["source_refs"] == [
+        "attempt-1:0",
+        "attempt-2:0",
+        "attempt-2:1",
+    ]
 
 
 def _real_deepseek_transport_client(*, localization_item, content_item):
@@ -2305,7 +2415,11 @@ def test_evidence_batch_returns_task7_values_without_legacy_policy(
 
     def fake_three_stage(**kwargs):
         captured.update(kwargs)
-        return task7_values, {}, [], {"recognition_pipeline": "three_stage", "content_llm_ms": 7.5}
+        return task7_values, {}, [], {
+            "recognition_pipeline": "three_stage",
+            "content_llm_ms": 7.5,
+            "stage_audit": {},
+        }
 
     class PageOCR:
         enabled = True
@@ -2361,6 +2475,7 @@ def test_evidence_batch_returns_task7_values_without_legacy_policy(
         ocr_full_page_max_edge=987,
         ocr_crop_recheck_limit=1,
         evidence_ocr_crop_recheck_limit=9,
+        stage_audit_enabled=True,
     )
 
     assert result.items == []
@@ -2372,6 +2487,7 @@ def test_evidence_batch_returns_task7_values_without_legacy_policy(
     assert values[0]["ocr_raw_json"]["local_ocr_page"]["status"] == "available"
     assert values[0]["ocr_raw_json"]["local_ocr_page"]["crop_recheck_limit"] == 9
     assert values[0]["ocr_raw_json"]["local_ocr_page"]["crop_recheck_count"] == 0
+    assert values[0]["ocr_raw_json"]["stage_audit"]["red_scan_ms"] == 1.0
     assert captured["client"] is client
     assert captured["evidence_mode"] is True
     assert captured["image_id"] == "image-8"

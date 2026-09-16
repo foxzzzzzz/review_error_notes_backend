@@ -377,6 +377,11 @@ def process_image(self, image_id: str, filepath: str):
                 if evidence_mode
                 else None
             ),
+            stage_audit_enabled=(
+                settings.CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED
+                if evidence_mode
+                else False
+            ),
         )
         log_mark_validation_diagnostics(image_id, question_values)
         question_values = discard_pending_duplicates_of_collected(question_values)

@@ -3,7 +3,8 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +26,8 @@ def run_script(*args: str, access_token: str = "test-secret-token"):
 
 def as_msys_path(path: Path) -> str:
     resolved = path.resolve()
+    if not resolved.drive:
+        return resolved.as_posix()
     return f"/{resolved.drive[0].lower()}{resolved.as_posix()[2:]}"
 
 
@@ -34,6 +37,17 @@ class ServerValidationScriptTest(unittest.TestCase):
         with path.open("w", encoding="utf-8", newline="\n") as stream:
             stream.write(content)
         path.chmod(0o755)
+
+    def test_as_msys_path_preserves_linux_absolute_path(self):
+        with patch.object(
+            Path,
+            "resolve",
+            return_value=PurePosixPath("/tmp/validation/bin"),
+        ):
+            self.assertEqual(
+                as_msys_path(Path("ignored")),
+                "/tmp/validation/bin",
+            )
 
     def test_report_uses_persisted_pre_commit_timing_and_ocr_text(self):
         script = SCRIPT.read_text(encoding="utf-8")
@@ -72,11 +86,20 @@ class ServerValidationScriptTest(unittest.TestCase):
                 "3",
                 "--semester",
                 "1",
+                "--old-truth-count",
+                "11",
+                "--new-truth-count",
+                "9",
+                "--protected-truth-count",
+                "6",
                 access_token=secret,
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Input validation passed", result.stdout)
+            self.assertIn("OLD_TRUTH_COUNT=11", result.stdout)
+            self.assertIn("NEW_TRUTH_COUNT=9", result.stdout)
+            self.assertIn("PROTECTED_TRUTH_COUNT=6", result.stdout)
             self.assertNotIn(secret, result.stdout)
             self.assertNotIn(secret, result.stderr)
 
@@ -222,7 +245,7 @@ if [[ "$*" == *"docker inspect"*"evidence-shadow-api" ]]; then
   exit 0
 fi
 if [[ "$*" == *"docker inspect"*"evidence-shadow-worker" ]]; then
-  printf '%s\n' 'REDIS_URL=redis://redis:6379/15'
+  printf '%s\n' 'REDIS_URL=redis://redis:6379/15' 'CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED=true'
   exit 0
 fi
 if [[ "$*" == *"docker inspect"*"production-worker" ]]; then
@@ -232,6 +255,20 @@ fi
 if [[ "$*" == *" psql "* && "$*" == *" -At "* ]]; then printf '0\n'; exit 0; fi
 if [[ "$*" == *" psql "* ]]; then printf 'fake database report\n'; exit 0; fi
 if [[ "$*" == *"docker logs"* ]]; then printf 'evidence_recognition_to_commit fake\n'; exit 0; fi
+if [[ "$*" == *"docker compose run"*"deepseek_raw_page_comparison.py"* ]]; then
+  previous=''
+  for argument in "$@"; do
+    if [[ "$previous" == '-v' && "$argument" == *':/comparison' ]]; then
+      host_output="${argument%:/comparison}"
+      mkdir -p "$host_output/raw-direct"
+      printf '%s\n' '# fake raw comparison' > "$host_output/raw-direct/summary.md"
+      exit 0
+    fi
+    previous="$argument"
+  done
+  exit 7
+fi
+if [[ "$*" == *"docker compose run"*"chinese_marked_evidence_stage_audit.py"* ]]; then exit 0; fi
 if [[ "$*" == *"docker rm"* ]]; then exit 0; fi
 printf 'unexpected sudo command: %s\n' "$*" >&2
 exit 9
@@ -254,6 +291,9 @@ i = 0
 while i < len(args):
     if args[i] == "--arg":
         variables[args[i + 1]] = args[i + 2]
+        del args[i:i + 3]
+    elif args[i] == "--argjson":
+        variables[args[i + 1]] = json.loads(args[i + 2])
         del args[i:i + 3]
     elif args[i] in {"-e", "-r", "-c", "-n", "-er"}:
         i += 1
@@ -287,6 +327,12 @@ elif '.status == "failed"' in query:
 elif "select(.image_id == $old" in query:
     wanted = {variables["old"], variables["new"], variables["protected"]}
     print(json.dumps([x for x in load() if x["image_id"] in wanted]))
+elif "old_label" in query and "protected_truth" in query:
+    print(json.dumps([
+        {"label": variables["old_label"], "image_id": variables["old_id"], "image_path": "/audit-inputs/old-image", "truth_count": variables["old_truth"]},
+        {"label": variables["new_label"], "image_id": variables["new_id"], "image_path": "/audit-inputs/new-image", "truth_count": variables["new_truth"]},
+        {"label": variables["protected_label"], "image_id": variables["protected_id"], "image_path": "/audit-inputs/protected-image", "truth_count": variables["protected_truth"]},
+    ]))
 elif query.lstrip().startswith("[.[] | {"):
     print(json.dumps(load()))
 elif "any(.[]; .image_id == $image_id" in query:
@@ -352,6 +398,8 @@ else:
                 names = archive.getnames()
                 self.assertTrue(any(name.endswith("review-images.json") for name in names))
                 self.assertTrue(any(name.endswith("automatic-candidates.txt") for name in names))
+                self.assertTrue(any(name.endswith("comparison-index.md") for name in names))
+                self.assertTrue(any(name.endswith("raw-direct/summary.md") for name in names))
                 for member in archive.getmembers():
                     if member.isfile():
                         content = archive.extractfile(member).read()
