@@ -299,8 +299,8 @@ printf '%s\n' "$INVALID_AUTO_COLLECTED" | tee "$RESULT_DIR/invalid-auto-collecte
 
 sql_capture timing.txt \
   "SELECT image_id,
-          max((ocr_raw_json #>> '{evidence_timing,elapsed_seconds}')::numeric) AS max_elapsed_seconds,
-          bool_or(coalesce((ocr_raw_json #>> '{evidence_timing,exhausted}')::boolean,false)) AS any_exhausted,
+          max((ocr_raw_json #>> '{evidence_timing,pre_commit,elapsed_seconds}')::numeric) AS max_elapsed_seconds,
+          bool_or(coalesce((ocr_raw_json #>> '{evidence_timing,pre_commit,exhausted}')::boolean,false)) AS any_exhausted,
           count(*) AS candidates
      FROM wrong_questions
     WHERE recognition_pipeline='chinese_marked_evidence_v1'
@@ -311,7 +311,7 @@ sql_capture timing.txt \
 jq '[.[] | {
   image_id, group_type, question_count, issue_code,
   questions:[.questions[]? | {
-    id, question_text, ocr_answer, question_type,
+    id, ocr_text, ocr_answer, question_type,
     mark_status, question_evidence_status, answer_status,
     collection_status, review_status
   }]

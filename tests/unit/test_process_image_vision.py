@@ -430,9 +430,15 @@ def test_task_logs_safe_localization_counts_without_recognized_text(caplog):
     assert "学生隐私作答" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("deadline_enabled", "expected_deadline"),
+    [(True, 103.0), (False, None)],
+)
 def test_task_persists_placeholder_evidence_after_deadline_without_result_item(
     monkeypatch,
     caplog,
+    deadline_enabled,
+    expected_deadline,
 ):
     from types import SimpleNamespace
 
@@ -543,6 +549,12 @@ def test_task_persists_placeholder_evidence_after_deadline_without_result_item(
     )
     monkeypatch.setattr(
         process_image_module.settings,
+        "CHINESE_MARKED_EVIDENCE_PAGE_DEADLINE_ENABLED",
+        deadline_enabled,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        process_image_module.settings,
         "CHINESE_MARKED_EVIDENCE_OCR_CROP_RECHECK_LIMIT",
         1,
     )
@@ -598,7 +610,7 @@ def test_task_persists_placeholder_evidence_after_deadline_without_result_item(
     assert captured["ocr_verifier"] is actual_ocr
     assert captured["evidence_mode"] is True
     assert captured["image_id"] == "image-8"
-    assert captured["deadline"] == 103.0
+    assert captured["deadline"] == expected_deadline
     assert captured["ocr_crop_recheck_limit"] == 7
     assert captured["evidence_ocr_crop_recheck_limit"] == 1
     assert captured["evidence_localization_recheck_limit"] == 2

@@ -290,6 +290,7 @@ def process_image(self, image_id: str, filepath: str):
             recognition_started_at
             + settings.CHINESE_MARKED_EVIDENCE_PAGE_TIMEOUT_SECONDS
             if evidence_mode
+            and settings.CHINESE_MARKED_EVIDENCE_PAGE_DEADLINE_ENABLED
             else None
         )
         local_red_scan = scan_red_mark_regions(

@@ -35,6 +35,17 @@ class ServerValidationScriptTest(unittest.TestCase):
             stream.write(content)
         path.chmod(0o755)
 
+    def test_report_uses_persisted_pre_commit_timing_and_ocr_text(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "{evidence_timing,pre_commit,elapsed_seconds}",
+            script,
+        )
+        self.assertIn("{evidence_timing,pre_commit,exhausted}", script)
+        self.assertIn("id, ocr_text, ocr_answer, question_type", script)
+        self.assertNotIn("id, question_text, ocr_answer, question_type", script)
+
     def test_check_inputs_accepts_three_existing_images_without_printing_token(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

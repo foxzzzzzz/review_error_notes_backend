@@ -66,6 +66,86 @@ def test_merges_duplicate_same_shape_across_attempts():
     assert diagnostic["cross_attempt_deduplicated_count"] == 1
 
 
+def test_composite_mark_absorbs_strongly_overlapping_components_across_attempts():
+    from app.services.error_mark_validation import merge_error_mark_attempts
+
+    composite = ErrorMark(
+        mark_id=0,
+        mark_type="cross_circle",
+        bbox=[0.20, 0.20, 0.50, 0.50],
+        cross_bbox=[0.32, 0.25, 0.42, 0.35],
+        circle_bbox=[0.20, 0.20, 0.50, 0.50],
+        confidence=0.96,
+    )
+    duplicate_cross = ErrorMark(
+        mark_id=0,
+        mark_type="cross",
+        bbox=[0.325, 0.25, 0.42, 0.35],
+        cross_bbox=[0.325, 0.25, 0.42, 0.35],
+        confidence=0.94,
+    )
+    duplicate_circle = ErrorMark(
+        mark_id=1,
+        mark_type="circle",
+        bbox=[0.20, 0.205, 0.50, 0.50],
+        circle_bbox=[0.20, 0.205, 0.50, 0.50],
+        confidence=0.93,
+    )
+    distinct_cross = ErrorMark(
+        mark_id=2,
+        mark_type="cross",
+        bbox=[0.70, 0.70, 0.78, 0.78],
+        cross_bbox=[0.70, 0.70, 0.78, 0.78],
+        confidence=0.95,
+    )
+
+    merged, diagnostic = merge_error_mark_attempts(
+        [[composite], [duplicate_cross, duplicate_circle, distinct_cross]],
+        dedup_iou_threshold=0.8,
+    )
+
+    assert [mark.mark_type for mark in merged] == ["cross_circle", "cross"]
+    assert merged[1].bbox == distinct_cross.bbox
+    assert diagnostic["cross_type_deduplicated_count"] == 2
+
+
+def test_composite_mark_does_not_absorb_ambiguous_overlapping_components():
+    from app.services.error_mark_validation import merge_error_mark_attempts
+
+    composite = ErrorMark(
+        mark_id=0,
+        mark_type="cross_circle",
+        bbox=[0.20, 0.20, 0.50, 0.50],
+        cross_bbox=[0.25, 0.25, 0.45, 0.35],
+        circle_bbox=[0.20, 0.20, 0.50, 0.50],
+        confidence=0.96,
+    )
+    crosses = [
+        ErrorMark(
+            mark_id=index,
+            mark_type="cross",
+            bbox=bbox,
+            cross_bbox=bbox,
+            confidence=0.94,
+        )
+        for index, bbox in enumerate(
+            ([0.25, 0.25, 0.32, 0.35], [0.38, 0.25, 0.45, 0.35])
+        )
+    ]
+
+    merged, diagnostic = merge_error_mark_attempts(
+        [[composite], crosses],
+        dedup_iou_threshold=0.8,
+    )
+
+    assert [mark.mark_type for mark in merged] == [
+        "cross_circle",
+        "cross",
+        "cross",
+    ]
+    assert diagnostic["cross_type_deduplicated_count"] == 0
+
+
 def test_accepts_mark_box_with_red_pixels(tmp_path):
     from app.services.error_mark_validation import filter_valid_error_marks
 
@@ -402,6 +482,83 @@ def test_normalize_error_mark_groups_pairs_mutual_nearest_with_clear_margin():
     assert diagnostic["pair_diagnostics"][0]["accepted"] is True
     assert diagnostic["pair_diagnostics"][0]["pair_tier"] == "strong"
     assert diagnostic["review_required_mark_ids"] == []
+
+
+def test_normalize_error_mark_groups_uses_overlap_to_break_zero_distance_tie():
+    from app.services.error_mark_validation import normalize_error_mark_groups
+
+    marks = [
+        ErrorMark(
+            mark_id=0,
+            mark_type="cross",
+            bbox=[0.32, 0.15, 0.39, 0.25],
+            cross_bbox=[0.32, 0.15, 0.39, 0.25],
+            confidence=0.95,
+        ),
+        ErrorMark(
+            mark_id=1,
+            mark_type="circle",
+            bbox=[0.10, 0.10, 0.40, 0.40],
+            circle_bbox=[0.10, 0.10, 0.40, 0.40],
+            confidence=0.95,
+        ),
+        ErrorMark(
+            mark_id=2,
+            mark_type="circle",
+            bbox=[0.36, 0.10, 0.60, 0.40],
+            circle_bbox=[0.36, 0.10, 0.60, 0.40],
+            confidence=0.95,
+        ),
+    ]
+
+    groups, diagnostic = normalize_error_mark_groups(
+        marks,
+        dedup_iou_threshold=0.8,
+        pair_max_distance_ratio=0.04,
+        pair_max_relative_distance_ratio=1.0,
+        pair_min_margin_ratio=0.2,
+    )
+
+    assert [group.mark_type for group in groups] == ["cross_circle", "circle"]
+    assert groups[0].circle_bbox == marks[1].bbox
+    assert diagnostic["pair_diagnostics"][0]["accepted"] is True
+    assert diagnostic["pair_diagnostics"][0]["selection_evidence"] == "overlap"
+
+
+def test_normalize_error_mark_groups_keeps_equal_overlap_ambiguous():
+    from app.services.error_mark_validation import normalize_error_mark_groups
+
+    marks = [
+        ErrorMark(
+            mark_id=0,
+            mark_type="cross",
+            bbox=[0.30, 0.15, 0.40, 0.25],
+            confidence=0.95,
+        ),
+        ErrorMark(
+            mark_id=1,
+            mark_type="circle",
+            bbox=[0.10, 0.10, 0.40, 0.40],
+            confidence=0.95,
+        ),
+        ErrorMark(
+            mark_id=2,
+            mark_type="circle",
+            bbox=[0.30, 0.10, 0.60, 0.40],
+            confidence=0.95,
+        ),
+    ]
+
+    groups, diagnostic = normalize_error_mark_groups(
+        marks,
+        dedup_iou_threshold=0.8,
+        pair_max_distance_ratio=0.04,
+        pair_max_relative_distance_ratio=1.0,
+        pair_min_margin_ratio=0.2,
+    )
+
+    assert [group.mark_type for group in groups] == ["cross", "circle", "circle"]
+    assert diagnostic["pair_diagnostics"][0]["reason"] == "ambiguous_overlap"
 
 
 def test_normalize_error_mark_groups_marks_non_intersecting_pair_for_review():

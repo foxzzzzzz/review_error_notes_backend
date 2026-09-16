@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     MINIMAX_CONTENT_BATCH_SIZE: int = Field(default=6, ge=1, le=20)
     CHINESE_MARKED_EVIDENCE_ENABLED: bool = False
     CHINESE_MARKED_EVIDENCE_SUBJECTS: str = "chinese"
+    CHINESE_MARKED_EVIDENCE_PAGE_DEADLINE_ENABLED: bool = False
     CHINESE_MARKED_EVIDENCE_PAGE_TIMEOUT_SECONDS: float = Field(default=30, gt=0, le=120)
     CHINESE_MARKED_EVIDENCE_LOCALIZATION_RECHECK_LIMIT: int = Field(default=1, ge=0, le=3)
     CHINESE_MARKED_EVIDENCE_OCR_CROP_RECHECK_LIMIT: int = Field(default=3, ge=0, le=20)

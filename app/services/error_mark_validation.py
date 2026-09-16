@@ -343,6 +343,48 @@ def merge_error_mark_attempts(
             duplicate_count += 1
             if mark.confidence > merged[duplicate_index].confidence:
                 merged[duplicate_index] = mark
+
+    cross_type_duplicate_indexes = set()
+    composite_component_matches = {}
+    standalone_composite_matches = {}
+    for composite_index, composite in enumerate(merged):
+        if composite.mark_type != "cross_circle":
+            continue
+        for component_type, component_bbox in (
+            ("cross", composite.cross_bbox),
+            ("circle", composite.circle_bbox),
+        ):
+            if component_bbox is None:
+                continue
+            matches = []
+            for standalone_index, standalone in enumerate(merged):
+                if standalone.mark_type != component_type:
+                    continue
+                iou, containment = _bbox_overlap_ratios(
+                    component_bbox,
+                    standalone.bbox,
+                )
+                if max(iou, containment) < dedup_iou_threshold:
+                    continue
+                matches.append(standalone_index)
+                standalone_composite_matches.setdefault(standalone_index, []).append(
+                    composite_index
+                )
+            composite_component_matches[(composite_index, component_type)] = matches
+
+    for matches in composite_component_matches.values():
+        if len(matches) != 1:
+            continue
+        standalone_index = matches[0]
+        if len(standalone_composite_matches[standalone_index]) == 1:
+            cross_type_duplicate_indexes.add(standalone_index)
+
+    if cross_type_duplicate_indexes:
+        merged = [
+            mark
+            for index, mark in enumerate(merged)
+            if index not in cross_type_duplicate_indexes
+        ]
     merged = [
         mark.model_copy(update={"mark_id": index})
         for index, mark in enumerate(merged)
@@ -351,6 +393,7 @@ def merge_error_mark_attempts(
         "attempt_primitive_counts": [len(attempt) for attempt in attempts],
         "merged_primitive_count": len(merged),
         "cross_attempt_deduplicated_count": duplicate_count,
+        "cross_type_deduplicated_count": len(cross_type_duplicate_indexes),
     }
 
 
@@ -394,6 +437,10 @@ def normalize_error_mark_groups(
     for cross in crosses:
         for circle in circles:
             distance = _bbox_distance(cross.bbox, circle.bbox)
+            overlap_iou, overlap_containment = _bbox_overlap_ratios(
+                cross.bbox,
+                circle.bbox,
+            )
             circle_scale = max(
                 circle.bbox[2] - circle.bbox[0],
                 circle.bbox[3] - circle.bbox[1],
@@ -404,6 +451,9 @@ def normalize_error_mark_groups(
                 "distance": distance,
                 "relative_distance": relative_distance,
                 "intersects": distance == 0,
+                "overlap_iou": overlap_iou,
+                "overlap_containment": overlap_containment,
+                "overlap_quality": max(overlap_iou, overlap_containment),
                 "eligible": distance <= pair_max_distance_ratio
                 and relative_distance <= pair_max_relative_distance_ratio,
             }
@@ -413,6 +463,8 @@ def normalize_error_mark_groups(
             candidates,
             key=lambda candidate: (
                 not candidate[2]["intersects"],
+                -candidate[2]["overlap_quality"],
+                -candidate[2]["overlap_iou"],
                 candidate[2]["distance"],
                 candidate[2]["relative_distance"],
                 candidate[1],
@@ -423,6 +475,17 @@ def normalize_error_mark_groups(
         if len(eligible) == 1:
             return eligible[0], "unique", None
         first, second = eligible[:2]
+        if first[2]["intersects"]:
+            first_quality = first[2]["overlap_quality"]
+            second_quality = second[2]["overlap_quality"]
+            margin = (
+                (first_quality - second_quality) / max(first_quality, 1e-9)
+                if first_quality > 0
+                else 0.0
+            )
+            if margin < pair_min_margin_ratio:
+                return None, "ambiguous_overlap", margin
+            return first, "clear_overlap", margin
         first_distance = first[2]["distance"]
         second_distance = second[2]["distance"]
         margin = (
@@ -498,6 +561,7 @@ def normalize_error_mark_groups(
             "accepted": True,
             "reason": "mutual_unique_best",
             "pair_tier": "strong" if edge["intersects"] else "nearby_review",
+            "selection_evidence": "overlap" if edge["intersects"] else "distance",
             "distance_ratio": round(edge["distance"], 6),
             "relative_distance_ratio": round(edge["relative_distance"], 6),
             "margin_ratio": round(margin, 6) if margin is not None else None,
