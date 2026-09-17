@@ -237,26 +237,37 @@ worker_stage_audit="$(sudo docker inspect --format '{{range .Config.Env}}{{print
 [[ "$worker_stage_audit" == true ]] \
   || die 'evidence-shadow-worker must set CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED=true'
 
-printf 'Running raw-page DeepSeek comparison before the processed pipeline\n'
-if ! sudo docker compose run --rm --no-deps -T \
-  -v "$RESULT_DIR:/comparison" \
-  -v "$OLD_IMAGE:/comparison-inputs/old-image:ro" \
-  -v "$NEW_IMAGE:/comparison-inputs/new-image:ro" \
-  -v "$PROTECTED_IMAGE:/comparison-inputs/protected-image:ro" \
-  --entrypoint python worker -X utf8 -B \
-  -m scripts.deepseek_raw_page_comparison \
-  --prompt /app/config/deepseek-raw-page-comparison-prompt.md \
-  --output-dir /comparison/raw-direct \
-  --page "$(basename "${OLD_IMAGE%.*}")" /comparison-inputs/old-image \
-    "$(basename "$OLD_IMAGE")" "${OLD_TRUTH_COUNT:-null}" \
-  --page "$(basename "${NEW_IMAGE%.*}")" /comparison-inputs/new-image \
-    "$(basename "$NEW_IMAGE")" "${NEW_TRUTH_COUNT:-null}" \
-  --page "$(basename "${PROTECTED_IMAGE%.*}")" /comparison-inputs/protected-image \
-    "$(basename "$PROTECTED_IMAGE")" "${PROTECTED_TRUTH_COUNT:-null}"; then
-  RAW_COMPARISON_FAILED=true
-  VALIDATION_FAILED=true
-  printf 'Raw-page DeepSeek comparison failed; processed pipeline will continue.\n' >&2
-fi
+run_deepseek_comparison() {
+  local name="$1" prompt="$2" input_mode="$3"
+  printf 'Running DeepSeek comparison: %s\n' "$name"
+  if ! sudo docker compose run --rm --no-deps -T \
+    -v "$RESULT_DIR:/comparison" \
+    -v "$OLD_IMAGE:/comparison-inputs/old-image:ro" \
+    -v "$NEW_IMAGE:/comparison-inputs/new-image:ro" \
+    -v "$PROTECTED_IMAGE:/comparison-inputs/protected-image:ro" \
+    --entrypoint python worker -X utf8 -B \
+    -m scripts.deepseek_raw_page_comparison \
+    --prompt "$prompt" \
+    --output-dir "/comparison/$name" \
+    --input-mode "$input_mode" \
+    --page "$(basename "${OLD_IMAGE%.*}")" /comparison-inputs/old-image \
+      "$(basename "$OLD_IMAGE")" "${OLD_TRUTH_COUNT:-null}" \
+    --page "$(basename "${NEW_IMAGE%.*}")" /comparison-inputs/new-image \
+      "$(basename "$NEW_IMAGE")" "${NEW_TRUTH_COUNT:-null}" \
+    --page "$(basename "${PROTECTED_IMAGE%.*}")" /comparison-inputs/protected-image \
+      "$(basename "$PROTECTED_IMAGE")" "${PROTECTED_TRUTH_COUNT:-null}"; then
+    RAW_COMPARISON_FAILED=true
+    VALIDATION_FAILED=true
+    printf 'DeepSeek comparison %s failed; processed pipeline will continue.\n' "$name" >&2
+  fi
+}
+
+run_deepseek_comparison raw-direct \
+  /app/config/deepseek-raw-page-comparison-prompt.md raw
+run_deepseek_comparison raw-direct-bbox \
+  /app/config/deepseek-raw-page-comparison-bbox-prompt.md raw
+run_deepseek_comparison prepared-direct \
+  /app/config/deepseek-raw-page-comparison-prompt.md prepared
 
 auth_header=( -H "Authorization: Bearer $ACCESS_TOKEN" )
 
@@ -354,10 +365,13 @@ sudo docker compose run --rm --no-deps -T \
   printf -- '- 分阶段计数、耗时及膨胀：`stage-audit/summary.md`\n'
   printf -- '- 每页bbox叠框及证据：`stage-audit/<页名>/`\n'
   printf -- '- 后台候选原始数据：`review-images.json`、`automatic-candidates.txt`\n\n'
-  printf '## B：DeepSeek原图直读\n\n'
-  printf -- '- 请求汇总：`raw-direct/summary.md`、`summary.csv`、`summary.json`\n'
-  printf -- '- 每页原始回答和API响应：`raw-direct/<页名>/answer.md`、`response.json`\n'
-  printf -- '- 请求元数据：`raw-direct/<页名>/metadata.json`\n\n'
+  printf '## B：DeepSeek交叉对照\n\n'
+  printf -- '- B：原图 + 当前简单提示词：`raw-direct/`\n'
+  printf -- '- B-1：原图 + 轻量 JSON/bbox 提示词：`raw-direct-bbox/`\n'
+  printf -- '- B-2：A相同预处理图 + 当前简单提示词：`prepared-direct/`\n'
+  printf -- '- 每组请求汇总：`<组名>/summary.md`、`summary.csv`、`summary.json`\n'
+  printf -- '- 每页原始回答和API响应：`<组名>/<页名>/answer.md`、`response.json`\n'
+  printf -- '- 每页请求元数据：`<组名>/<页名>/metadata.json`；B-2实际发送图：`prepared-direct/<页名>/input.jpg`\n\n'
   printf '两套结果必须按人工真值复核检出、漏检、误检和内容字段；自然语言回答更详细不等于正确。\n'
 } > "$RESULT_DIR/comparison-index.md"
 

@@ -269,16 +269,25 @@ if [[ "$*" == *" psql "* ]]; then printf 'fake database report\n'; exit 0; fi
 if [[ "$*" == *"docker logs"* ]]; then printf 'evidence_recognition_to_commit fake\n'; exit 0; fi
 if [[ "$*" == *"docker compose run"*"scripts.deepseek_raw_page_comparison"* ]]; then
   previous=''
+  host_output=''
+  comparison_output=''
   for argument in "$@"; do
     if [[ "$previous" == '-v' && "$argument" == *':/comparison' ]]; then
       host_output="${argument%:/comparison}"
-      mkdir -p "$host_output/raw-direct"
-      printf '%s\n' '# fake raw comparison' > "$host_output/raw-direct/summary.md"
-      exit 0
+    elif [[ "$previous" == '--output-dir' ]]; then
+      comparison_output="$argument"
     fi
     previous="$argument"
   done
-  exit 7
+  group_name="${comparison_output#/comparison/}"
+  [[ -n "$host_output" && -n "$group_name" ]] || exit 7
+  mkdir -p "$host_output/$group_name"
+  printf '%s\n' '# fake raw comparison' > "$host_output/$group_name/summary.md"
+  if [[ "$group_name" == prepared-direct ]]; then
+    mkdir -p "$host_output/$group_name/P003"
+    printf '%s\n' 'fake submitted jpeg' > "$host_output/$group_name/P003/input.jpg"
+  fi
+  exit 0
 fi
 if [[ "$*" == *"docker compose run"*"chinese_marked_evidence_stage_audit.py"* ]]; then exit 0; fi
 if [[ "$*" == *"docker rm"* ]]; then exit 0; fi
@@ -412,6 +421,16 @@ else:
                 self.assertTrue(any(name.endswith("automatic-candidates.txt") for name in names))
                 self.assertTrue(any(name.endswith("comparison-index.md") for name in names))
                 self.assertTrue(any(name.endswith("raw-direct/summary.md") for name in names))
+                self.assertTrue(any(name.endswith("raw-direct-bbox/summary.md") for name in names))
+                self.assertTrue(any(name.endswith("prepared-direct/summary.md") for name in names))
+                self.assertTrue(any(name.endswith("prepared-direct/P003/input.jpg") for name in names))
+                index = next(
+                    member for member in archive.getmembers()
+                    if member.name.endswith("comparison-index.md")
+                )
+                index_text = archive.extractfile(index).read().decode("utf-8")
+                self.assertIn("raw-direct-bbox/", index_text)
+                self.assertIn("prepared-direct/", index_text)
                 for member in archive.getmembers():
                     if member.isfile():
                         content = archive.extractfile(member).read()

@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
+from PIL import Image
 
 
 def _write_json(path: Path, value) -> None:
@@ -36,6 +37,37 @@ def _mime_type(source_name: str) -> str:
     if mime_type is None:
         raise ValueError(f"unsupported image type: {source_name}")
     return mime_type
+
+
+def _image_dimensions(image_path: Path) -> dict | None:
+    try:
+        with Image.open(image_path) as image:
+            return {"width": image.width, "height": image.height}
+    except OSError:
+        return None
+
+
+def _prepared_image_bytes(image_path: Path, settings_obj) -> tuple[bytes, dict]:
+    from app.services.vision_recognition import prepare_image_data_url
+
+    diagnostic = {}
+    data_url = prepare_image_data_url(
+        str(image_path),
+        settings_obj.MINIMAX_IMAGE_MAX_EDGE,
+        settings_obj.MINIMAX_IMAGE_JPEG_QUALITY,
+        diagnostic,
+    )
+    encoded = data_url.removeprefix("data:image/jpeg;base64,")
+    return base64.b64decode(encoded), {
+        "source_dimensions": {
+            "width": diagnostic["source_width"],
+            "height": diagnostic["source_height"],
+        },
+        "sent_dimensions": {
+            "width": diagnostic["prepared_width"],
+            "height": diagnostic["prepared_height"],
+        },
+    }
 
 
 def _credential(settings_obj) -> str:
@@ -101,6 +133,7 @@ def run_comparison(
     prompt_path: Path,
     output_dir: Path,
     settings_obj,
+    input_mode: str = "raw",
     transport=None,
 ) -> list[dict]:
     prompt = prompt_path.read_text(encoding="utf-8").strip()
@@ -108,6 +141,8 @@ def run_comparison(
         raise ValueError("comparison prompt must not be empty")
     if len(pages) != 3:
         raise ValueError("raw comparison requires exactly three pages")
+    if input_mode not in {"raw", "prepared"}:
+        raise ValueError("input mode must be raw or prepared")
     labels = [str(page["label"]) for page in pages]
     if len(set(labels)) != len(labels) or any(
         not label or label in {".", ".."} or "/" in label or "\\" in label
@@ -129,8 +164,18 @@ def run_comparison(
             page_dir = output_dir / label
             page_dir.mkdir()
             image_path = Path(page["image_path"])
-            image_bytes = image_path.read_bytes()
-            mime_type = _mime_type(str(page["source_name"]))
+            source_bytes = image_path.read_bytes()
+            source_dimensions = _image_dimensions(image_path)
+            if input_mode == "prepared":
+                image_bytes, dimensions = _prepared_image_bytes(image_path, settings_obj)
+                source_dimensions = dimensions["source_dimensions"]
+                sent_dimensions = dimensions["sent_dimensions"]
+                mime_type = "image/jpeg"
+                (page_dir / "input.jpg").write_bytes(image_bytes)
+            else:
+                image_bytes = source_bytes
+                sent_dimensions = source_dimensions
+                mime_type = _mime_type(str(page["source_name"]))
             request_body = {
                 "model": settings_obj.DEEPSEEK_VISION_MODEL,
                 "thinking": {"type": settings_obj.DEEPSEEK_VISION_THINKING},
@@ -212,6 +257,14 @@ def run_comparison(
                     page_dir / "metadata.json",
                     {
                         **row,
+                        "input_mode": input_mode,
+                        "source_dimensions": source_dimensions,
+                        "sent_dimensions": sent_dimensions,
+                        "source_bytes": len(source_bytes),
+                        "source_sha256": _sha256(source_bytes),
+                        "sent_bytes": len(image_bytes),
+                        "sent_sha256": _sha256(image_bytes),
+                        "sent_mime_type": mime_type,
                         "image_bytes": len(image_bytes),
                         "image_mime_type": mime_type,
                         "api_host": api_host,
@@ -240,6 +293,9 @@ def main() -> None:
     parser.add_argument("--prompt", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument(
+        "--input-mode", choices=("raw", "prepared"), default="raw"
+    )
+    parser.add_argument(
         "--page",
         action="append",
         nargs=4,
@@ -263,6 +319,7 @@ def main() -> None:
         prompt_path=args.prompt,
         output_dir=args.output_dir,
         settings_obj=settings,
+        input_mode=args.input_mode,
     )
     raise SystemExit(0 if all(row["status"] == "completed" for row in rows) else 2)
 

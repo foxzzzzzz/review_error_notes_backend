@@ -1,9 +1,11 @@
 import base64
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,6 +26,8 @@ def _settings():
         DEEPSEEK_VISION_MAX_TOKENS=4096,
         DEEPSEEK_VISION_IMAGE_DETAIL="original",
         DEEPSEEK_VISION_TIMEOUT_SECONDS=60,
+        MINIMAX_IMAGE_MAX_EDGE=2048,
+        MINIMAX_IMAGE_JPEG_QUALITY=90,
         LLM_API_KEY="secret-key-that-must-not-be-written",
         LLM_API_BASE="https://api.deepseek.test/v1",
     )
@@ -156,3 +160,79 @@ def test_raw_comparison_records_failures_without_retrying_or_stopping_other_page
     assert calls == 3
     assert [row["status"] for row in summary] == ["failed"] * 3
     assert all(row["http_status"] == 503 for row in summary)
+
+
+def test_prepared_comparison_reuses_a_preprocessing_and_persists_sent_image(tmp_path):
+    from scripts.deepseek_raw_page_comparison import run_comparison
+
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text(PROMPT, encoding="utf-8")
+    pages = []
+    for label in ("P003", "P015", "P041"):
+        image_path = tmp_path / f"{label}.png"
+        Image.new("RGBA", (3000, 1500), "red").save(image_path)
+        pages.append(
+            {
+                "label": label,
+                "image_path": image_path,
+                "source_name": image_path.name,
+                "truth_count": None,
+            }
+        )
+
+    requests = []
+
+    def respond(request: httpx.Request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "deepseek-flash",
+                "choices": [{"message": {"content": "结果"}, "finish_reason": "stop"}],
+            },
+        )
+
+    output_dir = tmp_path / "prepared-direct"
+    run_comparison(
+        pages=pages,
+        prompt_path=prompt_path,
+        output_dir=output_dir,
+        settings_obj=_settings(),
+        input_mode="prepared",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert len(requests) == 3
+    for page, request_body in zip(pages, requests):
+        page_dir = output_dir / page["label"]
+        sent_image = page_dir / "input.jpg"
+        metadata = json.loads((page_dir / "metadata.json").read_text(encoding="utf-8"))
+        assert sent_image.is_file()
+        assert request_body["messages"][0]["content"][0]["text"] == PROMPT
+        assert request_body["messages"][0]["content"][1]["image_url"]["url"] == (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(sent_image.read_bytes()).decode("ascii")
+        )
+        assert metadata["input_mode"] == "prepared"
+        assert "mode" not in metadata
+        assert metadata["source_dimensions"] == {"width": 3000, "height": 1500}
+        assert metadata["sent_dimensions"] == {"width": 2048, "height": 1024}
+        assert metadata["source_bytes"] == page["image_path"].stat().st_size
+        assert metadata["sent_bytes"] == sent_image.stat().st_size
+        assert metadata["sent_sha256"] == hashlib.sha256(sent_image.read_bytes()).hexdigest()
+
+
+def test_bbox_prompt_has_confirmed_lightweight_json_contract():
+    prompt = (ROOT / "config" / "deepseek-raw-page-comparison-bbox-prompt.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"wrong_questions"' in prompt
+    assert '"printed_question"' in prompt
+    assert '"student_answer"' in prompt
+    assert '"bbox"' in prompt
+    assert '"confidence"' in prompt
+    assert "严格 JSON" in prompt
+    assert "归一化 [left, top, right, bottom]" in prompt
+    assert "看不清时使用 null" in prompt
+    assert '{"wrong_questions":[]}' in prompt
