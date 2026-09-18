@@ -1,5 +1,7 @@
 import ast
+import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).parents[2]
@@ -129,3 +131,22 @@ def test_chinese_marked_evidence_revision_follows_cancelled_status():
     ):
         assert f'op.add_column("wrong_questions", sa.Column("{field}", sa.String' in source
         assert f'op.drop_column("wrong_questions", "{field}")' in source
+
+
+def test_recognition_audit_revision_compiles_add_and_drop_operations():
+    revision_path = VERSIONS / "0010_wrong_image_recognition_audit.py"
+    spec = importlib.util.spec_from_file_location("migration_0010", revision_path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    calls = []
+    migration.op = SimpleNamespace(
+        add_column=lambda table, column: calls.append(("add", table, column)),
+        drop_column=lambda table, column: calls.append(("drop", table, column)),
+    )
+
+    migration.upgrade()
+    migration.downgrade()
+
+    assert calls[0][0:2] == ("add", "wrong_images")
+    assert calls[0][2].name == "recognition_audit_json"
+    assert calls[1] == ("drop", "wrong_images", "recognition_audit_json")

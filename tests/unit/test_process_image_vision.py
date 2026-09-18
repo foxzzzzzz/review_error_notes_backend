@@ -130,6 +130,40 @@ def test_display_bbox_stays_in_image_at_edge():
     assert all(0 <= coordinate <= 1 for coordinate in display_bbox)
 
 
+@pytest.mark.parametrize(
+    ("model_bbox", "expected_display_bbox"),
+    [
+        ([0.4, 0.4, 0.6, 0.6], [0.3, 0.3, 0.7, 0.7]),
+        ([0.0, 0.4, 0.2, 0.6], [0.0, 0.3, 0.3, 0.7]),
+        ([0.8, 0.4, 1.0, 0.6], [0.7, 0.3, 1.0, 0.7]),
+        ([0.4, 0.0, 0.6, 0.2], [0.3, 0.0, 0.7, 0.3]),
+        ([0.4, 0.8, 0.6, 1.0], [0.3, 0.7, 0.7, 1.0]),
+        ([0.0, 0.0, 0.2, 0.2], [0.0, 0.0, 0.3, 0.3]),
+        ([0.8, 0.8, 1.0, 1.0], [0.7, 0.7, 1.0, 1.0]),
+        ([0.499, 0.2, 0.501, 0.8], [0.498, 0.0, 0.502, 1.0]),
+        ([0.01, 0.01, 0.99, 0.99], [0.0, 0.0, 1.0, 1.0]),
+    ],
+)
+def test_page_primary_display_bbox_is_centered_two_x_and_clipped(
+    model_bbox, expected_display_bbox
+):
+    from app.services.vision_recognition import marker_focused_display_bbox
+
+    assert marker_focused_display_bbox(
+        localization_bbox=model_bbox,
+        mark_ids=[],
+        marks={},
+        padding_ratio=0.5,
+        center_on_bbox=True,
+    ) == pytest.approx(expected_display_bbox)
+
+
+def test_page_primary_display_bbox_default_scale_is_two():
+    from app.config import Settings
+
+    assert Settings(_env_file=None).CHINESE_QUESTION_DISPLAY_BBOX_SCALE == 2.0
+
+
 def test_question_values_preserve_raw_writing_and_normalized_content():
     from app.services.vision_recognition import build_question_values
 
@@ -431,13 +465,14 @@ def test_task_logs_safe_localization_counts_without_recognized_text(caplog):
 
 
 @pytest.mark.parametrize(
-    ("deadline_enabled", "expected_deadline"),
-    [(True, 103.0), (False, None)],
+    ("deadline_enabled", "primary_enabled", "expected_deadline"),
+    [(True, True, 103.0), (False, False, None)],
 )
 def test_task_persists_placeholder_evidence_after_deadline_without_result_item(
     monkeypatch,
     caplog,
     deadline_enabled,
+    primary_enabled,
     expected_deadline,
 ):
     from types import SimpleNamespace
@@ -487,6 +522,7 @@ def test_task_persists_placeholder_evidence_after_deadline_without_result_item(
     actual_ocr = object()
     captured = {}
     persisted_kwargs = []
+    calls = []
 
     def evidence_value(mark_id):
         return {
@@ -520,6 +556,7 @@ def test_task_persists_placeholder_evidence_after_deadline_without_result_item(
     values = [evidence_value(0), evidence_value(1)]
 
     def fake_recognize_question_batch(**kwargs):
+        calls.append("recognize")
         captured.update(kwargs)
         return (
             SimpleNamespace(
@@ -541,6 +578,11 @@ def test_task_persists_placeholder_evidence_after_deadline_without_result_item(
         process_image_module.settings,
         "CHINESE_MARKED_EVIDENCE_SUBJECTS",
         "chinese",
+    )
+    monkeypatch.setattr(
+        process_image_module.settings,
+        "CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED",
+        primary_enabled,
     )
     monkeypatch.setattr(
         process_image_module.settings,
@@ -573,10 +615,9 @@ def test_task_persists_placeholder_evidence_after_deadline_without_result_item(
     monkeypatch.setattr(
         process_image_module,
         "scan_red_mark_regions",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            status="detected",
-            regions=[],
-            duration_ms=1.0,
+        lambda *_args, **_kwargs: (
+            calls.append("scan")
+            or SimpleNamespace(status="detected", regions=[], duration_ms=1.0)
         ),
     )
     monkeypatch.setattr(
@@ -609,6 +650,8 @@ def test_task_persists_placeholder_evidence_after_deadline_without_result_item(
     assert captured["client"] is actual_client
     assert captured["ocr_verifier"] is actual_ocr
     assert captured["evidence_mode"] is True
+    assert captured["deepseek_page_primary_enabled"] is primary_enabled
+    assert calls == (["recognize", "scan"] if primary_enabled else ["scan", "recognize"])
     assert captured["image_id"] == "image-8"
     assert captured["deadline"] == expected_deadline
     assert captured["ocr_crop_recheck_limit"] == 7
@@ -644,6 +687,212 @@ def test_task_persists_placeholder_evidence_after_deadline_without_result_item(
     assert '"remaining_seconds":0.0' in caplog.text
     assert '"exhausted":true' in caplog.text
     assert engine.disposed is True
+
+
+@pytest.mark.parametrize(
+    ("audit_enabled", "has_red_mark", "expected_calls", "expects_cv_diagnostic"),
+    [
+        (True, True, ["recognize", "scan"], True),
+        (True, False, ["recognize", "scan"], True),
+        (False, True, ["recognize"], False),
+    ],
+    ids=["strong_red", "no_red", "audit_disabled"],
+)
+def test_page_primary_failure_runs_advisory_cv_audit_before_manual_review(
+    monkeypatch,
+    caplog,
+    audit_enabled,
+    has_red_mark,
+    expected_calls,
+    expects_cv_diagnostic,
+):
+    from types import SimpleNamespace
+    import logging
+
+    from app.tasks import process_image as process_image_module
+    from app.services.vision_recognition import ImageReviewRequired
+
+    image = SimpleNamespace(
+        id="primary-failure",
+        student_id="student",
+        subject="chinese",
+        grade=3,
+        semester=1,
+        status="pending",
+        question_count=9,
+        recognition_correction=None,
+        error_code=None,
+        error_message=None,
+    )
+    calls = []
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def scalar(self, _statement):
+            return image
+
+        def commit(self):
+            pass
+
+    class Engine:
+        def dispose(self):
+            pass
+
+    def fail_primary(**_kwargs):
+        calls.append("recognize")
+        raise ImageReviewRequired(
+            "deepseek_page_primary_failed",
+            "整页识别未完成，请人工确认。",
+            diagnostic={"operation": "marked_page_recognition", "reason": "vision_timeout"},
+        )
+
+    def scan(*_args, **_kwargs):
+        calls.append("scan")
+        return SimpleNamespace(
+            status="detected" if has_red_mark else "none",
+            regions=(
+                [SimpleNamespace(bbox=[0.2, 0.2, 0.3, 0.3])]
+                if has_red_mark
+                else []
+            ),
+            red_pixel_count=20 if has_red_mark else 0,
+            scanned_width=400,
+            scanned_height=300,
+            duration_ms=1.0,
+        )
+
+    monkeypatch.setattr(process_image_module, "create_engine", lambda _url: Engine())
+    monkeypatch.setattr(process_image_module, "Session", lambda _engine: Session())
+    monkeypatch.setattr(process_image_module, "create_vision_client", object)
+    monkeypatch.setattr(process_image_module, "RapidOCRVerifier", lambda **_kwargs: object())
+    monkeypatch.setattr(process_image_module, "recognize_question_batch", fail_primary)
+    monkeypatch.setattr(process_image_module, "scan_red_mark_regions", scan)
+    monkeypatch.setattr(process_image_module.settings, "CHINESE_MARKED_EVIDENCE_ENABLED", True)
+    monkeypatch.setattr(process_image_module.settings, "CHINESE_MARKED_EVIDENCE_SUBJECTS", "chinese")
+    monkeypatch.setattr(process_image_module.settings, "CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED", True)
+    monkeypatch.setattr(process_image_module.settings, "CHINESE_LOCAL_CV_AUDIT_ENABLED", audit_enabled)
+
+    with caplog.at_level(logging.INFO):
+        process_image_module.process_image.run(image.id, "worksheet.jpg")
+
+    assert calls == expected_calls
+    assert image.question_count == 0
+    assert image.status == "needs_review"
+    assert image.error_code == "deepseek_page_primary_failed"
+    assert ("local_cv_audit" in caplog.text) is expects_cv_diagnostic
+    if expects_cv_diagnostic:
+        expected_detected = (
+            '"strong_red_mark_detected":true'
+            if has_red_mark
+            else '"strong_red_mark_detected":false'
+        )
+        assert expected_detected in caplog.text
+
+
+def test_page_primary_persists_candidates_when_advisory_cv_scan_fails(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.tasks import process_image as process_image_module
+
+    image = SimpleNamespace(
+        id="primary-cv-unavailable",
+        student_id="student",
+        subject="chinese",
+        grade=3,
+        semester=1,
+        status="pending",
+        question_count=0,
+        recognition_correction=None,
+        error_code=None,
+        error_message=None,
+    )
+    persisted = []
+    calls = []
+    candidate = {
+        "recognition_pipeline": "chinese_marked_evidence_v1",
+        "mark_status": "needs_review",
+        "question_evidence_status": "supported",
+        "answer_status": "unresolved",
+        "collection_status": "pending_review",
+        "review_status": "needs_review",
+        "ocr_text": "学生作答",
+        "ocr_answer": None,
+        "subject": "chinese",
+        "question_type": None,
+        "tags": [],
+        "difficulty": None,
+        "crop_region": {"model_bbox": [0.2, 0.2, 0.4, 0.4]},
+        "ocr_raw_json": {
+            "evidence_bundle": {
+                "identity": {
+                    "image_id": image.id,
+                    "mark_id": 0,
+                    "question_geometry": {"bbox": [0.2, 0.2, 0.4, 0.4]},
+                }
+            }
+        },
+    }
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def scalar(self, _statement):
+            return image
+
+        def add(self, question):
+            persisted.append(question)
+
+        def commit(self):
+            pass
+
+    class Engine:
+        def dispose(self):
+            pass
+
+    def recognize(**_kwargs):
+        calls.append("recognize")
+        return SimpleNamespace(items=[], ignored_text=[]), [candidate]
+
+    def broken_scan(*_args, **_kwargs):
+        calls.append("scan")
+        raise OSError("CV unavailable")
+
+    monkeypatch.setattr(process_image_module, "create_engine", lambda _url: Engine())
+    monkeypatch.setattr(process_image_module, "Session", lambda _engine: Session())
+    monkeypatch.setattr(process_image_module, "create_vision_client", object)
+    monkeypatch.setattr(process_image_module, "RapidOCRVerifier", lambda **_kwargs: object())
+    monkeypatch.setattr(process_image_module, "recognize_question_batch", recognize)
+    monkeypatch.setattr(process_image_module, "scan_red_mark_regions", broken_scan)
+    monkeypatch.setattr(process_image_module, "WrongQuestion", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(process_image_module.settings, "CHINESE_MARKED_EVIDENCE_ENABLED", True)
+    monkeypatch.setattr(process_image_module.settings, "CHINESE_MARKED_EVIDENCE_SUBJECTS", "chinese")
+    monkeypatch.setattr(process_image_module.settings, "CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED", True)
+    monkeypatch.setattr(process_image_module.settings, "CHINESE_LOCAL_CV_AUDIT_ENABLED", True)
+
+    process_image_module.process_image.run(image.id, "worksheet.jpg")
+
+    assert calls == ["recognize", "scan"]
+    assert len(persisted) == image.question_count == 1
+    assert image.status == "needs_review"
+    assert image.error_code is None
+    stored = persisted[0]
+    assert stored.answer_status == "unresolved"
+    assert stored.collection_status == "pending_review"
+    assert stored.crop_region["model_bbox"] == [0.2, 0.2, 0.4, 0.4]
+    assert stored.ocr_raw_json["local_cv_audit"] == {
+        "status": "unavailable",
+        "coverage": "indeterminate",
+        "scan_error_type": "OSError",
+    }
 
 
 def test_process_actual_unmarked_is_identical_when_evidence_is_requested(

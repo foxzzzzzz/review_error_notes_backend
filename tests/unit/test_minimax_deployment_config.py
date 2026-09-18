@@ -56,6 +56,14 @@ EXPECTED_CHINESE_MARKED_EVIDENCE_SETTINGS = {
 }
 
 
+EXPECTED_CHINESE_DEEPSEEK_PAGE_PRIMARY_SETTINGS = {
+    "CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED": "false",
+    "CHINESE_DEEPSEEK_PAGE_PROMPT_PATH": "./config/deepseek-marked-page-primary-prompt.md",
+    "CHINESE_LOCAL_CV_AUDIT_ENABLED": "true",
+    "CHINESE_QUESTION_DISPLAY_BBOX_SCALE": "2.0",
+}
+
+
 def test_worker_receives_every_minimax_setting_without_a_secret_value():
     compose = (BACKEND_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
@@ -199,6 +207,26 @@ def test_chinese_marked_evidence_settings_are_validated_and_deployed():
         for name, default in EXPECTED_CHINESE_MARKED_EVIDENCE_SETTINGS.items():
             assert f"{name}: ${{{name}:-{default}}}" in section
             assert f"{name}={default}" in env_example
+
+
+def test_chinese_deepseek_page_primary_settings_default_to_disabled_and_are_documented():
+    settings = Settings(_env_file=None)
+    env_example = (BACKEND_ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert settings.CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED is False
+    assert (
+        settings.CHINESE_DEEPSEEK_PAGE_PROMPT_PATH
+        == "./config/deepseek-marked-page-primary-prompt.md"
+    )
+    assert settings.CHINESE_LOCAL_CV_AUDIT_ENABLED is True
+    for name, default in EXPECTED_CHINESE_DEEPSEEK_PAGE_PRIMARY_SETTINGS.items():
+        assert f"{name}={default}" in env_example
+
+    compose = (BACKEND_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    for service in ("api", "worker"):
+        section = compose.split(f"  {service}:", 1)[1]
+        for name, default in EXPECTED_CHINESE_DEEPSEEK_PAGE_PRIMARY_SETTINGS.items():
+            assert f"{name}: ${{{name}:-{default}}}" in section
 
 
 def test_worker_passes_correction_group_settings_to_recognition_batch():

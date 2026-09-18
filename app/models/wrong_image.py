@@ -1,5 +1,5 @@
 from sqlalchemy import Column, String, SmallInteger, Integer, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID, ENUM
+from sqlalchemy.dialects.postgresql import UUID, ENUM, JSONB
 from app.models import Base, TimestampMixin, gen_uuid
 
 
@@ -27,3 +27,4 @@ class WrongImage(Base, TimestampMixin):
     error_code = Column(String(64), nullable=True)
     error_message = Column(String(255), nullable=True)
     recognition_correction = Column(String(32), nullable=True)
+    recognition_audit_json = Column(JSONB, nullable=True)

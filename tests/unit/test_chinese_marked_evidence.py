@@ -4,6 +4,71 @@ import pytest
 from pydantic import ValidationError
 
 
+def _primary_candidate(index=0):
+    return {
+        "recognition_pipeline": "chinese_marked_evidence_v1",
+        "mark_status": "needs_review",
+        "answer_status": "unresolved",
+        "collection_status": "pending_review",
+        "crop_region": {
+            "model_bbox": [0.2, 0.2, 0.4, 0.4],
+            "display_bbox": [0.1, 0.1, 0.5, 0.5],
+            "index": index,
+        },
+        "ocr_raw_json": {"page_review_reasons": ["primary_page_recognition_pending_review"]},
+    }
+
+
+@pytest.mark.parametrize(
+    ("candidate_count", "regions", "expected_covered", "expected_uncovered"),
+    [
+        (1, [[0.25, 0.25, 0.3, 0.3]], [0], []),
+        (1, [], [], []),
+        (0, [[0.25, 0.25, 0.3, 0.3]], [], [0]),
+        (0, [], [], []),
+    ],
+    ids=["model_and_cv", "model_without_cv", "cv_without_model", "neither"],
+)
+def test_primary_page_cv_audit_is_advisory_and_never_changes_candidates(
+    candidate_count, regions, expected_covered, expected_uncovered
+):
+    """CV may flag coverage gaps, but it cannot decide primary-page identity."""
+    from app.services.chinese_marked_evidence import audit_primary_page_cv_coverage
+
+    candidates = [_primary_candidate(index) for index in range(candidate_count)]
+    result = audit_primary_page_cv_coverage(candidates, regions)
+
+    assert len(candidates) == candidate_count
+    assert result["candidate_count"] == candidate_count
+    assert result["covered_region_indexes"] == expected_covered
+    assert result["uncovered_region_indexes"] == expected_uncovered
+    assert result["requires_manual_review"] is bool(expected_uncovered)
+    assert all(
+        candidate["answer_status"] != "confirmed"
+        and candidate["collection_status"] != "collected"
+        for candidate in candidates
+    )
+    if candidate_count:
+        assert candidates[0]["ocr_raw_json"]["local_cv_audit"]["candidate_bbox"] == [
+            0.2,
+            0.2,
+            0.4,
+            0.4,
+        ]
+
+
+def test_primary_page_cv_audit_uses_model_bbox_not_display_bbox():
+    from app.services.chinese_marked_evidence import audit_primary_page_cv_coverage
+
+    candidate = _primary_candidate()
+    result = audit_primary_page_cv_coverage(
+        [candidate], [[0.12, 0.12, 0.18, 0.18]]
+    )
+
+    assert result["covered_region_indexes"] == []
+    assert result["uncovered_region_indexes"] == [0]
+
+
 def test_legacy_question_remains_downstream_eligible():
     from app.services.chinese_marked_evidence import is_downstream_eligible
 
@@ -283,6 +348,48 @@ def test_pending_values_are_fixed_to_manual_review_and_include_bundle():
     assert values["question_type"] == "词语辨析"
     assert values["crop_region"] == {"bbox": [0.1, 0.2, 0.4, 0.5]}
     assert values["ocr_raw_json"]["evidence_bundle"]["identity"]["mark_id"] == 12
+
+
+def test_page_primary_evidence_keeps_model_bbox_separate_from_display_bbox():
+    from app.services.chinese_marked_evidence import (
+        assemble_question_evidence,
+        build_pending_evidence_values,
+    )
+
+    model_bbox = [0.4, 0.4, 0.6, 0.6]
+    display_bbox = [0.3, 0.3, 0.7, 0.7]
+    bundle = assemble_question_evidence(
+        image_id="page-primary",
+        mark_id=0,
+        question_geometry={"bbox": model_bbox, "source": "deepseek_page_primary"},
+        deepseek_observations=[
+            _observation(source="deepseek", text="题干", bbox=model_bbox)
+        ],
+        ocr_observations=[],
+        structure_observation={},
+    )
+    values = build_pending_evidence_values(
+        bundle,
+        student_text=None,
+        question_type=None,
+        crop_region={
+            "bbox": display_bbox,
+            "model_bbox": model_bbox,
+            "display_bbox": display_bbox,
+            "display_bbox_scale": 2.0,
+            "bbox_format": "normalized_ltrb",
+        },
+        raw_evidence={
+            "model_bbox": model_bbox,
+            "display_bbox": display_bbox,
+            "display_bbox_scale": 2.0,
+        },
+    )
+
+    assert values["ocr_raw_json"]["evidence_bundle"]["identity"]["question_geometry"]["bbox"] == model_bbox
+    assert values["ocr_raw_json"]["model_bbox"] == model_bbox
+    assert values["crop_region"]["bbox"] == display_bbox
+    assert values["crop_region"]["model_bbox"] == model_bbox
 
 
 def test_confirmed_requires_each_provider_observation_inside_field_structure():

@@ -132,6 +132,45 @@ def _content_observations(image: dict) -> list[dict]:
     return observations
 
 
+def _candidate_ledger(image: dict) -> list[dict]:
+    """Return review-only primary-page evidence without making a quality claim."""
+    ledger = []
+    for question in image.get("questions") or []:
+        raw = question.get("ocr_raw_json") or {}
+        crop_region = question.get("crop_region") or {}
+        bundle = raw.get("evidence_bundle") or {}
+        cv_audit = raw.get("local_cv_audit") or {}
+        cv_status = cv_audit.get("status") or ("available" if cv_audit else "unavailable")
+        ocr_page = raw.get("ocr_page") or {}
+        ledger.append(
+            {
+                "question_id": question.get("id"),
+                "content": {
+                    "printed_question": question.get("ocr_text"),
+                    "student_answer": question.get("ocr_answer"),
+                },
+                "model_bbox": raw.get("model_bbox") or crop_region.get("model_bbox"),
+                "display_bbox": raw.get("display_bbox") or crop_region.get("display_bbox"),
+                "display_bbox_scale": raw.get("display_bbox_scale")
+                or crop_region.get("display_bbox_scale"),
+                "ocr": {
+                    "status": raw.get("ocr_advisory_status", "unavailable"),
+                    "page_status": ocr_page.get("status", "not_provided"),
+                    "conflicts": bundle.get("role_conflicts") or [],
+                },
+                "cv": {
+                    "status": cv_status,
+                    "covered_region_indexes": cv_audit.get("covered_region_indexes") or [],
+                    "uncovered_region_indexes": (
+                        cv_audit.get("page_uncovered_region_indexes") or []
+                    ),
+                },
+                "timing": raw.get("evidence_timing") or {},
+            }
+        )
+    return ledger
+
+
 def _write_summary_files(output_dir: Path, summary: list[dict]) -> None:
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -193,7 +232,7 @@ def _write_summary_files(output_dir: Path, summary: list[dict]) -> None:
 
 
 def render_stage_audit_report(
-    *, review_path: Path, output_dir: Path, pages: list[dict]
+    *, review_path: Path, output_dir: Path, pages: list[dict], image_audits: dict | None = None
 ) -> list[dict]:
     review_images = json.loads(review_path.read_text(encoding="utf-8"))
     by_image_id = {image["image_id"]: image for image in review_images}
@@ -201,14 +240,24 @@ def render_stage_audit_report(
     summary = []
     for page in pages:
         image = by_image_id.get(page["image_id"])
+        image_audit = (image_audits or {}).get(str(page["image_id"])) or {}
         if image is None:
-            raise ValueError(f"review data has no image_id {page['image_id']}")
+            if not image_audit:
+                raise ValueError(f"review data has no image_id {page['image_id']}")
+            image = {"image_id": page["image_id"], "questions": []}
         image_path = Path(page["image_path"])
         if not image_path.is_file():
             raise ValueError(f"source image does not exist: {image_path}")
-        audit = _stage_audit_for(image)
+        audit = _stage_audit_for(image) if image.get("questions") else {}
         page_dir = output_dir / str(page["label"])
         page_dir.mkdir(parents=True, exist_ok=True)
+        if isinstance(image_audit.get("page_primary_raw_response"), str):
+            (page_dir / "primary-raw-response.md").write_text(
+                image_audit["page_primary_raw_response"], encoding="utf-8"
+            )
+            (page_dir / "primary-raw-response.json").write_text(
+                json.dumps(image_audit, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
         source_suffix = Path(str(page.get("source_name") or image_path.name)).suffix.lower()
         shutil.copyfile(image_path, page_dir / f"00-source{source_suffix}")
 
@@ -284,6 +333,10 @@ def render_stage_audit_report(
         (page_dir / "audit.json").write_text(
             json.dumps(page_audit, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        (page_dir / "candidate-ledger.json").write_text(
+            json.dumps(_candidate_ledger(image), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         first_raw = (image.get("questions") or [{}])[0].get("ocr_raw_json") or {}
         three_stage = first_raw.get("three_stage") or {}
         local_ocr_page = first_raw.get("local_ocr_page") or {}
@@ -329,12 +382,15 @@ def main() -> None:
     parser.add_argument("--review-images", required=True, type=Path)
     parser.add_argument("--pages-json", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--image-audits", type=Path)
     args = parser.parse_args()
     pages = json.loads(args.pages_json.read_text(encoding="utf-8"))
+    image_audits = json.loads(args.image_audits.read_text(encoding="utf-8")) if args.image_audits else None
     render_stage_audit_report(
         review_path=args.review_images,
         output_dir=args.output_dir,
         pages=pages,
+        image_audits=image_audits,
     )
 
 

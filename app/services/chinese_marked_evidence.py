@@ -489,6 +489,64 @@ def build_pending_evidence_values(
     }
 
 
+def _positive_bbox_overlap(left: Sequence[float], right: Sequence[float]) -> bool:
+    return (
+        max(left[0], right[0]) < min(left[2], right[2])
+        and max(left[1], right[1]) < min(left[3], right[3])
+    )
+
+
+def audit_primary_page_cv_coverage(
+    candidates: Sequence[dict[str, Any]],
+    regions: Sequence[Sequence[float]],
+) -> dict[str, Any]:
+    """Record local red-region coverage without changing primary candidates."""
+    valid_regions = [
+        bbox
+        for bbox in (_ordered_bbox(region) for region in regions)
+        if bbox is not None
+    ]
+    covered_region_indexes = set()
+    for candidate in candidates:
+        crop_region = candidate.get("crop_region") or {}
+        model_bbox = _ordered_bbox(crop_region.get("model_bbox"))
+        covered_indexes = (
+            [
+                index
+                for index, region in enumerate(valid_regions)
+                if _positive_bbox_overlap(model_bbox, region)
+            ]
+            if model_bbox is not None
+            else []
+        )
+        covered_region_indexes.update(covered_indexes)
+        raw_json = candidate.setdefault("ocr_raw_json", {})
+        raw_json["local_cv_audit"] = {
+            "candidate_bbox": model_bbox,
+            "covered_region_indexes": covered_indexes,
+        }
+    uncovered_region_indexes = [
+        index for index in range(len(valid_regions)) if index not in covered_region_indexes
+    ]
+    diagnostic = {
+        "candidate_count": len(candidates),
+        "region_count": len(valid_regions),
+        "covered_region_indexes": sorted(covered_region_indexes),
+        "uncovered_region_indexes": uncovered_region_indexes,
+        "requires_manual_review": bool(uncovered_region_indexes),
+    }
+    if uncovered_region_indexes:
+        for candidate in candidates:
+            raw_json = candidate.setdefault("ocr_raw_json", {})
+            raw_json["local_cv_audit"]["page_uncovered_region_indexes"] = (
+                uncovered_region_indexes
+            )
+            reasons = raw_json.setdefault("page_review_reasons", [])
+            if "local_cv_uncovered_strong_red_mark" not in reasons:
+                reasons.append("local_cv_uncovered_strong_red_mark")
+    return diagnostic
+
+
 def is_downstream_eligible(question) -> bool:
     """Keep legacy records usable while requiring confirmation for this pipeline."""
     return (

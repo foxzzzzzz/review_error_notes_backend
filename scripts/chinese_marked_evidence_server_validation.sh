@@ -5,6 +5,9 @@ OLD_IMAGE="${OLD_IMAGE:-}"
 NEW_IMAGE="${NEW_IMAGE:-}"
 PROTECTED_IMAGE="${PROTECTED_IMAGE:-}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:18000}"
+LEGACY_BASE_URL="${LEGACY_BASE_URL:-}"
+LEGACY_API_CONTAINER="${LEGACY_API_CONTAINER:-evidence-shadow-legacy-api}"
+LEGACY_WORKER_CONTAINER="${LEGACY_WORKER_CONTAINER:-evidence-shadow-legacy-worker}"
 SHADOW_DB="${SHADOW_DB:-}"
 GRADE="${GRADE:-3}"
 SEMESTER="${SEMESTER:-1}"
@@ -36,6 +39,7 @@ Required values may be supplied by options/environment or entered interactively:
 
 Options:
   --base-url URL            Shadow API URL (default: http://127.0.0.1:18000)
+  --legacy-base-url URL     Legacy three-stage shadow API URL for the same three pages
   --grade 1..6              Upload grade (default: 3)
   --semester 1..2           Upload semester (default: 1)
   --poll-seconds N          Status polling interval (default: 2)
@@ -70,6 +74,9 @@ while [[ $# -gt 0 ]]; do
     --new-image) need_value "$@"; NEW_IMAGE="$2"; shift 2 ;;
     --protected-image) need_value "$@"; PROTECTED_IMAGE="$2"; shift 2 ;;
     --base-url) need_value "$@"; BASE_URL="$2"; shift 2 ;;
+    --legacy-base-url) need_value "$@"; LEGACY_BASE_URL="$2"; shift 2 ;;
+    --legacy-api-container) need_value "$@"; LEGACY_API_CONTAINER="$2"; shift 2 ;;
+    --legacy-worker-container) need_value "$@"; LEGACY_WORKER_CONTAINER="$2"; shift 2 ;;
     --shadow-db) need_value "$@"; SHADOW_DB="$2"; shift 2 ;;
     --grade) need_value "$@"; GRADE="$2"; shift 2 ;;
     --semester) need_value "$@"; SEMESTER="$2"; shift 2 ;;
@@ -100,7 +107,6 @@ prompt_value() {
 prompt_value OLD_IMAGE '旧样本整页原图绝对路径'
 prompt_value NEW_IMAGE '新样本整页原图绝对路径'
 prompt_value PROTECTED_IMAGE '保护样本整页原图绝对路径'
-prompt_value SHADOW_DB '第3步创建的影子数据库名'
 
 if [[ -z "$ACCESS_TOKEN" ]]; then
   [[ -t 0 ]] || die 'ACCESS_TOKEN is required in non-interactive mode'
@@ -126,8 +132,32 @@ PROTECTED_IMAGE="$(realpath "$PROTECTED_IMAGE")"
 [[ "$OLD_IMAGE" != "$NEW_IMAGE" && "$OLD_IMAGE" != "$PROTECTED_IMAGE" && "$NEW_IMAGE" != "$PROTECTED_IMAGE" ]] \
   || die 'OLD_IMAGE, NEW_IMAGE, and PROTECTED_IMAGE must be three different files'
 
+discover_shadow_db() {
+  local shadow_databases=()
+  [[ -n "$SHADOW_DB" || "$CHECK_INPUTS_ONLY" == true ]] && return 0
+  command -v sudo >/dev/null 2>&1 || return 0
+  mapfile -t shadow_databases < <(
+    sudo docker compose exec -T db psql -At -U wb_user -d postgres -c \
+      "SELECT datname FROM pg_database WHERE datname LIKE 'wrong_book_evidence_%' ORDER BY datname;" \
+      2>/dev/null || true
+  )
+  if [[ ${#shadow_databases[@]} -eq 1 ]]; then
+    SHADOW_DB="${shadow_databases[0]}"
+    printf 'Auto-discovered preserved shadow database: %s\n' "$SHADOW_DB"
+  elif [[ ${#shadow_databases[@]} -gt 1 ]]; then
+    die 'multiple preserved shadow databases found; pass one explicitly with --shadow-db'
+  fi
+}
+
+discover_shadow_db
+prompt_value SHADOW_DB '已保留影子数据库名（自动发现失败时必填）'
+
 BASE_URL="${BASE_URL%/}"
 [[ "$BASE_URL" =~ ^https?://[^[:space:]]+$ ]] || die "invalid BASE_URL: $BASE_URL"
+if [[ -n "$LEGACY_BASE_URL" ]]; then
+  LEGACY_BASE_URL="${LEGACY_BASE_URL%/}"
+  [[ "$LEGACY_BASE_URL" =~ ^https?://[^[:space:]]+$ ]] || die "invalid LEGACY_BASE_URL: $LEGACY_BASE_URL"
+fi
 [[ "$SHADOW_DB" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid SHADOW_DB: $SHADOW_DB"
 [[ "$GRADE" =~ ^[1-6]$ ]] || die "GRADE must be from 1 to 6: $GRADE"
 [[ "$SEMESTER" =~ ^[12]$ ]] || die "SEMESTER must be 1 or 2: $SEMESTER"
@@ -152,7 +182,7 @@ if [[ "$CHECK_INPUTS_ONLY" == true ]]; then
   exit 0
 fi
 
-for command_name in curl jq sudo docker tar git grep tee awk; do
+for command_name in curl jq sudo docker tar git grep tee awk sha256sum python; do
   command -v "$command_name" >/dev/null 2>&1 || die "required command not found: $command_name"
 done
 sudo docker compose version >/dev/null
@@ -175,10 +205,165 @@ collect_logs() {
     "$RESULT_DIR/worker.log" > "$RESULT_DIR/worker-summary.log" || true
 }
 
+write_replay_hashes() {
+  local relative_path archived_path sha256
+  local files=(
+    app/config.py
+    app/services/chinese_marked_evidence.py
+    app/services/vision_recognition.py
+    app/tasks/process_image.py
+    scripts/chinese_marked_evidence_stage_audit.py
+    scripts/chinese_marked_evidence_server_validation.sh
+    scripts/deepseek_raw_page_comparison.py
+    config/deepseek-marked-page-primary-prompt.md
+    config/deepseek-raw-page-comparison-prompt.md
+    config/deepseek-raw-page-comparison-bbox-prompt.md
+    docker-compose.yml
+    .env.example
+  )
+  : > "$RESULT_DIR/replay-hashes.tsv"
+  for relative_path in "${files[@]}"; do
+    [[ -f "$relative_path" ]] || die "required replay hash input missing: $relative_path"
+    archived_path="replay-sources/$relative_path"
+    mkdir -p "$RESULT_DIR/$(dirname "$archived_path")"
+    cp "$relative_path" "$RESULT_DIR/$archived_path"
+    sha256="$(sha256sum "$RESULT_DIR/$archived_path" | awk '{print $1}')"
+    printf '%s\t%s\n' "$archived_path" "$sha256" >> "$RESULT_DIR/replay-hashes.tsv"
+  done
+  python - "$RESULT_DIR/replay-hashes.tsv" "$RESULT_DIR/replay-hashes.json" \
+    "${CHINESE_QUESTION_DISPLAY_BBOX_SCALE:-2.0}" <<'PY'
+import json
+import sys
+
+input_path, output_path, scale = sys.argv[1:]
+with open(input_path, encoding="utf-8") as stream:
+    files = [
+        {"path": path, "sha256": sha256}
+        for path, sha256 in (line.rstrip("\n").split("\t", 1) for line in stream)
+    ]
+with open(output_path, "w", encoding="utf-8") as stream:
+    json.dump(
+        {"schema_version": 1, "display_bbox_scale": scale, "files": files},
+        stream,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    stream.write("\n")
+PY
+}
+
+container_env_value() {
+  local container_name="$1" variable_name="$2"
+  sudo docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container_name" 2>/dev/null \
+    | awk -F= -v key="$variable_name" '$1 == key {sub("^[^=]*=", ""); print; exit}' \
+    || true
+}
+
+write_effective_config() {
+  local variable_name
+  local allowed=(
+    CHINESE_MARKED_EVIDENCE_ENABLED CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED
+    CHINESE_DEEPSEEK_PAGE_PROMPT_PATH CHINESE_LOCAL_CV_AUDIT_ENABLED
+    CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED CHINESE_QUESTION_DISPLAY_BBOX_SCALE
+    VISION_PROVIDER DEEPSEEK_VISION_MODEL DEEPSEEK_VISION_THINKING
+    DEEPSEEK_VISION_MAX_TOKENS DEEPSEEK_VISION_IMAGE_DETAIL DEEPSEEK_VISION_TIMEOUT_SECONDS
+  )
+  : > "$RESULT_DIR/effective-config.tsv"
+  for variable_name in "${allowed[@]}"; do
+    printf 'api\t%s\t%s\n' "$variable_name" \
+      "$(container_env_value evidence-shadow-api "$variable_name")" \
+      >> "$RESULT_DIR/effective-config.tsv"
+    printf 'worker\t%s\t%s\n' "$variable_name" \
+      "$(container_env_value evidence-shadow-worker "$variable_name")" \
+      >> "$RESULT_DIR/effective-config.tsv"
+  done
+  python - "$RESULT_DIR/effective-config.tsv" "$RESULT_DIR/effective-config.json" <<'PY'
+import json
+import sys
+
+input_path, output_path = sys.argv[1:]
+config = {"api": {}, "worker": {}}
+with open(input_path, encoding="utf-8") as stream:
+    for line in stream:
+        service, key, value = line.rstrip("\n").split("\t", 2)
+        config[service][key] = value
+with open(output_path, "w", encoding="utf-8") as stream:
+    json.dump(config, stream, ensure_ascii=False, separators=(",", ":"))
+    stream.write("\n")
+PY
+  sha256sum "$RESULT_DIR/effective-config.json" > "$RESULT_DIR/effective-config.sha256"
+}
+
+write_return_package_contract() {
+  write_effective_config
+  write_replay_hashes
+  cat > "$RESULT_DIR/return-package-contract.json" <<'EOF'
+{
+  "schema_version": 1,
+  "sample_groups": ["old", "new", "protected"],
+  "development_regression_pages": ["P003", "P015", "P041"],
+  "required_artifacts": [
+    "review-images.json",
+    "stage-audit/summary.json",
+    "stage-audit/<page>/candidate-ledger.json",
+    "stage-audit/<page>/audit.json",
+    "stage-audit/<page>/primary-raw-response.md",
+    "image-audits.json",
+    "raw-direct/<page>/response.json",
+    "raw-direct-bbox/<page>/response.json",
+    "prepared-direct/<page>/response.json",
+    "effective-config.json",
+    "replay-hashes.json",
+    "replay-sources/<path>",
+    "legacy-mode-comparison.json",
+    "legacy-mode-review-images.json",
+    "legacy-mode/stage-audit/<page>/audit.json",
+    "legacy-mode/stage-audit/<page>/candidate-ledger.json"
+  ],
+  "candidate_ledger_fields": [
+    "content", "model_bbox", "display_bbox", "display_bbox_scale",
+    "ocr.status", "ocr.conflicts", "cv.covered_region_indexes",
+    "cv.uncovered_region_indexes", "timing"
+  ],
+  "ocr_allowed_states": ["support", "conflict", "missing", "unavailable"],
+  "cv_availability_states": ["available", "unavailable"],
+  "cv_coverage_semantics": {
+    "covered": "regions with CV support",
+    "uncovered": "regions without CV support",
+    "indeterminate": "coverage cannot be determined"
+  },
+  "quality_rule": "HTTP 200, JSON parsing, OCR support, CV coverage, and validator acceptance are not substitutes for per-question human correctness and answer review."
+}
+
+EOF
+}
+
+verify_return_package_contract() {
+  local label group path sha256 expected
+  for label in "$(basename "${OLD_IMAGE%.*}")" "$(basename "${NEW_IMAGE%.*}")" "$(basename "${PROTECTED_IMAGE%.*}")"; do
+    for path in "stage-audit/$label/audit.json" "stage-audit/$label/candidate-ledger.json" "stage-audit/$label/primary-raw-response.md"; do
+      [[ -f "$RESULT_DIR/$path" ]] || die "required return artifact missing: $path"
+    done
+    for path in "legacy-mode/stage-audit/$label/audit.json" "legacy-mode/stage-audit/$label/candidate-ledger.json"; do
+      [[ -f "$RESULT_DIR/$path" ]] || die "required return artifact missing: $path"
+    done
+    for group in raw-direct raw-direct-bbox prepared-direct; do [[ -f "$RESULT_DIR/$group/$label/response.json" ]] || die "required return artifact missing: $group/$label/response.json"; done
+  done
+  sha256sum -c "$RESULT_DIR/effective-config.sha256" >/dev/null || die 'effective config hash mismatch'
+  while IFS=$'\t' read -r path expected; do
+    [[ -f "$RESULT_DIR/$path" ]] || die "required replay source missing: $path"
+    [[ "$(sha256sum "$RESULT_DIR/$path" | awk '{print $1}')" == "$expected" ]] || die "replay hash mismatch: $path"
+  done < "$RESULT_DIR/replay-hashes.tsv"
+  [[ -f "$RESULT_DIR/legacy-mode-review-images.json" ]] || die 'required return artifact missing: legacy-mode-review-images.json'
+  jq -e '.status == "completed"' "$RESULT_DIR/legacy-mode-comparison.json" >/dev/null || die 'legacy comparison did not complete'
+}
+
 package_results() {
   local exit_code="$1"
   [[ -n "$RESULT_DIR" && -d "$RESULT_DIR" ]] || return 0
   collect_logs
+  write_return_package_contract
+  verify_return_package_contract
   printf '{"commit":"%s","exit_code":%s,"human_review_mode":"%s","shadow_db":"%s","raw_comparison_failed":%s}\n' \
     "$EXPECTED_COMMIT" "$exit_code" "$HUMAN_REVIEW_MODE" "$SHADOW_DB" \
     "$RAW_COMPARISON_FAILED" > "$RESULT_DIR/run-summary.json"
@@ -232,10 +417,38 @@ verify_shadow_broker_isolation() {
 
 verify_shadow_broker_isolation
 
-worker_stage_audit="$(sudo docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
-  evidence-shadow-worker 2>/dev/null | awk -F= '$1 == "CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED" {print tolower($2); exit}')"
-[[ "$worker_stage_audit" == true ]] \
-  || die 'evidence-shadow-worker must set CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED=true'
+verify_primary_shadow_preflight() {
+  local prompt_path subjects
+  [[ "$(container_env_value evidence-shadow-worker CHINESE_MARKED_EVIDENCE_ENABLED)" == "true" ]] \
+    || die 'evidence-shadow-worker must set CHINESE_MARKED_EVIDENCE_ENABLED=true'
+  [[ "$(container_env_value evidence-shadow-worker CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED)" == "true" ]] \
+    || die 'evidence-shadow-worker must set CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED=true'
+  [[ "$(container_env_value evidence-shadow-worker CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED)" == "true" ]] \
+    || die 'evidence-shadow-worker must set CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED=true'
+  [[ "$(container_env_value evidence-shadow-worker CHINESE_LOCAL_CV_AUDIT_ENABLED)" == "true" ]] \
+    || die 'evidence-shadow-worker must set CHINESE_LOCAL_CV_AUDIT_ENABLED=true'
+  subjects="$(container_env_value evidence-shadow-worker CHINESE_MARKED_EVIDENCE_SUBJECTS)"
+  subjects_include_chinese "$subjects" \
+    || die 'evidence-shadow-worker CHINESE_MARKED_EVIDENCE_SUBJECTS must include chinese'
+  [[ "$(container_env_value evidence-shadow-worker VISION_PROVIDER)" == "deepseek" ]] \
+    || die 'evidence-shadow-worker must set VISION_PROVIDER=deepseek'
+  [[ "$(container_env_value evidence-shadow-api CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED)" == "true" ]] \
+    || die 'evidence-shadow-api must set CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED=true'
+  prompt_path="$(container_env_value evidence-shadow-worker CHINESE_DEEPSEEK_PAGE_PROMPT_PATH)"
+  [[ -n "$prompt_path" ]] || die 'evidence-shadow-worker must set CHINESE_DEEPSEEK_PAGE_PROMPT_PATH'
+  sudo docker exec evidence-shadow-worker test -r "$prompt_path" \
+    || die "evidence-shadow-worker prompt path is not readable: $prompt_path"
+}
+
+subjects_include_chinese() {
+  local subjects="$1" subject
+  for subject in ${subjects//,/ }; do
+    [[ "$subject" == "chinese" ]] && return 0
+  done
+  return 1
+}
+
+verify_primary_shadow_preflight
 
 run_deepseek_comparison() {
   local name="$1" prompt="$2" input_mode="$3"
@@ -270,6 +483,68 @@ run_deepseek_comparison prepared-direct \
   /app/config/deepseek-raw-page-comparison-prompt.md prepared
 
 auth_header=( -H "Authorization: Bearer $ACCESS_TOKEN" )
+
+run_legacy_mode_comparison() {
+  if [[ -z "$LEGACY_BASE_URL" ]]; then
+    printf '{"status":"not_run","reason":"--legacy-base-url was not supplied"}\n' \
+      > "$RESULT_DIR/legacy-mode-comparison.json"
+    return 0
+  fi
+  local primary_base_url="$BASE_URL" legacy_old_id legacy_new_id legacy_protected_id
+  [[ "$LEGACY_BASE_URL" != "$primary_base_url" ]] || die 'legacy URL must differ from primary URL'
+  [[ "$(container_env_value "$LEGACY_API_CONTAINER" CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED)" == false ]] \
+    || die 'legacy API must set CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED=false'
+  [[ "$(container_env_value "$LEGACY_WORKER_CONTAINER" CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED)" == false ]] \
+    || die 'legacy worker must set CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED=false'
+  BASE_URL="$LEGACY_BASE_URL"
+  legacy_old_id="$(upload_case legacy-old "$OLD_IMAGE")"
+  legacy_new_id="$(upload_case legacy-new "$NEW_IMAGE")"
+  legacy_protected_id="$(upload_case legacy-protected "$PROTECTED_IMAGE")"
+  local legacy_status="$RESULT_DIR/legacy-mode-status-latest.json" legacy_deadline=$((SECONDS + TIMEOUT_SECONDS))
+  while true; do
+    curl --fail --silent --show-error "${auth_header[@]}" --get \
+      --data-urlencode "image_ids=$legacy_old_id" \
+      --data-urlencode "image_ids=$legacy_new_id" \
+      --data-urlencode "image_ids=$legacy_protected_id" \
+      "$BASE_URL/api/upload/images/status" > "$legacy_status"
+    if jq -e 'length == 3 and all(.[]; .status != "pending" and .status != "segmented")' \
+        "$legacy_status" >/dev/null; then break; fi
+    (( SECONDS < legacy_deadline )) || die "legacy image processing did not finish within $TIMEOUT_SECONDS seconds"
+    sleep "$POLL_SECONDS"
+  done
+  jq -e 'any(.[]; .status == "failed")' "$legacy_status" >/dev/null && \
+    die 'legacy image processing failed'
+  curl --fail --silent --show-error "${auth_header[@]}" \
+    "$BASE_URL/api/questions/review/images" \
+    | jq --arg old "$legacy_old_id" --arg new "$legacy_new_id" --arg protected "$legacy_protected_id" \
+        '[.[] | select(.image_id == $old or .image_id == $new or .image_id == $protected)]' \
+    > "$RESULT_DIR/legacy-mode-review-images.json"
+  jq -n \
+    --arg old_label "$(basename "${OLD_IMAGE%.*}")" \
+    --arg new_label "$(basename "${NEW_IMAGE%.*}")" \
+    --arg protected_label "$(basename "${PROTECTED_IMAGE%.*}")" \
+    --arg old_id "$legacy_old_id" --arg new_id "$legacy_new_id" --arg protected_id "$legacy_protected_id" \
+    '[
+      {label:$old_label,image_id:$old_id,image_path:"/audit-inputs/old-image"},
+      {label:$new_label,image_id:$new_id,image_path:"/audit-inputs/new-image"},
+      {label:$protected_label,image_id:$protected_id,image_path:"/audit-inputs/protected-image"}
+    ]' > "$RESULT_DIR/legacy-mode-stage-audit-pages.json"
+  sudo docker compose run --rm --no-deps -T \
+    -v "$RESULT_DIR:/audit" \
+    -v "$OLD_IMAGE:/audit-inputs/old-image:ro" \
+    -v "$NEW_IMAGE:/audit-inputs/new-image:ro" \
+    -v "$PROTECTED_IMAGE:/audit-inputs/protected-image:ro" \
+    --entrypoint python worker -X utf8 -B \
+    /app/scripts/chinese_marked_evidence_stage_audit.py \
+    --review-images /audit/legacy-mode-review-images.json \
+    --pages-json /audit/legacy-mode-stage-audit-pages.json \
+    --output-dir /audit/legacy-mode/stage-audit
+  jq -n --arg primary_url "$primary_base_url" --arg legacy_url "$LEGACY_BASE_URL" \
+    --arg old "$legacy_old_id" --arg new "$legacy_new_id" --arg protected "$legacy_protected_id" \
+    '{status:"completed",primary_mode:{base_url:$primary_url,enabled:true},legacy_mode:{base_url:$legacy_url,enabled:false,image_ids:{old:$old,new:$new,protected:$protected}},review_artifact:"legacy-mode-review-images.json",audit_artifact:"legacy-mode/stage-audit"}' \
+    > "$RESULT_DIR/legacy-mode-comparison.json"
+  BASE_URL="$primary_base_url"
+}
 
 upload_case() {
   local label="$1" image_path="$2" response image_id
@@ -346,6 +621,11 @@ jq -n \
     {label:$protected_label,image_id:$protected_id,image_path:"/audit-inputs/protected-image",source_name:$protected_source_name,truth_count:$protected_truth}
   ]' > "$RESULT_DIR/stage-audit-pages.json"
 
+sudo docker compose exec -T db psql -v ON_ERROR_STOP=1 -At -U wb_user -d "$SHADOW_DB" -c \
+  "SELECT coalesce(jsonb_object_agg(id::text, recognition_audit_json), '{}'::jsonb)
+     FROM wrong_images WHERE id IN ('$OLD_IMAGE_ID','$NEW_IMAGE_ID','$PROTECTED_IMAGE_ID');" \
+  > "$RESULT_DIR/image-audits.json"
+
 sudo docker compose run --rm --no-deps -T \
   -v "$RESULT_DIR:/audit" \
   -v "$OLD_IMAGE:/audit-inputs/old-image:ro" \
@@ -355,7 +635,10 @@ sudo docker compose run --rm --no-deps -T \
   /app/scripts/chinese_marked_evidence_stage_audit.py \
   --review-images /audit/review-images.json \
   --pages-json /audit/stage-audit-pages.json \
+  --image-audits /audit/image-audits.json \
   --output-dir /audit/stage-audit
+
+run_legacy_mode_comparison
 
 {
   printf '# 同图A/B识别结果索引\n\n'

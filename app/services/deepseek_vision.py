@@ -1,10 +1,17 @@
 """DeepSeek transport for the existing visual prompts, stages and validation."""
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
 
 from app.config import settings
-from app.services.vision_recognition import MiniMaxVisionClient, VisionRecognitionError, _extract_json
+from app.services.vision_recognition import (
+    MarkedPageRecognitionResult,
+    MiniMaxVisionClient,
+    VisionRecognitionError,
+    _extract_json,
+    prepare_image_data_url,
+)
 
 
 class DeepSeekVisionClient(MiniMaxVisionClient):
@@ -42,6 +49,33 @@ class DeepSeekVisionClient(MiniMaxVisionClient):
             return client.post(self.api_host+'/chat/completions',
                                headers={'Authorization':'Bearer '+self.api_key,'Content-Type':'application/json'},
                                json=request)
+
+    def recognize_marked_page(self, image_path: str) -> MarkedPageRecognitionResult:
+        diagnostic = {"operation": "marked_page_recognition"}
+        image_url = prepare_image_data_url(
+            image_path, self.max_edge, self.jpeg_quality, diagnostic
+        )
+        prompt = Path(settings.CHINESE_DEEPSEEK_PAGE_PROMPT_PATH).read_text(
+            encoding="utf-8"
+        )
+        return self._request(
+            {"prompt": prompt, "image_url": image_url},
+            MarkedPageRecognitionResult,
+            diagnostic,
+            allow_format_retry=False,
+        )
+
+    @staticmethod
+    def _raw_response_content_for_audit(response):
+        try:
+            data = response.json()
+            choices = data.get('choices')
+            if not isinstance(choices, list) or len(choices) != 1:
+                return None
+            content = (choices[0].get('message') or {}).get('content')
+            return content if isinstance(content, str) else None
+        except (ValueError, TypeError, AttributeError):
+            return None
 
     @staticmethod
     def _parse_response_content(response, diagnostic):

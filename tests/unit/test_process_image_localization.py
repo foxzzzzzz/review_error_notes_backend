@@ -1,4 +1,5 @@
 import pytest
+import pytest
 from PIL import Image, ImageDraw
 
 from app.services.local_ocr_verification import OCRVerification
@@ -171,6 +172,7 @@ def _run_batch(
     localization_stage_retry_count=1,
     evidence_localization_recheck_limit=None,
     stage_audit_enabled=False,
+    deepseek_page_primary_enabled=False,
 ):
     from app.services.vision_recognition import recognize_question_batch
 
@@ -195,6 +197,11 @@ def _run_batch(
             evidence_kwargs["evidence_localization_recheck_limit"] = (
                 evidence_localization_recheck_limit
             )
+    primary_kwargs = (
+        {"deepseek_page_primary_enabled": True}
+        if deepseek_page_primary_enabled
+        else {}
+    )
     return recognize_question_batch(
         client=client or FakeClient(),
         image_path=_write_source_image(tmp_path),
@@ -223,6 +230,7 @@ def _run_batch(
         localization_stage_retry_count=localization_stage_retry_count,
         ocr_full_page_max_edge=ocr_full_page_max_edge,
         ocr_crop_recheck_limit=ocr_crop_recheck_limit,
+        **primary_kwargs,
         **evidence_kwargs,
     )
 
@@ -283,6 +291,7 @@ class _EvidenceStageClient:
         self.content_error = content_error
         self.content_calls = 0
 
+
     def detect_marks(self, image_path, local_red_regions, correction=None):
         from app.services.vision_recognition import MarkDetectionResult
 
@@ -323,6 +332,231 @@ class _EvidenceStageClient:
         if self.content_error is not None:
             raise self.content_error
         return self.content_result
+
+
+def test_deepseek_page_primary_uses_one_page_call_without_legacy_stages(tmp_path):
+    from app.services.vision_recognition import (
+        MarkedPageRecognitionItem,
+        MarkedPageRecognitionResult,
+    )
+
+    class PrimaryClient:
+        def __init__(self):
+            self.page_calls = 0
+
+        def recognize_marked_page(self, _image_path):
+            self.page_calls += 1
+            return MarkedPageRecognitionResult(
+                wrong_questions=[
+                    MarkedPageRecognitionItem(
+                        printed_question="看拼音写词语",
+                        student_answer="合做",
+                        model_bbox=[0.1, 0.2, 0.4, 0.5],
+                        confidence=0.9,
+                    )
+                ]
+            )
+
+        def detect_marks(self, *_args, **_kwargs):
+            raise AssertionError("primary page route must not detect marks")
+
+        def locate_marked_questions(self, *_args, **_kwargs):
+            raise AssertionError("primary page route must not localize marks")
+
+        def recognize_localized_content(self, *_args, **_kwargs):
+            raise AssertionError("primary page route must not recognize crops")
+
+    client = PrimaryClient()
+    result, values = _run_batch(
+        tmp_path, client=client, local_red_scan=_detected_red_scan(),
+        evidence_mode=True, image_id="primary-page", deepseek_page_primary_enabled=True,
+    )
+
+    assert client.page_calls == 1
+    assert result.items == []
+    assert values[0]["collection_status"] == "pending_review"
+    assert values[0]["answer_status"] == "unresolved"
+    assert values[0]["crop_region"]["bbox"] == pytest.approx([0.0, 0.05, 0.55, 0.65])
+    assert values[0]["crop_region"]["display_bbox"] == pytest.approx([0.0, 0.05, 0.55, 0.65])
+    assert values[0]["crop_region"]["model_bbox"] == [0.1, 0.2, 0.4, 0.5]
+    assert values[0]["ocr_raw_json"]["evidence_bundle"]["identity"]["question_geometry"]["bbox"] == [0.1, 0.2, 0.4, 0.5]
+    assert values[0]["ocr_raw_json"]["display_bbox_scale"] == 2.0
+    assert values[0]["ocr_raw_json"]["page_review_reasons"] == [
+        "primary_page_recognition_pending_review"
+    ]
+
+
+def test_deepseek_page_primary_does_not_duplicate_raw_content_in_candidates(tmp_path):
+    from app.services.vision_recognition import MarkedPageRecognitionItem, MarkedPageRecognitionResult
+
+    raw_content = "```json\n{\"wrong_questions\": []}\n```"
+
+    class PrimaryClient:
+        def recognize_marked_page(self, _image_path):
+            return MarkedPageRecognitionResult(
+                wrong_questions=[MarkedPageRecognitionItem(
+                    printed_question="题干", student_answer=None,
+                    model_bbox=[0.2, 0.2, 0.4, 0.4], confidence=0.9,
+                )],
+                raw_response_content=raw_content,
+            )
+
+    _result, audited_values = _run_batch(
+        tmp_path, client=PrimaryClient(), local_red_scan=_detected_red_scan(),
+        evidence_mode=True, image_id="primary-raw", deepseek_page_primary_enabled=True,
+        stage_audit_enabled=True,
+    )
+    _result, ordinary_values = _run_batch(
+        tmp_path, client=PrimaryClient(), local_red_scan=_detected_red_scan(),
+        evidence_mode=True, image_id="primary-no-raw", deepseek_page_primary_enabled=True,
+        stage_audit_enabled=False,
+    )
+
+    assert audited_values[0]["ocr_raw_json"].get("page_primary_raw_response") is None
+    assert ordinary_values[0]["ocr_raw_json"].get("page_primary_raw_response") is None
+
+
+def test_deepseek_page_primary_failure_requires_page_review(tmp_path):
+    from app.services.vision_recognition import ImageReviewRequired, VisionRecognitionError
+
+    class FailingClient:
+        def recognize_marked_page(self, _image_path):
+            raise VisionRecognitionError("vision_timeout", "识别服务超时")
+
+        def detect_marks(self, *_args, **_kwargs):
+            raise AssertionError("failed primary route must not fall back")
+
+    with pytest.raises(ImageReviewRequired, match="整页识别") as exc_info:
+        _run_batch(
+            tmp_path, client=FailingClient(), local_red_scan=_detected_red_scan(),
+            evidence_mode=True, image_id="primary-failed", deepseek_page_primary_enabled=True,
+        )
+
+    assert exc_info.value.code == "deepseek_page_primary_failed"
+    assert exc_info.value.diagnostic["reason"] == "vision_timeout"
+
+
+def test_deepseek_page_primary_keeps_invalid_items_as_review_reason(tmp_path):
+    from app.services.vision_recognition import (
+        MarkedPageRecognitionItem,
+        MarkedPageRecognitionResult,
+    )
+
+    class PartialClient:
+        def recognize_marked_page(self, _image_path):
+            return MarkedPageRecognitionResult(
+                wrong_questions=[MarkedPageRecognitionItem(
+                    printed_question="看图填空", student_answer=None,
+                    model_bbox=[0.2, 0.3, 0.5, 0.6], confidence=0.8,
+                    uncertain_fields=["student_answer"],
+                )],
+                invalid_item_diagnostics=[{"item_index": 1, "reason": "bbox"}],
+            )
+
+    _result, values = _run_batch(
+        tmp_path, client=PartialClient(), local_red_scan=_detected_red_scan(),
+        evidence_mode=True, image_id="primary-partial", deepseek_page_primary_enabled=True,
+    )
+
+    assert values[0]["collection_status"] == "pending_review"
+    assert values[0]["answer_status"] != "confirmed"
+    assert values[0]["ocr_raw_json"]["page_review_reasons"] == [
+        "primary_page_recognition_pending_review",
+        "invalid_marked_page_items",
+        "uncertain_marked_page_items",
+    ]
+
+
+def test_deepseek_page_primary_empty_candidates_are_normal_no_candidate_result(tmp_path):
+    from app.services.vision_recognition import MarkedPageRecognitionResult
+
+    class EmptyClient:
+        def recognize_marked_page(self, _image_path):
+            return MarkedPageRecognitionResult(wrong_questions=[])
+
+    result, values = _run_batch(
+        tmp_path, client=EmptyClient(), local_red_scan=_detected_red_scan(),
+        evidence_mode=True, image_id="primary-empty", deepseek_page_primary_enabled=True,
+    )
+
+    assert result.items == []
+    assert values == []
+
+
+@pytest.mark.parametrize(
+    ("page_status", "lines", "expected_selected_lines", "expected_ocr_semantic", "expected_field_status"),
+    [
+        ("available", [("题干", [0.2, 0.2, 0.4, 0.4])], 1, "support", "confirmed"),
+        ("available", [("冲突文本", [0.2, 0.2, 0.4, 0.4])], 1, "conflict", "conflict"),
+        ("available", [], 0, "missing", "supported"),
+        ("unavailable", [], 0, "unavailable", "supported"),
+    ],
+    ids=["consistent", "conflict", "empty", "exception"],
+)
+def test_deepseek_page_primary_ocr_is_advisory_and_runs_with_no_cv_marks(
+    tmp_path, page_status, lines, expected_selected_lines, expected_ocr_semantic, expected_field_status
+):
+    from app.services.error_mark_validation import RedMarkScanResult
+    from app.services.local_ocr_verification import OCRLine, OCRPageEvidence
+    from app.services.vision_recognition import (
+        MarkedPageRecognitionItem,
+        MarkedPageRecognitionResult,
+    )
+
+    class PrimaryClient:
+        def recognize_marked_page(self, _image_path):
+            return MarkedPageRecognitionResult(
+                wrong_questions=[
+                    MarkedPageRecognitionItem(
+                        printed_question="题干",
+                        student_answer="学生作答",
+                        model_bbox=[0.2, 0.2, 0.4, 0.4],
+                        confidence=0.9,
+                    )
+                ]
+            )
+
+    class OCR:
+        enabled = True
+
+        def recognize_page(self, _image_path, _max_edge):
+            return OCRPageEvidence(
+                status=page_status,
+                lines=[
+                    OCRLine(text=text, confidence=0.99, bbox=bbox)
+                    for text, bbox in lines
+                ],
+                error_code="inference_failed" if page_status == "unavailable" else None,
+            )
+
+    no_cv_marks = RedMarkScanResult(
+        status="none",
+        regions=[],
+        red_pixel_count=0,
+        scanned_width=400,
+        scanned_height=300,
+        duration_ms=1.0,
+    )
+    _result, values = _run_batch(
+        tmp_path,
+        client=PrimaryClient(),
+        ocr_verifier=OCR(),
+        local_red_scan=no_cv_marks,
+        evidence_mode=True,
+        image_id="primary-ocr",
+        deepseek_page_primary_enabled=True,
+    )
+
+    assert len(values) == 1
+    assert values[0]["answer_status"] != "confirmed"
+    assert values[0]["collection_status"] != "collected"
+    assert values[0]["ocr_raw_json"]["ocr_page"]["status"] == page_status
+    assert len(values[0]["ocr_raw_json"]["selected_ocr_lines"]) == expected_selected_lines
+    assert values[0]["ocr_raw_json"]["ocr_advisory_status"] == expected_ocr_semantic
+    bundle = values[0]["ocr_raw_json"]["evidence_bundle"]
+    assert bundle["fields"]["printed_prompt"]["status"] == expected_field_status
+    ocr_observations = bundle["fields"]["printed_prompt"]["observations"]
+    assert len([item for item in ocr_observations if item["source"] == "ocr"]) == expected_selected_lines
 
 
 def _run_evidence_three_stage(

@@ -338,6 +338,7 @@ SAFE_RECOGNITION_DIAGNOSTIC_KEYS = {
     "content_invalid_item_diagnostics",
     "response_attempt",
     "response_max_attempts",
+    "local_cv_audit",
 }
 
 
@@ -538,6 +539,60 @@ class ContentRecognitionEnvelope(BaseModel):
     items: List[dict]
 
 
+class MarkedPageRecognitionItem(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid", strict=True, protected_namespaces=()
+    )
+
+    printed_question: Optional[str]
+    student_answer: Optional[str]
+    model_bbox: List[float]
+    confidence: float = Field(ge=0, le=1)
+    uncertain_fields: List[
+        Literal["printed_question", "student_answer", "model_bbox"]
+    ] = Field(default_factory=list)
+
+    @field_validator("printed_question", "student_answer")
+    @classmethod
+    def visible_text_must_not_be_blank(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError("visible text must not be blank")
+        return value
+
+    @field_validator("model_bbox", mode="before")
+    @classmethod
+    def model_bbox_must_use_strict_finite_floats(cls, value):
+        if (
+            not isinstance(value, list)
+            or len(value) != 4
+            or any(type(coordinate) is not float for coordinate in value)
+            or any(not math.isfinite(coordinate) for coordinate in value)
+        ):
+            raise ValueError("model_bbox must contain four finite float coordinates")
+        return validate_normalized_bbox(value)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def confidence_must_be_a_finite_normalized_float(cls, value):
+        if type(value) is not float or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("confidence must be a finite normalized float")
+        return value
+
+
+class MarkedPageRecognitionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    wrong_questions: List[MarkedPageRecognitionItem]
+    invalid_item_diagnostics: List[dict] = Field(default_factory=list, exclude=True)
+    raw_response_content: Optional[str] = Field(default=None, exclude=True)
+
+
+class MarkedPageRecognitionEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    wrong_questions: List[object]
+
+
 class VisionResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -643,6 +698,8 @@ def _stage_item_model(result_model):
         return MarkQuestionLocalizationItem
     if result_model is ContentRecognitionResult:
         return ContentRecognitionItem
+    if result_model is MarkedPageRecognitionResult:
+        return MarkedPageRecognitionItem
     return None
 
 
@@ -671,14 +728,19 @@ def _normalize_stage_response_shape(raw, result_model):
 def _stage_response_shape_diagnostic(raw, result_model) -> dict:
     if _stage_item_model(result_model) is None:
         return {}
-    diagnostic = {"expected_root_key": "items"}
+    root_field = (
+        "wrong_questions"
+        if result_model is MarkedPageRecognitionResult
+        else "items"
+    )
+    diagnostic = {"expected_root_key": root_field}
     if not isinstance(raw, dict):
         return diagnostic
     diagnostic["response_top_level_keys"] = sorted(str(key) for key in raw)[:20]
     diagnostic["response_array_field_names"] = sorted(
         str(key) for key, value in raw.items() if isinstance(value, list)
     )[:20]
-    for field_name in ("items", "results"):
+    for field_name in (root_field, "results"):
         values = raw.get(field_name)
         if isinstance(values, list) and values and isinstance(values[0], dict):
             diagnostic["response_first_item_keys"] = sorted(
@@ -691,52 +753,64 @@ def _stage_response_shape_diagnostic(raw, result_model) -> dict:
 def _format_retry_instruction_for(result_model) -> str:
     if _stage_item_model(result_model) is None:
         return FORMAT_RETRY_INSTRUCTION
+    root_field = (
+        "wrong_questions"
+        if result_model is MarkedPageRecognitionResult
+        else "items"
+    )
     return (
         FORMAT_RETRY_INSTRUCTION
-        + '\n本阶段最外层必须是 JSON 对象，根字段必须是 "items"，'
-        '格式为 {"items":[...]}；即使只有一项也不得省略 items 数组。'
+        + f'\n本阶段最外层必须是 JSON 对象，根字段必须是 "{root_field}"，'
+        + f'格式为 {{"{root_field}":[...]}}；即使只有一项也不得省略 {root_field} 数组。'
     )
 
 
 def _validate_response_result(raw, result_model, diagnostic: dict):
-    if result_model is not ContentRecognitionResult:
+    if result_model not in (ContentRecognitionResult, MarkedPageRecognitionResult):
         return result_model.model_validate(raw)
 
-    envelope = ContentRecognitionEnvelope.model_validate(raw)
+    if result_model is ContentRecognitionResult:
+        envelope = ContentRecognitionEnvelope.model_validate(raw)
+        item_model = ContentRecognitionItem
+        result_field = "items"
+    else:
+        envelope = MarkedPageRecognitionEnvelope.model_validate(raw)
+        item_model = MarkedPageRecognitionItem
+        result_field = "wrong_questions"
     valid_items = []
     invalid_item_diagnostics = []
-    for item_index, raw_item in enumerate(envelope.items):
+    for item_index, raw_item in enumerate(getattr(envelope, result_field)):
         try:
-            valid_items.append(ContentRecognitionItem.model_validate(raw_item))
+            valid_items.append(item_model.model_validate(raw_item))
         except ValidationError as exc:
-            raw_mark_id = raw_item.get("mark_id")
-            mark_id = (
-                raw_mark_id
-                if isinstance(raw_mark_id, int) and not isinstance(raw_mark_id, bool)
-                else None
-            )
-            invalid_item_diagnostics.append(
-                {
-                    "item_index": item_index,
-                    "mark_id": mark_id,
-                    "validation_errors": [
-                        {
-                            "field": ".".join(str(part) for part in error["loc"]),
-                            "type": error["type"],
-                        }
-                        for error in exc.errors()[:5]
-                    ],
-                }
-            )
+            item_diagnostic = {
+                "item_index": item_index,
+                "validation_errors": [
+                    {
+                        "field": ".".join(str(part) for part in error["loc"]),
+                        "type": error["type"],
+                    }
+                    for error in exc.errors()[:5]
+                ],
+            }
+            if result_model is ContentRecognitionResult:
+                raw_mark_id = raw_item.get("mark_id")
+                item_diagnostic["mark_id"] = (
+                    raw_mark_id
+                    if isinstance(raw_mark_id, int) and not isinstance(raw_mark_id, bool)
+                    else None
+                )
+            invalid_item_diagnostics.append(item_diagnostic)
 
-    result = ContentRecognitionResult(
-        items=valid_items,
+    result = result_model(
+        **{result_field: valid_items},
         invalid_item_diagnostics=invalid_item_diagnostics,
     )
     if invalid_item_diagnostics:
         logger.info(
-            "vision_content_items_rejected operation=%s candidate_count=%s "
+            "vision_%s_items_rejected operation=%s candidate_count=%s "
             "invalid_count=%s diagnostic=%s",
+            "content" if result_model is ContentRecognitionResult else "marked_page",
             diagnostic.get("operation", "content_recognition"),
             diagnostic.get("candidate_count", 0),
             len(invalid_item_diagnostics),
@@ -1097,13 +1171,25 @@ def marker_focused_display_bbox(
     mark_ids: List[int],
     marks: dict[int, ErrorMark],
     padding_ratio: float,
+    center_on_bbox: bool = False,
 ) -> List[float]:
+    """Expand a display-only bbox without changing the localization evidence."""
     if padding_ratio == 0:
         return list(localization_bbox)
 
     left, top, right, bottom = localization_bbox
     content_width = right - left
     content_height = bottom - top
+    if center_on_bbox:
+        center_x = (left + right) / 2
+        center_y = (top + bottom) / 2
+        return [
+            max(0.0, center_x - content_width * (1 + 2 * padding_ratio) / 2),
+            max(0.0, center_y - content_height * (1 + 2 * padding_ratio) / 2),
+            min(1.0, center_x + content_width * (1 + 2 * padding_ratio) / 2),
+            min(1.0, center_y + content_height * (1 + 2 * padding_ratio) / 2),
+        ]
+
     display_width = min(1.0, content_width * (1 + 2 * padding_ratio))
     display_height = min(1.0, content_height * (1 + 2 * padding_ratio))
 
@@ -3214,6 +3300,7 @@ def recognize_question_batch(
     evidence_ocr_crop_recheck_limit: int | None = None,
     evidence_localization_recheck_limit: int | None = None,
     stage_audit_enabled: bool = False,
+    deepseek_page_primary_enabled: bool = False,
 ) -> tuple[VisionResult | SimpleNamespace, List[dict]]:
     """Recognize, localize, and apply adaptive local evidence policy."""
     legacy_mode = local_red_scan is None
@@ -3339,6 +3426,202 @@ def recognize_question_batch(
             ),
             three_stage_result,
         )
+
+    def recognize_deepseek_page_primary():
+        from app.services.chinese_marked_evidence import (
+            PIPELINE_NAME,
+            assemble_question_evidence,
+            build_pending_evidence_values,
+        )
+        from app.services.local_ocr_verification import OCRPageEvidence
+
+        if not hasattr(client, "recognize_marked_page"):
+            raise ImageReviewRequired(
+                "deepseek_page_primary_unavailable",
+                "整页识别服务不可用，请人工确认。",
+                diagnostic={"operation": "marked_page_recognition"},
+            )
+        try:
+            page_result = client.recognize_marked_page(image_path)
+        except (VisionRecognitionError, httpx.TimeoutException, TimeoutError) as exc:
+            raise ImageReviewRequired(
+                "deepseek_page_primary_failed",
+                "整页识别未完成，请人工确认。",
+                diagnostic={
+                    "operation": "marked_page_recognition",
+                    "reason": (
+                        exc.code if isinstance(exc, VisionRecognitionError) else "vision_timeout"
+                    ),
+                    "error": safe_recognition_diagnostic(exc),
+                },
+            ) from exc
+
+        invalid_item_diagnostics = list(page_result.invalid_item_diagnostics)
+        image_audit = (
+            {
+                "page_primary_raw_response": page_result.raw_response_content,
+                "invalid_item_diagnostics": invalid_item_diagnostics,
+                "status": "completed",
+            }
+            if stage_audit_enabled
+            else None
+        )
+        if invalid_item_diagnostics and not page_result.wrong_questions:
+            raise ImageReviewRequired(
+                "deepseek_page_primary_invalid_items",
+                "整页识别结果不完整，请人工确认。",
+                diagnostic={
+                    "operation": "marked_page_recognition",
+                    "invalid_item_diagnostics": invalid_item_diagnostics,
+                    "recognition_audit_json": image_audit,
+                },
+            )
+
+        page_review_reasons = ["primary_page_recognition_pending_review"]
+        if invalid_item_diagnostics:
+            page_review_reasons.append("invalid_marked_page_items")
+        if any(item.uncertain_fields for item in page_result.wrong_questions):
+            page_review_reasons.append("uncertain_marked_page_items")
+
+        ocr_page_evidence = None
+        if hasattr(ocr_verifier, "recognize_page"):
+            try:
+                ocr_page_evidence = ocr_verifier.recognize_page(
+                    image_path,
+                    ocr_full_page_max_edge,
+                )
+            except (httpx.TimeoutException, TimeoutError):
+                ocr_page_evidence = OCRPageEvidence(
+                    status="unavailable",
+                    error_code="page_ocr_timeout",
+                )
+            except (ValidationError, TypeError, ValueError):
+                ocr_page_evidence = OCRPageEvidence(
+                    status="unavailable",
+                    error_code="page_ocr_invalid",
+                )
+        ocr_page_status = (
+            {
+                "status": ocr_page_evidence.status,
+                "duration_ms": ocr_page_evidence.duration_ms,
+                "error_code": ocr_page_evidence.error_code,
+                "prepared_size": ocr_page_evidence.prepared_size,
+            }
+            if ocr_page_evidence is not None
+            else {"status": "not_provided"}
+        )
+
+        values = []
+        for index, item in enumerate(page_result.wrong_questions):
+            model_bbox = list(item.model_bbox)
+            display_bbox = marker_focused_display_bbox(
+                localization_bbox=model_bbox,
+                mark_ids=[],
+                marks={},
+                padding_ratio=(settings.CHINESE_QUESTION_DISPLAY_BBOX_SCALE - 1) / 2,
+                center_on_bbox=True,
+            )
+            observations = []
+            if item.printed_question is not None:
+                observations.append(
+                    {
+                        "source": "deepseek",
+                        "text": item.printed_question,
+                        "bbox": model_bbox,
+                        "source_class": "printed",
+                        "confidence": item.confidence,
+                        "role": "printed_prompt",
+                    }
+                )
+            if item.student_answer is not None:
+                observations.append(
+                    {
+                        "source": "deepseek",
+                        "text": item.student_answer,
+                        "bbox": model_bbox,
+                        "source_class": "student_handwriting",
+                        "confidence": item.confidence,
+                        "role": "student_answer",
+                    }
+                )
+            ocr_observations, selected_ocr_lines = _ocr_evidence_for_question(
+                ocr_page_evidence,
+                model_bbox,
+            )
+            role_routing_hints = (
+                {"printed_prompt": model_bbox}
+                if item.printed_question is not None
+                else {}
+            )
+            bundle = assemble_question_evidence(
+                image_id=image_id,
+                mark_id=index,
+                question_geometry={
+                    "bbox": model_bbox,
+                    "source": "deepseek_page_primary",
+                },
+                deepseek_observations=observations,
+                ocr_observations=ocr_observations,
+                structure_observation=(
+                    {"printed_prompt_bbox": model_bbox}
+                    if item.printed_question is not None
+                    else {}
+                ),
+                role_routing_hints=role_routing_hints,
+                mark_status="needs_review",
+            )
+            if ocr_page_evidence is None or ocr_page_evidence.status != "available":
+                ocr_advisory_status = "unavailable"
+            elif not ocr_observations:
+                ocr_advisory_status = "missing"
+            elif bundle.question_evidence_status == "conflict":
+                ocr_advisory_status = "conflict"
+            else:
+                ocr_advisory_status = "support"
+            values.append(
+                build_pending_evidence_values(
+                    bundle,
+                    student_text=item.student_answer,
+                    question_type=None,
+                    crop_region={
+                        "bbox": display_bbox,
+                        "model_bbox": model_bbox,
+                        "display_bbox": display_bbox,
+                        "display_bbox_scale": settings.CHINESE_QUESTION_DISPLAY_BBOX_SCALE,
+                        "bbox_format": "normalized_ltrb",
+                        "bbox_source": "deepseek_page_primary",
+                        "bbox_confidence": item.confidence,
+                        "localization_status": "needs_review",
+                        "mark_ids": [index],
+                        "index": index,
+                    },
+                    subject=subject_hint,
+                    raw_evidence={
+                        "schema_version": 1,
+                        "marked_page_item": item.model_dump(mode="json"),
+                        "model_bbox": model_bbox,
+                        "display_bbox": display_bbox,
+                        "display_bbox_scale": settings.CHINESE_QUESTION_DISPLAY_BBOX_SCALE,
+                        "invalid_item_diagnostics": invalid_item_diagnostics,
+                        "page_review_reasons": list(page_review_reasons),
+                        "ocr_page": ocr_page_status,
+                        "selected_ocr_lines": selected_ocr_lines,
+                        "ocr_advisory_status": ocr_advisory_status,
+                    },
+                )
+            )
+        return (
+            SimpleNamespace(
+                items=[],
+                ignored_text=[],
+                recognition_pipeline=PIPELINE_NAME,
+                recognition_audit_json=image_audit,
+            ),
+            values,
+        )
+
+    if evidence_mode and deepseek_page_primary_enabled:
+        return recognize_deepseek_page_primary()
 
     if evidence_mode and mode == "marked":
         return recognize_evidence_pipeline()
@@ -4619,7 +4902,7 @@ class MiniMaxVisionClient:
             diagnostic,
         )
 
-    def _request(self, payload, result_model, diagnostic: dict):
+    def _request(self, payload, result_model, diagnostic: dict, *, allow_format_retry: bool = True):
         request_payload = dict(payload)
         for attempt in range(self.max_retries + 1):
             try:
@@ -4656,6 +4939,7 @@ class MiniMaxVisionClient:
                         "识别服务返回异常，请稍后重试",
                         {**diagnostic, "status_code": response.status_code},
                     )
+                raw_response_content = self._raw_response_content_for_audit(response)
                 raw = self._parse_response_content(response, diagnostic)
                 response_shape_diagnostic = _stage_response_shape_diagnostic(
                     raw, result_model
@@ -4673,6 +4957,8 @@ class MiniMaxVisionClient:
                     result = _validate_response_result(
                         normalized, result_model, diagnostic
                     )
+                    if result_model is MarkedPageRecognitionResult:
+                        result.raw_response_content = raw_response_content
                     self._emit_diagnostic_event(
                         "validated_response",
                         operation=diagnostic.get("operation", "unknown"),
@@ -4707,7 +4993,8 @@ class MiniMaxVisionClient:
                     diagnostic=exc.diagnostic,
                 )
                 if (
-                    exc.code in FORMAT_RETRYABLE_ERROR_CODES
+                    allow_format_retry
+                    and exc.code in FORMAT_RETRYABLE_ERROR_CODES
                     and attempt < self.max_retries
                 ):
                     logger.info(
@@ -4759,6 +5046,10 @@ class MiniMaxVisionClient:
         }
         with httpx.Client(timeout=self.timeout_seconds, transport=self.transport) as client:
             return client.post(self.api_host + VISION_PATH, headers=headers, json=payload)
+
+    @staticmethod
+    def _raw_response_content_for_audit(_response: httpx.Response) -> Optional[str]:
+        return None
 
     @staticmethod
     def _parse_response_content(response: httpx.Response, diagnostic: dict) -> dict:

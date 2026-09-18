@@ -19,7 +19,10 @@ from app.models.wrong_image import WrongImage
 from app.models.wrong_question import WrongQuestion
 from app.services.error_mark_validation import scan_red_mark_regions
 from app.services.local_ocr_verification import RapidOCRVerifier
-from app.services.chinese_marked_evidence import PIPELINE_NAME
+from app.services.chinese_marked_evidence import (
+    PIPELINE_NAME,
+    audit_primary_page_cv_coverage,
+)
 from app.services.vision_provider import create_vision_client
 from app.services.vision_recognition import (
     ImageReviewRequired,
@@ -68,6 +71,32 @@ def processing_failure_for(error: Exception) -> tuple[str, str]:
     if isinstance(error, VisionRecognitionError):
         return error.code, error.user_message
     return "recognition_internal_error", "识别暂时失败，请稍后重试"
+
+
+def local_cv_failure_diagnostic(filepath: str) -> dict:
+    """Capture advisory scan facts without masking a page-primary failure."""
+    try:
+        scan = scan_red_mark_regions(
+            filepath,
+            max_edge=settings.LOCAL_RED_SCAN_MAX_EDGE,
+            min_component_pixels=settings.LOCAL_RED_COMPONENT_MIN_PIXELS,
+            max_component_area_ratio=settings.LOCAL_RED_COMPONENT_MAX_AREA_RATIO,
+            max_thinness_ratio=settings.LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO,
+        )
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "strong_red_mark_detected": False,
+            "coverage": "indeterminate",
+            "scan_error_type": type(exc).__name__,
+        }
+    return {
+        "status": scan.status,
+        "strong_red_mark_detected": scan.status == "detected",
+        "strong_red_region_count": len(scan.regions),
+        "coverage": "indeterminate",
+        "duration_ms": scan.duration_ms,
+    }
 
 
 def should_persist_candidate(values: dict, recognition_correction: str | None) -> bool:
@@ -293,13 +322,18 @@ def process_image(self, image_id: str, filepath: str):
             and settings.CHINESE_MARKED_EVIDENCE_PAGE_DEADLINE_ENABLED
             else None
         )
-        local_red_scan = scan_red_mark_regions(
-            filepath,
-            max_edge=settings.LOCAL_RED_SCAN_MAX_EDGE,
-            min_component_pixels=settings.LOCAL_RED_COMPONENT_MIN_PIXELS,
-            max_component_area_ratio=settings.LOCAL_RED_COMPONENT_MAX_AREA_RATIO,
-            max_thinness_ratio=settings.LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO,
+        page_primary_enabled = bool(
+            evidence_mode and settings.CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED
         )
+        local_red_scan = None
+        if not page_primary_enabled:
+            local_red_scan = scan_red_mark_regions(
+                filepath,
+                max_edge=settings.LOCAL_RED_SCAN_MAX_EDGE,
+                min_component_pixels=settings.LOCAL_RED_COMPONENT_MIN_PIXELS,
+                max_component_area_ratio=settings.LOCAL_RED_COMPONENT_MAX_AREA_RATIO,
+                max_thinness_ratio=settings.LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO,
+            )
         vision_client = create_vision_client()
         ocr_verifier = RapidOCRVerifier(
             enabled=settings.LOCAL_OCR_ENABLED,
@@ -314,7 +348,8 @@ def process_image(self, image_id: str, filepath: str):
             support_similarity_threshold=settings.LOCAL_OCR_SUPPORT_SIMILARITY_THRESHOLD,
             contradiction_similarity_threshold=settings.LOCAL_OCR_CONTRADICTION_SIMILARITY_THRESHOLD,
         )
-        result, question_values = recognize_question_batch(
+        try:
+            result, question_values = recognize_question_batch(
             client=vision_client,
             image_path=filepath,
             subject_hint=subject_hint,
@@ -382,7 +417,39 @@ def process_image(self, image_id: str, filepath: str):
                 if evidence_mode
                 else False
             ),
-        )
+                deepseek_page_primary_enabled=page_primary_enabled,
+            )
+        except ImageReviewRequired as exc:
+            if page_primary_enabled and settings.CHINESE_LOCAL_CV_AUDIT_ENABLED:
+                exc.diagnostic["local_cv_audit"] = local_cv_failure_diagnostic(filepath)
+            raise
+        if page_primary_enabled and settings.CHINESE_LOCAL_CV_AUDIT_ENABLED:
+            cv_audit = None
+            try:
+                local_red_scan = scan_red_mark_regions(
+                    filepath,
+                    max_edge=settings.LOCAL_RED_SCAN_MAX_EDGE,
+                    min_component_pixels=settings.LOCAL_RED_COMPONENT_MIN_PIXELS,
+                    max_component_area_ratio=settings.LOCAL_RED_COMPONENT_MAX_AREA_RATIO,
+                    max_thinness_ratio=settings.LOCAL_RED_COMPONENT_MAX_THINNESS_RATIO,
+                )
+                cv_audit = audit_primary_page_cv_coverage(
+                    question_values,
+                    [region.bbox for region in local_red_scan.regions],
+                )
+            except Exception as exc:
+                for candidate in question_values:
+                    candidate.setdefault("ocr_raw_json", {})["local_cv_audit"] = {
+                        "status": "unavailable",
+                        "coverage": "indeterminate",
+                        "scan_error_type": type(exc).__name__,
+                    }
+            if cv_audit and cv_audit["requires_manual_review"] and not question_values:
+                raise ImageReviewRequired(
+                    "local_cv_uncovered_strong_red_mark",
+                    "检测到未覆盖的红色批改痕迹，请人工确认。",
+                    diagnostic={"operation": "local_cv_audit", **cv_audit},
+                )
         log_mark_validation_diagnostics(image_id, question_values)
         question_values = discard_pending_duplicates_of_collected(question_values)
 
@@ -426,6 +493,8 @@ def process_image(self, image_id: str, filepath: str):
                     evidence_value["ocr_raw_json"]["evidence_timing"][
                         "pre_commit"
                     ] = dict(pre_commit_timing)
+
+            image_audit = getattr(result, "recognition_audit_json", None)
 
             persisted_values = []
             for values in question_values:
@@ -484,6 +553,7 @@ def process_image(self, image_id: str, filepath: str):
             image.error_code = None
             image.error_message = None
             image.recognition_correction = None
+            image.recognition_audit_json = image_audit
             if not image.subject and result.items:
                 image.subject = result.items[0].subject
             db.commit()
@@ -517,7 +587,7 @@ def process_image(self, image_id: str, filepath: str):
                 else None
             )
             or three_stage_diagnostic.get("recognition_pipeline", "legacy"),
-            local_red_scan.duration_ms,
+            getattr(local_red_scan, "duration_ms", 0.0),
             vision_llm_ms,
             ocr_ms,
             ocr_calls,
@@ -539,6 +609,9 @@ def process_image(self, image_id: str, filepath: str):
                     claimed_image.error_code = exc.code
                     claimed_image.error_message = exc.user_message
                     claimed_image.recognition_correction = None
+                    claimed_image.recognition_audit_json = exc.diagnostic.get(
+                        "recognition_audit_json"
+                    )
                     db.commit()
         logger.info(
             "image_recognition_needs_review image_id=%s error_code=%s diagnostic=%s",

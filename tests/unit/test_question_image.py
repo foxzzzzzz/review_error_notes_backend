@@ -37,6 +37,26 @@ def test_crop_uses_normalized_ltrb_coordinates(tmp_path):
     assert _rendered_size(content) == (50, 40)
 
 
+def test_crop_uses_display_bbox_not_model_bbox(tmp_path):
+    source = tmp_path / "source.jpg"
+    _save_image(source)
+
+    content = render_question_image(
+        source,
+        {
+            "bbox": [0.1, 0.1, 0.9, 0.9],
+            "display_bbox": [0.1, 0.1, 0.9, 0.9],
+            "model_bbox": [0.4, 0.4, 0.6, 0.6],
+            "bbox_format": "normalized_ltrb",
+        },
+        view="crop",
+        jpeg_quality=90,
+        max_pixels=40_000_000,
+    )
+
+    assert _rendered_size(content) == (80, 64)
+
+
 def test_mark_context_preserves_page_bbox_and_converts_local_coordinates(tmp_path):
     from app.services.question_image import (
         local_bbox_to_page,

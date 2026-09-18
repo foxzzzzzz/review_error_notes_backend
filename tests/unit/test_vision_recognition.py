@@ -482,6 +482,137 @@ def test_content_validation_keeps_valid_sibling_when_observation_or_mark_id_is_i
         )
 
 
+def test_marked_page_validation_keeps_valid_questions_when_siblings_are_invalid():
+    from app.services.vision_recognition import (
+        MarkedPageRecognitionResult,
+        _validate_response_result,
+    )
+
+    valid_item = {
+        'printed_question': '把词语补充完整',
+        'student_answer': None,
+        'model_bbox': [0.1, 0.2, 0.4, 0.5],
+        'confidence': 0.9,
+        'uncertain_fields': ['student_answer'],
+    }
+    result = _validate_response_result(
+        {
+            'wrong_questions': [
+                valid_item,
+                {**valid_item, 'model_bbox': [0.1, 0.2, 1.1, 0.5]},
+                {**valid_item, 'model_bbox': [0.4, 0.2, 0.1, 0.5]},
+                {key: value for key, value in valid_item.items() if key != 'printed_question'},
+            ],
+        },
+        MarkedPageRecognitionResult,
+        {'operation': 'marked_page_recognition'},
+    )
+
+    assert [item.model_bbox for item in result.wrong_questions] == [[0.1, 0.2, 0.4, 0.5]]
+    assert result.wrong_questions[0].student_answer is None
+    assert [item['item_index'] for item in result.invalid_item_diagnostics] == [1, 2, 3]
+
+
+def test_marked_page_validation_isolates_non_object_siblings():
+    from app.services.vision_recognition import (
+        MarkedPageRecognitionResult,
+        _validate_response_result,
+    )
+
+    valid_item = {
+        'printed_question': None,
+        'student_answer': None,
+        'model_bbox': [0.1, 0.2, 0.4, 0.5],
+        'confidence': 0.9,
+        'uncertain_fields': ['printed_question', 'student_answer'],
+    }
+    result = _validate_response_result(
+        {'wrong_questions': [valid_item, 'not-an-item', [], None]},
+        MarkedPageRecognitionResult,
+        {'operation': 'marked_page_recognition'},
+    )
+
+    assert [item.model_bbox for item in result.wrong_questions] == [[0.1, 0.2, 0.4, 0.5]]
+    assert [item['item_index'] for item in result.invalid_item_diagnostics] == [1, 2, 3]
+
+
+def test_marked_page_question_is_required_but_may_be_null():
+    from app.services.vision_recognition import MarkedPageRecognitionItem
+
+    item = MarkedPageRecognitionItem.model_validate({
+        'printed_question': None,
+        'student_answer': None,
+        'model_bbox': [0.1, 0.2, 0.4, 0.5],
+        'confidence': 0.9,
+        'uncertain_fields': ['printed_question'],
+    })
+
+    assert item.printed_question is None
+    with pytest.raises(ValidationError):
+        MarkedPageRecognitionItem.model_validate({
+            'student_answer': None,
+            'model_bbox': [0.1, 0.2, 0.4, 0.5],
+            'confidence': 0.9,
+            'uncertain_fields': ['printed_question'],
+        })
+
+
+@pytest.mark.parametrize('model_bbox', [
+    [0, 0.2, 0.4, 0.5],
+    [float('nan'), 0.2, 0.4, 0.5],
+    [0.1, 0.2, float('inf'), 0.5],
+])
+def test_marked_page_rejects_non_float_or_non_finite_model_bbox(model_bbox):
+    from app.services.vision_recognition import MarkedPageRecognitionItem
+
+    with pytest.raises(ValidationError):
+        MarkedPageRecognitionItem.model_validate({
+            'printed_question': '题面',
+            'student_answer': None,
+            'model_bbox': model_bbox,
+            'confidence': 0.9,
+            'uncertain_fields': [],
+        })
+
+
+def test_marked_page_shape_diagnostic_names_its_root_and_item_keys():
+    from app.services.vision_recognition import (
+        MarkedPageRecognitionResult,
+        _stage_response_shape_diagnostic,
+    )
+
+    diagnostic = _stage_response_shape_diagnostic(
+        {
+            'wrong_questions': [{
+                'printed_question': '题面',
+                'student_answer': None,
+                'model_bbox': [0.1, 0.2, 0.4, 0.5],
+                'confidence': 0.9,
+                'uncertain_fields': [],
+            }],
+        },
+        MarkedPageRecognitionResult,
+    )
+
+    assert diagnostic['expected_root_key'] == 'wrong_questions'
+    assert diagnostic['response_first_item_keys'] == [
+        'confidence', 'model_bbox', 'printed_question', 'student_answer',
+        'uncertain_fields',
+    ]
+
+
+@pytest.mark.parametrize('payload', [
+    {'items': []},
+    {'wrong_questions': {}},
+    {'wrong_questions': [{'printed_question': '题面', 'student_answer': None, 'model_bbox': [0.1, 0.2, 0.4, 0.5], 'confidence': 0.9, 'uncertain_fields': [], 'extra': True}]},
+])
+def test_marked_page_validation_rejects_invalid_outer_contract(payload):
+    from app.services.vision_recognition import MarkedPageRecognitionResult
+
+    with pytest.raises(ValidationError):
+        MarkedPageRecognitionResult.model_validate(payload)
+
+
 def test_content_prompt_locks_source_separation_contract_and_preserves_prior_prompts():
     from hashlib import sha256
 

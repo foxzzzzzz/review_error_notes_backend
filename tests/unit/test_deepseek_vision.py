@@ -145,3 +145,81 @@ def test_deepseek_localized_content_uses_source_aware_prompt_and_parses_observat
     assert 'teacher_correction' in prompt
     assert result.items[0].mark_id == 4
     assert result.items[0].student_handwriting.text == 'qing ting'
+
+
+def test_deepseek_marked_page_uses_one_standardized_page_and_external_prompt(tmp_path):
+    image = tmp_path / 'page.png'
+    Image.new('RGB', (3200, 1600), 'white').save(image)
+    requests = []
+    response_content = {
+        'wrong_questions': [{
+            'printed_question': '看图填空',
+            'student_answer': None,
+            'model_bbox': [0.1, 0.2, 0.4, 0.5],
+            'confidence': 0.91,
+            'uncertain_fields': ['student_answer'],
+        }],
+    }
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            'choices': [{
+                'message': {'content': json.dumps(response_content)},
+                'finish_reason': 'stop',
+            }],
+        })
+
+    result = deepseek_client(respond).recognize_marked_page(str(image))
+
+    assert len(requests) == 1
+    body = requests[0]
+    content = body['messages'][0]['content']
+    assert len(content) == 2
+    assert content[1]['image_url']['url'].startswith('data:image/jpeg;base64,')
+    prompt = content[0]['text']
+    assert 'model_bbox' in prompt and 'uncertain_fields' in prompt
+    for forbidden in ('OCR', 'CV', 'region_id', 'sample_id', '人工答案', '正确答案', '候选'):
+        assert forbidden not in prompt
+    assert result.wrong_questions[0].student_answer is None
+
+
+def test_deepseek_marked_page_preserves_exact_production_response_content_for_audit(tmp_path):
+    image = tmp_path / "page.png"
+    Image.new("RGB", (160, 240), "white").save(image)
+    raw_content = "```json\n" + json.dumps({"wrong_questions": []}) + "\n```"
+
+    result = deepseek_client(
+        lambda _request: httpx.Response(200, json={
+            "choices": [{"message": {"content": raw_content}, "finish_reason": "stop"}],
+        })
+    ).recognize_marked_page(str(image))
+
+    assert result.raw_response_content == raw_content
+
+
+def test_deepseek_marked_page_format_error_makes_exactly_one_call(tmp_path):
+    image = tmp_path / 'page.png'
+    Image.new('RGB', (160, 240), 'white').save(image)
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        content = (
+            '{"wrong_questions":'
+            if len(requests) == 1
+            else json.dumps({'wrong_questions': []})
+        )
+        return httpx.Response(200, json={
+            'choices': [{
+                'message': {'content': content},
+                'finish_reason': 'stop',
+            }],
+        })
+
+    client = deepseek_client(respond)
+    client.max_retries = 1
+    with pytest.raises(VisionRecognitionError, match="格式"):
+        client.recognize_marked_page(str(image))
+
+    assert len(requests) == 1
