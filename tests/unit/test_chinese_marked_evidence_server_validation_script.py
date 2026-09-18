@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -38,9 +39,30 @@ def as_msys_path(path: Path) -> str:
 class ServerValidationScriptTest(unittest.TestCase):
     @staticmethod
     def _write_executable(path: Path, content: str):
+        content = content.replace("#!/usr/bin/env bash", "#!/usr/bin/bash", 1)
         with path.open("w", encoding="utf-8", newline="\n") as stream:
             stream.write(content)
         path.chmod(0o755)
+
+    def _write_hermetic_path_support(self, fake_bin: Path):
+        self._write_executable(
+            fake_bin / "env",
+            "#!/usr/bin/bash\nexec \"$@\"\n",
+        )
+        for command_name in (
+            "awk", "basename", "cat", "cp", "date", "dirname", "grep", "gzip", "mkdir",
+            "realpath", "sha256sum", "sleep", "tar", "tee",
+        ):
+            command_path = subprocess.run(
+                ["bash", "-lc", f"command -v {command_name}"],
+                capture_output=True,
+                check=True,
+                text=True,
+            ).stdout.strip()
+            self._write_executable(
+                fake_bin / command_name,
+                f'#!/usr/bin/bash\nexec "{command_path}" "$@"\n',
+            )
 
     def test_as_msys_path_preserves_linux_absolute_path(self):
         with patch.object(
@@ -234,11 +256,75 @@ class ServerValidationScriptTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("NEW_IMAGE is not a file", result.stderr)
 
+    def _run_host_python_command_probe(self, fake_python_commands):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            self._write_hermetic_path_support(fake_bin)
+            for name in ("old.jpg", "new.jpg", "protected.jpg"):
+                (temp_path / name).write_bytes(b"fixture")
+            for command_name in (
+                "curl", "jq", "docker", "tar", "git", "grep", "tee", "awk", "sha256sum"
+            ):
+                self._write_executable(
+                    fake_bin / command_name,
+                    "#!/usr/bin/env bash\nexit 0\n",
+                )
+            self._write_executable(
+                fake_bin / "sudo",
+                "#!/usr/bin/env bash\nprintf 'host-python-selection-reached\\n' >&2\nexit 31\n",
+            )
+            for command_name in fake_python_commands:
+                self._write_executable(
+                    fake_bin / command_name,
+                    "#!/usr/bin/env bash\nexit 32\n",
+                )
+            python_path_assertion = (
+                "command -v python >/dev/null"
+                if "python" in fake_python_commands
+                else "! command -v python >/dev/null"
+            )
+            env = os.environ.copy()
+            env["ACCESS_TOKEN"] = "test-secret-token"
+            return subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'export PATH="$1"; shift; {python_path_assertion}; exec "$BASH" "$@"',
+                    "validation-test",
+                    as_msys_path(fake_bin),
+                    as_msys_path(SCRIPT),
+                    "--old-image", (temp_path / "old.jpg").as_posix(),
+                    "--new-image", (temp_path / "new.jpg").as_posix(),
+                    "--protected-image", (temp_path / "protected.jpg").as_posix(),
+                    "--shadow-db", "wrong_book_evidence_test",
+                ],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+    def test_host_python_selection_falls_back_to_python_when_python3_is_unavailable(self):
+        result = self._run_host_python_command_probe(("python",))
+
+        self.assertEqual(result.returncode, 31, result.stderr)
+        self.assertIn("host-python-selection-reached", result.stderr)
+
+    def test_host_python_selection_reports_clear_error_when_neither_command_is_available(self):
+        result = self._run_host_python_command_probe(())
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("required command not found: python3 or python", result.stderr)
+
     def test_automatic_run_rejects_shadow_worker_on_production_redis(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
+            self._write_hermetic_path_support(fake_bin)
             images = []
             for name in ("old.jpg", "new.jpg", "protected.jpg"):
                 image = temp_path / name
@@ -304,11 +390,12 @@ exit 9
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("shares its Redis broker with the production worker", result.stderr)
 
-    def test_automatic_run_collects_and_packs_results_without_token(self):
+    def _run_automatic_packaging_with_host_python(self, host_python_command):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
+            self._write_hermetic_path_support(fake_bin)
             images = []
             for name in ("old.jpg", "new.jpg", "protected.jpg"):
                 image = temp_path / name
@@ -442,10 +529,18 @@ exit 9
                 fake_bin / "git",
                 "#!/usr/bin/env bash\nprintf '%s\\n' 313051fef267528891a0a5666f32d612107395b4\n",
             )
+            host_python_log = temp_path / "host-python.log"
+            self._write_executable(
+                fake_bin / host_python_command,
+                """#!/usr/bin/env bash
+printf '%q ' "$@" >> "${HOST_PYTHON_LOG:?}"
+printf '\\n' >> "${HOST_PYTHON_LOG:?}"
+exec "${REAL_PYTHON3:?}" "$@"
+""",
+            )
             self._write_executable(
                 fake_bin / "jq",
-                r'''#!/usr/bin/env python
-import json
+                f"#!/usr/bin/env {host_python_command}\n" + r'''import json
 import sys
 
 args = sys.argv[1:]
@@ -528,10 +623,17 @@ else:
             output_dir = temp_path / "results"
             env = os.environ.copy()
             env["ACCESS_TOKEN"] = "archive-secret-token"
+            env["HOST_PYTHON_LOG"] = as_msys_path(host_python_log)
+            env["REAL_PYTHON3"] = as_msys_path(Path(sys.executable))
+            python_path_assertion = (
+                "! command -v python >/dev/null"
+                if host_python_command == "python3"
+                else "command -v python >/dev/null"
+            )
             command = [
                 "bash",
                 "-c",
-                'export PATH="$1:$PATH"; shift; exec bash "$@"',
+                f'export PATH="$1"; shift; {python_path_assertion}; exec "$BASH" "$@"',
                 "validation-test",
                 as_msys_path(fake_bin),
                 as_msys_path(SCRIPT),
@@ -561,6 +663,9 @@ else:
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
+            host_python_invocations = host_python_log.read_text(encoding="utf-8")
+            self.assertIn("replay-hashes.tsv", host_python_invocations)
+            self.assertIn("effective-config.tsv", host_python_invocations)
             archives = list(output_dir.glob("*.tar.gz"))
             self.assertEqual(len(archives), 1)
             with tarfile.open(archives[0], "r:gz") as archive:
@@ -679,6 +784,12 @@ else:
                 )
                 self.assertNotEqual(preflight.returncode, 0, required_value)
                 self.assertFalse(curl_log.exists(), required_value)
+
+    def test_automatic_run_collects_and_packs_results_with_python3_only(self):
+        self._run_automatic_packaging_with_host_python("python3")
+
+    def test_automatic_run_collects_and_packs_results_with_python_only(self):
+        self._run_automatic_packaging_with_host_python("python")
 
 
 if __name__ == "__main__":

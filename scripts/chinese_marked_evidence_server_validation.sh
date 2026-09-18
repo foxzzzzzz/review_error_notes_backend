@@ -182,9 +182,16 @@ if [[ "$CHECK_INPUTS_ONLY" == true ]]; then
   exit 0
 fi
 
-for command_name in curl jq sudo docker tar git grep tee awk sha256sum python; do
+for command_name in curl jq sudo docker tar git grep tee awk sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || die "required command not found: $command_name"
 done
+if command -v python3 >/dev/null 2>&1; then
+  HOST_PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+  HOST_PYTHON=python
+else
+  die 'required command not found: python3 or python'
+fi
 sudo docker compose version >/dev/null
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(realpath "$OUTPUT_DIR")"
@@ -230,7 +237,7 @@ write_replay_hashes() {
     sha256="$(sha256sum "$RESULT_DIR/$archived_path" | awk '{print $1}')"
     printf '%s\t%s\n' "$archived_path" "$sha256" >> "$RESULT_DIR/replay-hashes.tsv"
   done
-  python - "$RESULT_DIR/replay-hashes.tsv" "$RESULT_DIR/replay-hashes.json" \
+  "$HOST_PYTHON" - "$RESULT_DIR/replay-hashes.tsv" "$RESULT_DIR/replay-hashes.json" \
     "${CHINESE_QUESTION_DISPLAY_BBOX_SCALE:-2.0}" <<'PY'
 import json
 import sys
@@ -277,7 +284,7 @@ write_effective_config() {
       "$(container_env_value evidence-shadow-worker "$variable_name")" \
       >> "$RESULT_DIR/effective-config.tsv"
   done
-  python - "$RESULT_DIR/effective-config.tsv" "$RESULT_DIR/effective-config.json" <<'PY'
+  "$HOST_PYTHON" - "$RESULT_DIR/effective-config.tsv" "$RESULT_DIR/effective-config.json" <<'PY'
 import json
 import sys
 
