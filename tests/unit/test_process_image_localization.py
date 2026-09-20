@@ -352,8 +352,6 @@ def test_deepseek_page_primary_uses_one_page_call_without_legacy_stages(tmp_path
                         printed_question="看拼音写词语",
                         student_answer="合做",
                         model_bbox=[0.1, 0.2, 0.4, 0.5],
-                        teacher_mark_type="red_cross",
-                        teacher_mark_bbox=[0.3, 0.2, 0.4, 0.3],
                         confidence=0.9,
                     )
                 ]
@@ -383,10 +381,6 @@ def test_deepseek_page_primary_uses_one_page_call_without_legacy_stages(tmp_path
     assert values[0]["crop_region"]["model_bbox"] == [0.1, 0.2, 0.4, 0.5]
     assert values[0]["ocr_raw_json"]["evidence_bundle"]["identity"]["question_geometry"]["bbox"] == [0.1, 0.2, 0.4, 0.5]
     assert values[0]["ocr_raw_json"]["display_bbox_scale"] == 2.0
-    assert values[0]["ocr_raw_json"]["marked_page_item"]["teacher_mark_type"] == "red_cross"
-    assert values[0]["ocr_raw_json"]["marked_page_item"]["teacher_mark_bbox"] == [
-        0.3, 0.2, 0.4, 0.3,
-    ]
     assert values[0]["ocr_raw_json"]["page_review_reasons"] == [
         "primary_page_recognition_pending_review"
     ]
@@ -403,8 +397,6 @@ def test_deepseek_page_primary_does_not_duplicate_raw_content_in_candidates(tmp_
                 wrong_questions=[MarkedPageRecognitionItem(
                     printed_question="题干", student_answer=None,
                     model_bbox=[0.2, 0.2, 0.4, 0.4], confidence=0.9,
-                    teacher_mark_type="red_circle",
-                    teacher_mark_bbox=[0.3, 0.2, 0.4, 0.3],
                 )],
                 raw_response_content=raw_content,
             )
@@ -456,8 +448,6 @@ def test_deepseek_page_primary_keeps_invalid_items_as_review_reason(tmp_path):
                 wrong_questions=[MarkedPageRecognitionItem(
                     printed_question="看图填空", student_answer=None,
                     model_bbox=[0.2, 0.3, 0.5, 0.6], confidence=0.8,
-                    teacher_mark_type="red_other",
-                    teacher_mark_bbox=[0.3, 0.3, 0.4, 0.4],
                     uncertain_fields=["student_answer"],
                 )],
                 invalid_item_diagnostics=[{"item_index": 1, "reason": "bbox"}],
@@ -474,59 +464,6 @@ def test_deepseek_page_primary_keeps_invalid_items_as_review_reason(tmp_path):
         "primary_page_recognition_pending_review",
         "invalid_marked_page_items",
         "uncertain_marked_page_items",
-    ]
-
-
-def test_deepseek_page_primary_old_schema_requires_review_without_retry(tmp_path):
-    from app.services.vision_recognition import (
-        ImageReviewRequired,
-        MarkedPageRecognitionResult,
-        _validate_response_result,
-    )
-
-    class OldSchemaClient:
-        def __init__(self):
-            self.page_calls = 0
-
-        def recognize_marked_page(self, _image_path):
-            self.page_calls += 1
-            return _validate_response_result(
-                {
-                    "wrong_questions": [
-                        {
-                            "printed_question": "题面",
-                            "student_answer": "学生作答",
-                            "model_bbox": [0.2, 0.3, 0.5, 0.6],
-                            "confidence": 0.9,
-                            "uncertain_fields": [],
-                        }
-                    ]
-                },
-                MarkedPageRecognitionResult,
-                {"operation": "marked_page_recognition"},
-            )
-
-    client = OldSchemaClient()
-    with pytest.raises(ImageReviewRequired) as exc_info:
-        _run_batch(
-            tmp_path,
-            client=client,
-            local_red_scan=_detected_red_scan(),
-            evidence_mode=True,
-            image_id="primary-old-schema",
-            deepseek_page_primary_enabled=True,
-        )
-
-    assert client.page_calls == 1
-    assert exc_info.value.code == "deepseek_page_primary_invalid_items"
-    assert exc_info.value.diagnostic["invalid_item_diagnostics"] == [
-        {
-            "item_index": 0,
-            "validation_errors": [
-                {"field": "teacher_mark_type", "type": "missing"},
-                {"field": "teacher_mark_bbox", "type": "missing"},
-            ],
-        }
     ]
 
 
@@ -574,8 +511,6 @@ def test_deepseek_page_primary_ocr_is_advisory_and_runs_with_no_cv_marks(
                         printed_question="题干",
                         student_answer="学生作答",
                         model_bbox=[0.2, 0.2, 0.4, 0.4],
-                        teacher_mark_type="red_cross",
-                        teacher_mark_bbox=[0.3, 0.2, 0.4, 0.3],
                         confidence=0.9,
                     )
                 ]

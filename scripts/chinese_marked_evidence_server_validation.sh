@@ -18,6 +18,7 @@ ACCESS_TOKEN="${ACCESS_TOKEN:-}"
 OLD_TRUTH_COUNT="${OLD_TRUTH_COUNT:-}"
 NEW_TRUTH_COUNT="${NEW_TRUTH_COUNT:-}"
 PROTECTED_TRUTH_COUNT="${PROTECTED_TRUTH_COUNT:-}"
+EXTRA_CASES_JSON="${EXTRA_CASES_JSON:-}"
 CHECK_INPUTS_ONLY=false
 HUMAN_REVIEW_MODE=ask
 KEEP_CONTAINERS=false
@@ -48,6 +49,7 @@ Options:
   --old-truth-count N       Human-audited old-page wrong-question count
   --new-truth-count N       Human-audited new-page wrong-question count
   --protected-truth-count N Human-audited protected-page wrong-question count
+  --extra-cases-json PATH   JSON array containing exactly six extra cloud-image cases
   --human-review            Require one interactive human confirmation
   --skip-human-review       Package automatic-stage evidence only
   --keep-containers         Do not remove shadow API/worker after success
@@ -86,6 +88,7 @@ while [[ $# -gt 0 ]]; do
     --old-truth-count) need_value "$@"; OLD_TRUTH_COUNT="$2"; shift 2 ;;
     --new-truth-count) need_value "$@"; NEW_TRUTH_COUNT="$2"; shift 2 ;;
     --protected-truth-count) need_value "$@"; PROTECTED_TRUTH_COUNT="$2"; shift 2 ;;
+    --extra-cases-json) need_value "$@"; EXTRA_CASES_JSON="$2"; shift 2 ;;
     --human-review) HUMAN_REVIEW_MODE=require; shift ;;
     --skip-human-review) HUMAN_REVIEW_MODE=skip; shift ;;
     --keep-containers) KEEP_CONTAINERS=true; shift ;;
@@ -107,6 +110,14 @@ prompt_value() {
 prompt_value OLD_IMAGE '旧样本整页原图绝对路径'
 prompt_value NEW_IMAGE '新样本整页原图绝对路径'
 prompt_value PROTECTED_IMAGE '保护样本整页原图绝对路径'
+
+if command -v python3 >/dev/null 2>&1; then
+  HOST_PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+  HOST_PYTHON=python
+else
+  die 'required command not found: python3 or python'
+fi
 
 if [[ -z "$ACCESS_TOKEN" ]]; then
   [[ -t 0 ]] || die 'ACCESS_TOKEN is required in non-interactive mode'
@@ -131,6 +142,58 @@ NEW_IMAGE="$(realpath "$NEW_IMAGE")"
 PROTECTED_IMAGE="$(realpath "$PROTECTED_IMAGE")"
 [[ "$OLD_IMAGE" != "$NEW_IMAGE" && "$OLD_IMAGE" != "$PROTECTED_IMAGE" && "$NEW_IMAGE" != "$PROTECTED_IMAGE" ]] \
   || die 'OLD_IMAGE, NEW_IMAGE, and PROTECTED_IMAGE must be three different files'
+
+PAGE_LABELS=( "$(basename "${OLD_IMAGE%.*}")" "$(basename "${NEW_IMAGE%.*}")" "$(basename "${PROTECTED_IMAGE%.*}")" )
+PAGE_IMAGES=( "$OLD_IMAGE" "$NEW_IMAGE" "$PROTECTED_IMAGE" )
+PAGE_TRUTHS=( "$OLD_TRUTH_COUNT" "$NEW_TRUTH_COUNT" "$PROTECTED_TRUTH_COUNT" )
+for label in "${PAGE_LABELS[@]}"; do
+  [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'base page labels must be unique and safe'
+done
+[[ "${PAGE_LABELS[0]}" != "${PAGE_LABELS[1]}" && "${PAGE_LABELS[0]}" != "${PAGE_LABELS[2]}" && "${PAGE_LABELS[1]}" != "${PAGE_LABELS[2]}" ]] \
+  || die 'base page labels must be unique and safe'
+if [[ -n "$EXTRA_CASES_JSON" ]]; then
+  [[ -f "$EXTRA_CASES_JSON" ]] || die "EXTRA_CASES_JSON is not a file: $EXTRA_CASES_JSON"
+  EXTRA_CASES_JSON="$(realpath "$EXTRA_CASES_JSON")"
+  EXTRA_CASES_PYTHON="$HOST_PYTHON"
+  "$EXTRA_CASES_PYTHON" -c 'import sys' >/dev/null 2>&1 || EXTRA_CASES_PYTHON=python
+  EXTRA_CASES_OUTPUT="$("$EXTRA_CASES_PYTHON" - "$EXTRA_CASES_JSON" "${PAGE_LABELS[@]}" <<'PY'
+import json, os, re, sys
+manifest_path, *existing_labels = sys.argv[1:]
+try:
+    with open(manifest_path, encoding="utf-8") as stream:
+        cases = json.load(stream)
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"EXTRA_CASES_JSON must be valid JSON: {error}")
+if not isinstance(cases, list) or len(cases) != 6:
+    raise SystemExit("EXTRA_CASES_JSON must contain exactly 6 cases")
+seen = set(existing_labels)
+for index, case in enumerate(cases):
+    if not isinstance(case, dict) or set(case) != {"label", "image_path", "truth_count"}:
+        raise SystemExit(f"EXTRA_CASES_JSON case {index} must contain only label, image_path, truth_count")
+    label, image_path, truth_count = case["label"], case["image_path"], case["truth_count"]
+    if not isinstance(label, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", label) or label in seen:
+        raise SystemExit(f"EXTRA_CASES_JSON case {index} label must be unique and safe")
+    if not isinstance(image_path, str) or not os.path.isabs(image_path) or not os.path.isfile(image_path):
+        raise SystemExit(f"EXTRA_CASES_JSON case {index} image_path must be an existing absolute file")
+    if os.path.splitext(image_path)[1].lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise SystemExit(f"EXTRA_CASES_JSON case {index} image_path must be a JPEG, PNG, or WebP image")
+    if truth_count is not None and (not isinstance(truth_count, int) or isinstance(truth_count, bool) or truth_count < 0):
+        raise SystemExit(f"EXTRA_CASES_JSON case {index} truth_count must be a non-negative integer or null")
+    seen.add(label)
+    print(label, os.path.realpath(image_path), "" if truth_count is None else truth_count, sep="\t")
+PY
+  )" || die 'EXTRA_CASES_JSON validation failed'
+  while IFS=$'\t' read -r label image_path truth_count; do
+    label="${label%$'\r'}"
+    image_path="${image_path%$'\r'}"
+    truth_count="${truth_count%$'\r'}"
+    [[ -n "$label" ]] || continue
+    PAGE_LABELS+=( "$label" )
+    PAGE_IMAGES+=( "$image_path" )
+    PAGE_TRUTHS+=( "$truth_count" )
+  done <<< "$EXTRA_CASES_OUTPUT"
+fi
+[[ ${#PAGE_LABELS[@]} -eq 3 || ${#PAGE_LABELS[@]} -eq 9 ]] || die 'internal page manifest count must be 3 or 9'
 
 discover_shadow_db() {
   local shadow_databases=()
@@ -177,6 +240,7 @@ printf '  BASE_URL=%s\n  SHADOW_DB=%s\n  GRADE=%s\n  SEMESTER=%s\n' \
   "$BASE_URL" "$SHADOW_DB" "$GRADE" "$SEMESTER"
 printf '  OLD_TRUTH_COUNT=%s\n  NEW_TRUTH_COUNT=%s\n  PROTECTED_TRUTH_COUNT=%s\n' \
   "${OLD_TRUTH_COUNT:-null}" "${NEW_TRUTH_COUNT:-null}" "${PROTECTED_TRUTH_COUNT:-null}"
+printf '  EXTRA_CASES=%s\n  TOTAL_PAGES=%s\n' "$(( ${#PAGE_LABELS[@]} - 3 ))" "${#PAGE_LABELS[@]}"
 
 if [[ "$CHECK_INPUTS_ONLY" == true ]]; then
   exit 0
@@ -185,13 +249,6 @@ fi
 for command_name in curl jq sudo docker tar git grep tee awk sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || die "required command not found: $command_name"
 done
-if command -v python3 >/dev/null 2>&1; then
-  HOST_PYTHON=python3
-elif command -v python >/dev/null 2>&1; then
-  HOST_PYTHON=python
-else
-  die 'required command not found: python3 or python'
-fi
 sudo docker compose version >/dev/null
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(realpath "$OUTPUT_DIR")"
@@ -316,13 +373,16 @@ write_return_package_contract() {
     "stage-audit/<page>/audit.json",
     "stage-audit/<page>/primary-raw-response.md",
     "image-audits.json",
+    "input-samples-manifest.json",
     "raw-direct/<page>/response.json",
     "raw-direct-bbox/<page>/response.json",
     "prepared-direct/<page>/response.json",
     "effective-config.json",
     "replay-hashes.json",
     "replay-sources/<path>",
-    "legacy-mode-comparison.json",
+    "legacy-mode-comparison.json"
+  ],
+  "legacy_artifacts_when_enabled": [
     "legacy-mode-review-images.json",
     "legacy-mode/stage-audit/<page>/audit.json",
     "legacy-mode/stage-audit/<page>/candidate-ledger.json"
@@ -351,13 +411,15 @@ write_return_package_contract_best_effort() {
 
 verify_return_package_contract() {
   local label group path sha256 expected
-  for label in "$(basename "${OLD_IMAGE%.*}")" "$(basename "${NEW_IMAGE%.*}")" "$(basename "${PROTECTED_IMAGE%.*}")"; do
+  for label in "${PAGE_LABELS[@]}"; do
     for path in "stage-audit/$label/audit.json" "stage-audit/$label/candidate-ledger.json" "stage-audit/$label/primary-raw-response.md"; do
       [[ -f "$RESULT_DIR/$path" ]] || die "required return artifact missing: $path"
     done
-    for path in "legacy-mode/stage-audit/$label/audit.json" "legacy-mode/stage-audit/$label/candidate-ledger.json"; do
-      [[ -f "$RESULT_DIR/$path" ]] || die "required return artifact missing: $path"
-    done
+    if [[ -n "$LEGACY_BASE_URL" ]]; then
+      for path in "legacy-mode/stage-audit/$label/audit.json" "legacy-mode/stage-audit/$label/candidate-ledger.json"; do
+        [[ -f "$RESULT_DIR/$path" ]] || die "required return artifact missing: $path"
+      done
+    fi
     for group in raw-direct raw-direct-bbox prepared-direct; do [[ -f "$RESULT_DIR/$group/$label/response.json" ]] || die "required return artifact missing: $group/$label/response.json"; done
   done
   sha256sum -c "$RESULT_DIR/effective-config.sha256" >/dev/null || die 'effective config hash mismatch'
@@ -365,8 +427,13 @@ verify_return_package_contract() {
     [[ -f "$RESULT_DIR/$path" ]] || die "required replay source missing: $path"
     [[ "$(sha256sum "$RESULT_DIR/$path" | awk '{print $1}')" == "$expected" ]] || die "replay hash mismatch: $path"
   done < "$RESULT_DIR/replay-hashes.tsv"
-  [[ -f "$RESULT_DIR/legacy-mode-review-images.json" ]] || die 'required return artifact missing: legacy-mode-review-images.json'
-  jq -e '.status == "completed"' "$RESULT_DIR/legacy-mode-comparison.json" >/dev/null || die 'legacy comparison did not complete'
+  [[ -f "$RESULT_DIR/input-samples-manifest.json" ]] || die 'required return artifact missing: input-samples-manifest.json'
+  if [[ -n "$LEGACY_BASE_URL" ]]; then
+    [[ -f "$RESULT_DIR/legacy-mode-review-images.json" ]] || die 'required return artifact missing: legacy-mode-review-images.json'
+    jq -e '.status == "completed"' "$RESULT_DIR/legacy-mode-comparison.json" >/dev/null || die 'legacy comparison did not complete'
+  else
+    jq -e '.status == "not_run"' "$RESULT_DIR/legacy-mode-comparison.json" >/dev/null || die 'legacy comparison should be not_run'
+  fi
 }
 
 package_results() {
@@ -468,24 +535,22 @@ subjects_include_chinese() {
 verify_primary_shadow_preflight
 
 run_deepseek_comparison() {
-  local name="$1" prompt="$2" input_mode="$3"
+  local name="$1" prompt="$2" input_mode="$3" index
+  local comparison_mounts=() comparison_pages=()
+  for index in "${!PAGE_LABELS[@]}"; do
+    comparison_mounts+=( -v "${PAGE_IMAGES[$index]}:/comparison-inputs/${PAGE_LABELS[$index]}:ro" )
+    comparison_pages+=( --page "${PAGE_LABELS[$index]}" "/comparison-inputs/${PAGE_LABELS[$index]}" "$(basename "${PAGE_IMAGES[$index]}")" "${PAGE_TRUTHS[$index]:-null}" )
+  done
   printf 'Running DeepSeek comparison: %s\n' "$name"
   if ! sudo docker compose run --rm --no-deps -T \
     -v "$RESULT_DIR:/comparison" \
-    -v "$OLD_IMAGE:/comparison-inputs/old-image:ro" \
-    -v "$NEW_IMAGE:/comparison-inputs/new-image:ro" \
-    -v "$PROTECTED_IMAGE:/comparison-inputs/protected-image:ro" \
+    "${comparison_mounts[@]}" \
     --entrypoint python worker -X utf8 -B \
     -m scripts.deepseek_raw_page_comparison \
     --prompt "$prompt" \
     --output-dir "/comparison/$name" \
     --input-mode "$input_mode" \
-    --page "$(basename "${OLD_IMAGE%.*}")" /comparison-inputs/old-image \
-      "$(basename "$OLD_IMAGE")" "${OLD_TRUTH_COUNT:-null}" \
-    --page "$(basename "${NEW_IMAGE%.*}")" /comparison-inputs/new-image \
-      "$(basename "$NEW_IMAGE")" "${NEW_TRUTH_COUNT:-null}" \
-    --page "$(basename "${PROTECTED_IMAGE%.*}")" /comparison-inputs/protected-image \
-      "$(basename "$PROTECTED_IMAGE")" "${PROTECTED_TRUTH_COUNT:-null}"; then
+    "${comparison_pages[@]}"; then
     RAW_COMPARISON_FAILED=true
     VALIDATION_FAILED=true
     printf 'DeepSeek comparison %s failed; processed pipeline will continue.\n' "$name" >&2
@@ -501,64 +566,83 @@ run_deepseek_comparison prepared-direct \
 
 auth_header=( -H "Authorization: Bearer $ACCESS_TOKEN" )
 
+verify_image_id_set() {
+  local response_path="$1" response_name="$2"
+  shift 2
+  "$HOST_PYTHON" - "$response_path" "$response_name" "$@" <<'PY'
+import json
+import sys
+
+path, name, *expected = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    payload = json.load(stream)
+actual = [item.get("image_id") for item in payload] if isinstance(payload, list) else []
+if len(actual) != len(expected) or set(actual) != set(expected) or len(set(actual)) != len(actual):
+    raise SystemExit(f"{name} image_id set does not match uploaded pages")
+PY
+}
+
 run_legacy_mode_comparison() {
   if [[ -z "$LEGACY_BASE_URL" ]]; then
     printf '{"status":"not_run","reason":"--legacy-base-url was not supplied"}\n' \
       > "$RESULT_DIR/legacy-mode-comparison.json"
     return 0
   fi
-  local primary_base_url="$BASE_URL" legacy_old_id legacy_new_id legacy_protected_id
+  local primary_base_url="$BASE_URL" page_index page_label
+  local legacy_status="$RESULT_DIR/legacy-mode-status-latest.json" legacy_deadline=$((SECONDS + TIMEOUT_SECONDS))
+  local legacy_status_args=() legacy_audit_mounts=()
+  declare -A LEGACY_PAGE_IDS
   [[ "$LEGACY_BASE_URL" != "$primary_base_url" ]] || die 'legacy URL must differ from primary URL'
   [[ "$(container_env_value "$LEGACY_API_CONTAINER" CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED)" == false ]] \
     || die 'legacy API must set CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED=false'
   [[ "$(container_env_value "$LEGACY_WORKER_CONTAINER" CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED)" == false ]] \
     || die 'legacy worker must set CHINESE_DEEPSEEK_PAGE_PRIMARY_ENABLED=false'
   BASE_URL="$LEGACY_BASE_URL"
-  legacy_old_id="$(upload_case legacy-old "$OLD_IMAGE")"
-  legacy_new_id="$(upload_case legacy-new "$NEW_IMAGE")"
-  legacy_protected_id="$(upload_case legacy-protected "$PROTECTED_IMAGE")"
-  local legacy_status="$RESULT_DIR/legacy-mode-status-latest.json" legacy_deadline=$((SECONDS + TIMEOUT_SECONDS))
+  for page_index in "${!PAGE_LABELS[@]}"; do
+    page_label="${PAGE_LABELS[$page_index]}"
+    LEGACY_PAGE_IDS["$page_label"]="$(upload_case "legacy-$page_label" "${PAGE_IMAGES[$page_index]}")"
+    legacy_audit_mounts+=( -v "${PAGE_IMAGES[$page_index]}:/audit-inputs/$page_label:ro" )
+  done
   while true; do
-    curl --fail --silent --show-error "${auth_header[@]}" --get \
-      --data-urlencode "image_ids=$legacy_old_id" \
-      --data-urlencode "image_ids=$legacy_new_id" \
-      --data-urlencode "image_ids=$legacy_protected_id" \
-      "$BASE_URL/api/upload/images/status" > "$legacy_status"
-    if jq -e 'length == 3 and all(.[]; .status != "pending" and .status != "segmented")' \
+    legacy_status_args=( --fail --silent --show-error "${auth_header[@]}" --get )
+    for page_label in "${PAGE_LABELS[@]}"; do legacy_status_args+=( --data-urlencode "image_ids=${LEGACY_PAGE_IDS[$page_label]}" ); done
+    curl "${legacy_status_args[@]}" "$BASE_URL/api/upload/images/status" > "$legacy_status"
+    if jq -e --argjson expected_count "${#PAGE_LABELS[@]}" 'length == $expected_count and all(.[]; .status != "pending" and .status != "segmented")' \
         "$legacy_status" >/dev/null; then break; fi
     (( SECONDS < legacy_deadline )) || die "legacy image processing did not finish within $TIMEOUT_SECONDS seconds"
     sleep "$POLL_SECONDS"
   done
+  verify_image_id_set "$legacy_status" 'legacy status response' "${LEGACY_PAGE_IDS[@]}" \
+    || die 'legacy status response image_id set does not match uploaded pages'
   jq -e 'any(.[]; .status == "failed")' "$legacy_status" >/dev/null && \
     die 'legacy image processing failed'
   curl --fail --silent --show-error "${auth_header[@]}" \
     "$BASE_URL/api/questions/review/images" \
-    | jq --arg old "$legacy_old_id" --arg new "$legacy_new_id" --arg protected "$legacy_protected_id" \
-        '[.[] | select(.image_id == $old or .image_id == $new or .image_id == $protected)]' \
+    | jq '[.[] | select(.image_id as $id | $ARGS.positional | index($id))]' --args "${LEGACY_PAGE_IDS[@]}" \
     > "$RESULT_DIR/legacy-mode-review-images.json"
-  jq -n \
-    --arg old_label "$(basename "${OLD_IMAGE%.*}")" \
-    --arg new_label "$(basename "${NEW_IMAGE%.*}")" \
-    --arg protected_label "$(basename "${PROTECTED_IMAGE%.*}")" \
-    --arg old_id "$legacy_old_id" --arg new_id "$legacy_new_id" --arg protected_id "$legacy_protected_id" \
-    '[
-      {label:$old_label,image_id:$old_id,image_path:"/audit-inputs/old-image"},
-      {label:$new_label,image_id:$new_id,image_path:"/audit-inputs/new-image"},
-      {label:$protected_label,image_id:$protected_id,image_path:"/audit-inputs/protected-image"}
-    ]' > "$RESULT_DIR/legacy-mode-stage-audit-pages.json"
+  verify_image_id_set "$RESULT_DIR/legacy-mode-review-images.json" 'legacy review response' "${LEGACY_PAGE_IDS[@]}" \
+    || die 'legacy review response image_id set does not match uploaded pages'
+  LEGACY_MANIFEST_TSV="$RESULT_DIR/legacy-mode-pages.tsv"
+  : > "$LEGACY_MANIFEST_TSV"
+  for page_index in "${!PAGE_LABELS[@]}"; do printf '%s\t%s\n' "${PAGE_LABELS[$page_index]}" "${LEGACY_PAGE_IDS[${PAGE_LABELS[$page_index]}]}" >> "$LEGACY_MANIFEST_TSV"; done
+  "$HOST_PYTHON" - "$LEGACY_MANIFEST_TSV" "$RESULT_DIR/legacy-mode-stage-audit-pages.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    pages = [{"label": label, "image_id": image_id, "image_path": f"/audit-inputs/{label}"} for label, image_id in (line.rstrip("\n").split("\t") for line in stream)]
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    json.dump(pages, stream, ensure_ascii=False, separators=(",", ":")); stream.write("\n")
+PY
   sudo docker compose run --rm --no-deps -T \
     -v "$RESULT_DIR:/audit" \
-    -v "$OLD_IMAGE:/audit-inputs/old-image:ro" \
-    -v "$NEW_IMAGE:/audit-inputs/new-image:ro" \
-    -v "$PROTECTED_IMAGE:/audit-inputs/protected-image:ro" \
+    "${legacy_audit_mounts[@]}" \
     --entrypoint python worker -X utf8 -B \
     /app/scripts/chinese_marked_evidence_stage_audit.py \
     --review-images /audit/legacy-mode-review-images.json \
     --pages-json /audit/legacy-mode-stage-audit-pages.json \
     --output-dir /audit/legacy-mode/stage-audit
   jq -n --arg primary_url "$primary_base_url" --arg legacy_url "$LEGACY_BASE_URL" \
-    --arg old "$legacy_old_id" --arg new "$legacy_new_id" --arg protected "$legacy_protected_id" \
-    '{status:"completed",primary_mode:{base_url:$primary_url,enabled:true},legacy_mode:{base_url:$legacy_url,enabled:false,image_ids:{old:$old,new:$new,protected:$protected}},review_artifact:"legacy-mode-review-images.json",audit_artifact:"legacy-mode/stage-audit"}' \
+    '{status:"completed",primary_mode:{base_url:$primary_url,enabled:true},legacy_mode:{base_url:$legacy_url,enabled:false,image_ids:$ARGS.positional},review_artifact:"legacy-mode-review-images.json",audit_artifact:"legacy-mode/stage-audit"}' \
+    --args "${LEGACY_PAGE_IDS[@]}" \
     > "$RESULT_DIR/legacy-mode-comparison.json"
   BASE_URL="$primary_base_url"
 }
@@ -575,36 +659,36 @@ upload_case() {
     -F "semester=$SEMESTER" \
     "$BASE_URL/api/upload/image" | tee "$response" >/dev/null
   image_id="$(jq -er '.image_id | strings | select(length > 0)' "$response")"
-  [[ "$image_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "$label upload returned invalid image_id: $image_id"
+  [[ "$image_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "$label upload returned invalid image_id: $image_id"
   printf '%s' "$image_id"
 }
 
-OLD_IMAGE_ID="$(upload_case old "$OLD_IMAGE")"
-NEW_IMAGE_ID="$(upload_case new "$NEW_IMAGE")"
-PROTECTED_IMAGE_ID="$(upload_case protected "$PROTECTED_IMAGE")"
-printf 'Uploaded image IDs:\n  old=%s\n  new=%s\n  protected=%s\n' \
-  "$OLD_IMAGE_ID" "$NEW_IMAGE_ID" "$PROTECTED_IMAGE_ID"
+declare -A PAGE_IDS
+for page_index in "${!PAGE_LABELS[@]}"; do
+  PAGE_IDS["${PAGE_LABELS[$page_index]}"]="$(upload_case "${PAGE_LABELS[$page_index]}" "${PAGE_IMAGES[$page_index]}")"
+done
+printf 'Uploaded image IDs:\n'
+for page_label in "${PAGE_LABELS[@]}"; do printf '  %s=%s\n' "$page_label" "${PAGE_IDS[$page_label]}"; done
 
 STATUS_FILE="$RESULT_DIR/status-latest.json"
 STATUS_HISTORY="$RESULT_DIR/status-history.ndjson"
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while true; do
-  curl --fail --silent --show-error \
-    "${auth_header[@]}" --get \
-    --data-urlencode "image_ids=$OLD_IMAGE_ID" \
-    --data-urlencode "image_ids=$NEW_IMAGE_ID" \
-    --data-urlencode "image_ids=$PROTECTED_IMAGE_ID" \
-    "$BASE_URL/api/upload/images/status" | tee "$STATUS_FILE" >/dev/null
+  status_args=( --fail --silent --show-error "${auth_header[@]}" --get )
+  for page_label in "${PAGE_LABELS[@]}"; do status_args+=( --data-urlencode "image_ids=${PAGE_IDS[$page_label]}" ); done
+  curl "${status_args[@]}" "$BASE_URL/api/upload/images/status" | tee "$STATUS_FILE" >/dev/null
   jq -c --arg checked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{checked_at:$checked_at, images:.}' "$STATUS_FILE" >> "$STATUS_HISTORY"
   jq -r '.[] | "  \(.image_id) \(.status) questions=\(.question_count // 0)"' "$STATUS_FILE"
-  if jq -e 'length == 3 and all(.[]; .status != "pending" and .status != "segmented")' \
+  if jq -e --argjson expected_count "${#PAGE_LABELS[@]}" 'length == $expected_count and all(.[]; .status != "pending" and .status != "segmented")' \
       "$STATUS_FILE" >/dev/null; then
     break
   fi
   (( SECONDS < deadline )) || die "image processing did not finish within $TIMEOUT_SECONDS seconds"
   sleep "$POLL_SECONDS"
 done
+verify_image_id_set "$STATUS_FILE" 'primary status response' "${PAGE_IDS[@]}" \
+  || die 'primary status response image_id set does not match uploaded pages'
 
 if jq -e 'any(.[]; .status == "failed")' "$STATUS_FILE" >/dev/null; then
   VALIDATION_FAILED=true
@@ -612,42 +696,47 @@ fi
 
 curl --fail --silent --show-error "${auth_header[@]}" \
   "$BASE_URL/api/questions/review/images" \
-  | jq --arg old "$OLD_IMAGE_ID" --arg new "$NEW_IMAGE_ID" --arg protected "$PROTECTED_IMAGE_ID" \
-      '[.[] | select(.image_id == $old or .image_id == $new or .image_id == $protected)]' \
+  | jq '[.[] | select(.image_id as $id | $ARGS.positional | index($id))]' --args "${PAGE_IDS[@]}" \
   | tee "$RESULT_DIR/review-images.json" >/dev/null
+verify_image_id_set "$RESULT_DIR/review-images.json" 'primary review response' "${PAGE_IDS[@]}" \
+  || die 'primary review response image_id set does not match uploaded pages'
 
 truth_json_value() {
   local value="$1"
   if [[ -n "$value" ]]; then printf '%s' "$value"; else printf 'null'; fi
 }
 
-jq -n \
-  --arg old_label "$(basename "${OLD_IMAGE%.*}")" \
-  --arg new_label "$(basename "${NEW_IMAGE%.*}")" \
-  --arg protected_label "$(basename "${PROTECTED_IMAGE%.*}")" \
-  --arg old_source_name "$(basename "$OLD_IMAGE")" \
-  --arg new_source_name "$(basename "$NEW_IMAGE")" \
-  --arg protected_source_name "$(basename "$PROTECTED_IMAGE")" \
-  --arg old_id "$OLD_IMAGE_ID" --arg new_id "$NEW_IMAGE_ID" --arg protected_id "$PROTECTED_IMAGE_ID" \
-  --argjson old_truth "$(truth_json_value "$OLD_TRUTH_COUNT")" \
-  --argjson new_truth "$(truth_json_value "$NEW_TRUTH_COUNT")" \
-  --argjson protected_truth "$(truth_json_value "$PROTECTED_TRUTH_COUNT")" \
-  '[
-    {label:$old_label,image_id:$old_id,image_path:"/audit-inputs/old-image",source_name:$old_source_name,truth_count:$old_truth},
-    {label:$new_label,image_id:$new_id,image_path:"/audit-inputs/new-image",source_name:$new_source_name,truth_count:$new_truth},
-    {label:$protected_label,image_id:$protected_id,image_path:"/audit-inputs/protected-image",source_name:$protected_source_name,truth_count:$protected_truth}
-  ]' > "$RESULT_DIR/stage-audit-pages.json"
+page_manifest_args=()
+for page_index in "${!PAGE_LABELS[@]}"; do
+  page_manifest_args+=( "${PAGE_LABELS[$page_index]}" "${PAGE_IDS[${PAGE_LABELS[$page_index]}]}" "${PAGE_IMAGES[$page_index]}" "${PAGE_TRUTHS[$page_index]:-null}" )
+done
+"$HOST_PYTHON" - "$RESULT_DIR/input-samples-manifest.json" "$RESULT_DIR/stage-audit-pages.json" "${page_manifest_args[@]}" <<'PY'
+import json, sys
+input_path, audit_path, *values = sys.argv[1:]
+if len(values) % 4:
+    raise SystemExit("page manifest arguments must be label/id/path/truth groups")
+rows = [{"label": label, "image_id": image_id, "image_path": image_path,
+         "source_name": image_path.rsplit("/", 1)[-1],
+         "truth_count": None if truth_count in {"", "null"} else int(truth_count)}
+        for label, image_id, image_path, truth_count in zip(*[iter(values)] * 4)]
+with open(input_path, "w", encoding="utf-8") as stream:
+    json.dump(rows, stream, ensure_ascii=False, separators=(",", ":")); stream.write("\n")
+with open(audit_path, "w", encoding="utf-8") as stream:
+    json.dump([{**row, "image_path": f"/audit-inputs/{row['label']}"} for row in rows], stream, ensure_ascii=False, separators=(",", ":")); stream.write("\n")
+PY
+
+audit_mounts=()
+for page_index in "${!PAGE_LABELS[@]}"; do audit_mounts+=( -v "${PAGE_IMAGES[$page_index]}:/audit-inputs/${PAGE_LABELS[$page_index]}:ro" ); done
+ids_sql="$(printf "'%s'," "${PAGE_IDS[@]}")"; ids_sql="${ids_sql%,}"
 
 sudo docker compose exec -T db psql -v ON_ERROR_STOP=1 -At -U wb_user -d "$SHADOW_DB" -c \
   "SELECT coalesce(jsonb_object_agg(id::text, recognition_audit_json), '{}'::jsonb)
-     FROM wrong_images WHERE id IN ('$OLD_IMAGE_ID','$NEW_IMAGE_ID','$PROTECTED_IMAGE_ID');" \
+     FROM wrong_images WHERE id IN ($ids_sql);" \
   > "$RESULT_DIR/image-audits.json"
 
 sudo docker compose run --rm --no-deps -T \
   -v "$RESULT_DIR:/audit" \
-  -v "$OLD_IMAGE:/audit-inputs/old-image:ro" \
-  -v "$NEW_IMAGE:/audit-inputs/new-image:ro" \
-  -v "$PROTECTED_IMAGE:/audit-inputs/protected-image:ro" \
+  "${audit_mounts[@]}" \
   --entrypoint python worker -X utf8 -B \
   /app/scripts/chinese_marked_evidence_stage_audit.py \
   --review-images /audit/review-images.json \
@@ -682,7 +771,6 @@ sql_capture() {
     | tee "$RESULT_DIR/$output_file"
 }
 
-ids_sql="'$OLD_IMAGE_ID','$NEW_IMAGE_ID','$PROTECTED_IMAGE_ID'"
 sql_capture automatic-candidates.txt \
   "SELECT image_id, id, recognition_pipeline, mark_status,
           question_evidence_status, answer_status, collection_status,

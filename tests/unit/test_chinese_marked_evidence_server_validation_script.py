@@ -256,6 +256,85 @@ class ServerValidationScriptTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("NEW_IMAGE is not a file", result.stderr)
 
+    def test_check_inputs_rejects_duplicate_base_page_labels(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            first = temp_path / "one" / "same.jpg"
+            second = temp_path / "two" / "same.png"
+            third = temp_path / "protected.jpg"
+            for image in (first, second, third):
+                image.parent.mkdir(parents=True, exist_ok=True)
+                image.write_bytes(b"fixture")
+            result = run_script("--check-inputs-only", "--old-image", first.as_posix(), "--new-image", second.as_posix(), "--protected-image", third.as_posix(), "--shadow-db", "wrong_book_evidence_test")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("base page labels must be unique and safe", result.stderr)
+
+    def test_check_inputs_rejects_unsafe_base_page_label(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            images = [temp_path / "old image.jpg", temp_path / "new.jpg", temp_path / "protected.jpg"]
+            for image in images:
+                image.write_bytes(b"fixture")
+            result = run_script("--check-inputs-only", "--old-image", images[0].as_posix(), "--new-image", images[1].as_posix(), "--protected-image", images[2].as_posix(), "--shadow-db", "wrong_book_evidence_test")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("base page labels must be unique and safe", result.stderr)
+
+    def test_check_inputs_accepts_exactly_six_extra_cases_and_reports_nine_pages(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            base_images = []
+            for name in ("old.jpg", "new.jpg", "protected.jpg"):
+                image = temp_path / name
+                image.write_bytes(b"fixture")
+                base_images.append(image)
+            extras = []
+            for index in range(6):
+                image = temp_path / f"extra-{index}.png"
+                image.write_bytes(b"fixture")
+                extras.append({
+                    "label": f"extra-{index}",
+                    "image_path": str(image.resolve()),
+                    "truth_count": index if index % 2 else None,
+                })
+            manifest = temp_path / "extra-cases.json"
+            manifest.write_text(json.dumps(extras), encoding="utf-8")
+
+            result = run_script(
+                "--check-inputs-only",
+                "--old-image", base_images[0].as_posix(),
+                "--new-image", base_images[1].as_posix(),
+                "--protected-image", base_images[2].as_posix(),
+                "--extra-cases-json", manifest.as_posix(),
+                "--shadow-db", "wrong_book_evidence_test",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("TOTAL_PAGES=9", result.stdout)
+            self.assertIn("EXTRA_CASES=6", result.stdout)
+
+    def test_check_inputs_rejects_extra_cases_not_exactly_six(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            images = []
+            for name in ("old.jpg", "new.jpg", "protected.jpg"):
+                image = temp_path / name
+                image.write_bytes(b"fixture")
+                images.append(image)
+            manifest = temp_path / "extra-cases.json"
+            manifest.write_text("[]", encoding="utf-8")
+
+            result = run_script(
+                "--check-inputs-only",
+                "--old-image", images[0].as_posix(),
+                "--new-image", images[1].as_posix(),
+                "--protected-image", images[2].as_posix(),
+                "--extra-cases-json", manifest.as_posix(),
+                "--shadow-db", "wrong_book_evidence_test",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must contain exactly 6 cases", result.stderr)
+
     def _run_host_python_command_probe(self, fake_python_commands):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -414,7 +493,7 @@ exit 9
             self.assertEqual(json.loads(summary)["exit_code"], 2)
             self.assertIn("required replay hash input missing", packaging_warnings)
 
-    def _run_automatic_packaging_with_host_python(self, host_python_command):
+    def _run_automatic_packaging_with_host_python(self, host_python_command, *, legacy=True, extra_cases=False, bad_uuid=False):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             fake_bin = temp_path / "bin"
@@ -425,6 +504,17 @@ exit 9
                 image = temp_path / name
                 image.write_bytes(b"fixture")
                 images.append(image)
+            extra_manifest = None
+            page_labels = ["old", "new", "protected"]
+            if extra_cases:
+                extras = []
+                for index in range(6):
+                    image = temp_path / f"extra-{index}.png"
+                    image.write_bytes(b"fixture")
+                    extras.append({"label": f"extra-{index}", "image_path": str(image.resolve()), "truth_count": None})
+                    page_labels.append(f"extra-{index}")
+                extra_manifest = temp_path / "extra-cases.json"
+                extra_manifest.write_text(json.dumps(extras), encoding="utf-8")
 
             self._write_executable(
                 fake_bin / "curl",
@@ -433,17 +523,28 @@ set -euo pipefail
 args="$*"
 [[ -z "${CURL_LOG:-}" ]] || printf '%s\n' "$args" >> "$CURL_LOG"
 if [[ "$args" == *"/api/upload/images/status"* ]]; then
-  printf '%s\n' '[{"image_id":"11111111-1111-1111-1111-111111111111","status":"needs_review","question_count":1},{"image_id":"22222222-2222-2222-2222-222222222222","status":"needs_review","question_count":1},{"image_id":"33333333-3333-3333-3333-333333333333","status":"needs_review","question_count":1}]'
+  first=true; printf '['
+  for argument in "$@"; do
+    [[ "$argument" == image_ids=* ]] || continue
+    $first || printf ','; first=false
+    printf '{"image_id":"%s","status":"needs_review","question_count":1}' "${argument#image_ids=}"
+  done
+  printf ']\n'
 elif [[ "$args" == *"/api/upload/image"* ]]; then
-  if [[ "$args" == *"old.jpg"* ]]; then id=11111111-1111-1111-1111-111111111111
-  elif [[ "$args" == *"new.jpg"* ]]; then id=22222222-2222-2222-2222-222222222222
-  else id=33333333-3333-3333-3333-333333333333
-  fi
+  count=0; [[ -f "${CURL_STATE:?}" ]] && count="$(cat "$CURL_STATE")"
+  count=$((count + 1)); printf '%s' "$count" > "$CURL_STATE"
+  if [[ "${BAD_UPLOAD_UUID:-}" == true ]]; then id='------------------------------------'; else id="00000000-0000-0000-0000-$(printf '%012d' "$count")"; fi
+  printf '%s\n' "$id" >> "${CURL_IDS:?}"
   printf '{"image_id":"%s","status":"pending"}\n' "$id"
 elif [[ "$args" == *"/api/questions/review/images/"*"/decisions"* ]]; then
   printf '%s\n' '{"status":"confirmed"}'
 else
-  printf '%s\n' '[{"image_id":"11111111-1111-1111-1111-111111111111","group_type":"questions","question_count":1,"issue_code":null,"questions":[{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}]},{"image_id":"22222222-2222-2222-2222-222222222222","group_type":"questions","question_count":1,"issue_code":null,"questions":[{"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}]}]'
+  first=true; printf '['
+  while IFS= read -r id; do
+    $first || printf ','; first=false
+    printf '{"image_id":"%s","group_type":"questions","question_count":0,"issue_code":null,"questions":[]}' "$id"
+  done < "${CURL_IDS:?}"
+  printf ']\n'
 fi
 """,
             )
@@ -514,7 +615,12 @@ if [[ "$*" == *"docker compose run"*"scripts.deepseek_raw_page_comparison"* ]]; 
   [[ -n "$host_output" && -n "$group_name" ]] || exit 7
   mkdir -p "$host_output/$group_name"
   printf '%s\n' '# fake raw comparison' > "$host_output/$group_name/summary.md"
-  for page in old new protected; do
+  pages=(); previous=''
+  for argument in "$@"; do
+    [[ "$previous" == '--page' ]] && pages+=("$argument")
+    previous="$argument"
+  done
+  for page in "${pages[@]}"; do
     mkdir -p "$host_output/$group_name/$page"
     printf '%s\n' '{"choices":[]}' > "$host_output/$group_name/$page/response.json"
   done
@@ -532,7 +638,11 @@ if [[ "$*" == *"docker compose run"*"chinese_marked_evidence_stage_audit.py"* ]]
   done
   audit_dir="$host_output/stage-audit"
   [[ "$*" == *"legacy-mode-stage-audit"* ]] && audit_dir="$host_output/legacy-mode/stage-audit"
-      for page in old new protected; do
+  pages_file=''; previous=''
+  for argument in "$@"; do [[ "$previous" == '--pages-json' ]] && pages_file="$argument"; previous="$argument"; done
+  pages_file="$host_output/${pages_file#/audit/}"
+  mapfile -t pages < <(grep -o '"label":"[^"]*"' "$pages_file" | awk -F '"' '{print $4}')
+      for page in "${pages[@]}"; do
         mkdir -p "$audit_dir/$page"
         printf '%s\n' '{}' > "$audit_dir/$page/audit.json"
         if [[ "${OMIT_LEGACY_LEDGER:-}" != true || "$audit_dir" != */legacy-mode/stage-audit || "$page" != protected ]]; then
@@ -569,6 +679,7 @@ import sys
 
 args = sys.argv[1:]
 variables = {}
+args_values = []
 i = 0
 while i < len(args):
     if args[i] == "--arg":
@@ -577,6 +688,9 @@ while i < len(args):
     elif args[i] == "--argjson":
         variables[args[i + 1]] = json.loads(args[i + 2])
         del args[i:i + 3]
+    elif args[i] == "--args":
+        args_values = args[i + 1:]
+        del args[i:]
     elif args[i] in {"-e", "-r", "-c", "-n", "-er"}:
         i += 1
     else:
@@ -601,14 +715,27 @@ elif "checked_at:$checked_at" in query:
 elif '"  \\(.image_id)' in query:
     for item in load():
         print(f'  {item["image_id"]} {item["status"]} questions={item.get("question_count", 0)}')
-elif "length == 3" in query:
+elif "length == 3" in query or "length == $expected_count" in query:
     data = load()
-    sys.exit(0 if len(data) == 3 and all(x["status"] not in {"pending", "segmented"} for x in data) else 1)
+    expected_count = variables.get("expected_count", 3)
+    sys.exit(0 if len(data) == expected_count and all(x["status"] not in {"pending", "segmented"} for x in data) else 1)
 elif '.status == "failed"' in query:
     sys.exit(0 if any(x["status"] == "failed" for x in load()) else 1)
 elif "select(.image_id == $old" in query:
     wanted = {variables["old"], variables["new"], variables["protected"]}
     print(json.dumps([x for x in load() if x["image_id"] in wanted]))
+elif query.lstrip().startswith('{status:"completed"') and "$ARGS.positional" in query:
+    print(json.dumps({
+        "status": "completed",
+        "primary_mode": {"base_url": variables["primary_url"], "enabled": True},
+        "legacy_mode": {"base_url": variables["legacy_url"], "enabled": False, "image_ids": args_values},
+    }))
+elif "([.[].image_id] | sort)" in query:
+    data = load()
+    sys.exit(0 if sorted(item["image_id"] for item in data) == sorted(args_values) else 1)
+elif "$ARGS.positional" in query:
+    data = load()
+    print(json.dumps([x for x in data if x["image_id"] in args_values]))
 elif "old_label" in query:
     print(json.dumps([
         {"label": variables["old_label"], "image_id": variables["old_id"], "image_path": "/audit-inputs/old-image", "truth_count": variables.get("old_truth")},
@@ -638,6 +765,8 @@ elif "primary_mode" in query and "legacy_mode" in query:
     print(json.dumps({"status": "completed"}))
 elif query == '.status == "completed"':
     sys.exit(0 if load().get("status") == "completed" else 1)
+elif query == '.status == "not_run"':
+    sys.exit(0 if load().get("status") == "not_run" else 1)
 else:
     print(f"unsupported jq query: {query}", file=sys.stderr)
     sys.exit(8)
@@ -647,6 +776,10 @@ else:
             output_dir = temp_path / "results"
             env = os.environ.copy()
             env["ACCESS_TOKEN"] = "archive-secret-token"
+            env["CURL_STATE"] = as_msys_path(temp_path / "curl-upload-count")
+            env["CURL_IDS"] = as_msys_path(temp_path / "curl-upload-ids")
+            if bad_uuid:
+                env["BAD_UPLOAD_UUID"] = "true"
             env["HOST_PYTHON_LOG"] = as_msys_path(host_python_log)
             env["REAL_PYTHON3"] = as_msys_path(Path(sys.executable))
             python_path_assertion = (
@@ -662,9 +795,7 @@ else:
                 as_msys_path(fake_bin),
                 as_msys_path(SCRIPT),
             ]
-            result = subprocess.run(
-                command
-                + [
+            run_args = command + [
                     "--old-image",
                     images[0].as_posix(),
                     "--new-image",
@@ -673,12 +804,16 @@ else:
                     images[2].as_posix(),
                     "--shadow-db",
                     "wrong_book_evidence_test",
-                    "--legacy-base-url",
-                    "http://127.0.0.1:18001",
                     "--output-dir",
                     output_dir.as_posix(),
                     "--skip-human-review",
-                ],
+                ]
+            if legacy:
+                run_args.extend(["--legacy-base-url", "http://127.0.0.1:18001"])
+            if extra_manifest:
+                run_args.extend(["--extra-cases-json", extra_manifest.as_posix()])
+            result = subprocess.run(
+                run_args,
                 cwd=ROOT,
                 env=env,
                 capture_output=True,
@@ -686,6 +821,10 @@ else:
                 check=False,
             )
 
+            if bad_uuid:
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("upload returned invalid image_id", result.stderr)
+                return
             self.assertEqual(result.returncode, 0, result.stderr)
             host_python_invocations = host_python_log.read_text(encoding="utf-8")
             self.assertIn("replay-hashes.tsv", host_python_invocations)
@@ -705,12 +844,19 @@ else:
                 self.assertTrue(any(name.endswith("effective-config.sha256") for name in names))
                 self.assertTrue(any(name.endswith("replay-hashes.json") for name in names))
                 self.assertTrue(any(name.endswith("legacy-mode-comparison.json") for name in names))
-                for page in ("old", "new", "protected"):
+                manifest_name = next(name for name in names if name.endswith("input-samples-manifest.json"))
+                manifest = json.loads(archive.extractfile(next(member for member in archive.getmembers() if member.name.endswith("input-samples-manifest.json"))).read())
+                self.assertEqual([item["label"] for item in manifest], page_labels)
+                manifest_ids = {item["image_id"] for item in manifest}
+                review_member = next(member for member in archive.getmembers() if member.name.endswith("/review-images.json"))
+                self.assertEqual({item["image_id"] for item in json.loads(archive.extractfile(review_member).read())}, manifest_ids)
+                for page in page_labels:
                     self.assertTrue(any(name.endswith(f"stage-audit/{page}/audit.json") for name in names))
                     self.assertTrue(any(name.endswith(f"stage-audit/{page}/candidate-ledger.json") for name in names))
                     self.assertTrue(any(name.endswith(f"stage-audit/{page}/primary-raw-response.md") for name in names))
-                    self.assertTrue(any(name.endswith(f"legacy-mode/stage-audit/{page}/audit.json") for name in names))
-                    self.assertTrue(any(name.endswith(f"legacy-mode/stage-audit/{page}/candidate-ledger.json") for name in names))
+                    if legacy:
+                        self.assertTrue(any(name.endswith(f"legacy-mode/stage-audit/{page}/audit.json") for name in names))
+                        self.assertTrue(any(name.endswith(f"legacy-mode/stage-audit/{page}/candidate-ledger.json") for name in names))
                     for group in ("raw-direct", "raw-direct-bbox", "prepared-direct"):
                         self.assertTrue(any(name.endswith(f"{group}/{page}/response.json") for name in names))
                 members = {
@@ -731,7 +877,7 @@ else:
                     matching_name = next(name for name in members if name.endswith(replay["path"]))
                     self.assertEqual(hashlib.sha256(members[matching_name]).hexdigest(), replay["sha256"])
                 legacy_name = next(name for name in members if name.endswith("legacy-mode-comparison.json"))
-                self.assertEqual(json.loads(members[legacy_name])["status"], "completed")
+                self.assertEqual(json.loads(members[legacy_name])["status"], "completed" if legacy else "not_run")
                 zero_candidate_ledger = next(
                     content for name, content in members.items()
                     if name.endswith("stage-audit/protected/candidate-ledger.json")
@@ -754,6 +900,8 @@ else:
                         content = archive.extractfile(member).read()
                         self.assertNotIn(b"archive-secret-token", content)
 
+            if not legacy:
+                return
             failure_env = env.copy()
             failure_env["OMIT_LEGACY_LEDGER"] = "true"
             failure_output = temp_path / "missing-artifact-results"
@@ -816,6 +964,15 @@ else:
 
     def test_automatic_run_collects_and_packs_results_with_python_only(self):
         self._run_automatic_packaging_with_host_python("python")
+
+    def test_automatic_run_without_legacy_packs_not_run_status(self):
+        self._run_automatic_packaging_with_host_python("python3", legacy=False)
+
+    def test_automatic_run_with_nine_pages_packs_every_page(self):
+        self._run_automatic_packaging_with_host_python("python3", extra_cases=True)
+
+    def test_automatic_run_rejects_malformed_upload_uuid(self):
+        self._run_automatic_packaging_with_host_python("python3", bad_uuid=True)
 
 
 if __name__ == "__main__":
