@@ -156,6 +156,8 @@ def test_deepseek_marked_page_uses_one_standardized_page_and_external_prompt(tmp
             'printed_question': '看图填空',
             'student_answer': None,
             'model_bbox': [0.1, 0.2, 0.4, 0.5],
+            'teacher_mark_type': 'red_cross',
+            'teacher_mark_bbox': [0.32, 0.18, 0.43, 0.29],
             'confidence': 0.91,
             'uncertain_fields': ['student_answer'],
         }],
@@ -179,9 +181,16 @@ def test_deepseek_marked_page_uses_one_standardized_page_and_external_prompt(tmp
     assert content[1]['image_url']['url'].startswith('data:image/jpeg;base64,')
     prompt = content[0]['text']
     assert 'model_bbox' in prompt and 'uncertain_fields' in prompt
+    assert 'teacher_mark_type' in prompt and 'teacher_mark_bbox' in prompt
+    assert '同一行存在多个独立红色批改标记时' in prompt
+    assert '每个被批改的答题格或选择项分别返回一个条目' in prompt
+    assert '黑色或灰色的铅笔勾选' in prompt
+    assert '禁止把整行多个词语合并为一个条目' in prompt
     for forbidden in ('OCR', 'CV', 'region_id', 'sample_id', '人工答案', '正确答案', '候选'):
         assert forbidden not in prompt
     assert result.wrong_questions[0].student_answer is None
+    assert result.wrong_questions[0].teacher_mark_type == 'red_cross'
+    assert result.wrong_questions[0].teacher_mark_bbox == [0.32, 0.18, 0.43, 0.29]
 
 
 def test_deepseek_marked_page_preserves_exact_production_response_content_for_audit(tmp_path):

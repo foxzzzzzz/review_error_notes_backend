@@ -492,6 +492,8 @@ def test_marked_page_validation_keeps_valid_questions_when_siblings_are_invalid(
         'printed_question': '把词语补充完整',
         'student_answer': None,
         'model_bbox': [0.1, 0.2, 0.4, 0.5],
+        'teacher_mark_type': 'red_cross',
+        'teacher_mark_bbox': [0.3, 0.2, 0.4, 0.3],
         'confidence': 0.9,
         'uncertain_fields': ['student_answer'],
     }
@@ -523,6 +525,8 @@ def test_marked_page_validation_isolates_non_object_siblings():
         'printed_question': None,
         'student_answer': None,
         'model_bbox': [0.1, 0.2, 0.4, 0.5],
+        'teacher_mark_type': 'red_circle',
+        'teacher_mark_bbox': [0.3, 0.2, 0.4, 0.3],
         'confidence': 0.9,
         'uncertain_fields': ['printed_question', 'student_answer'],
     }
@@ -543,6 +547,8 @@ def test_marked_page_question_is_required_but_may_be_null():
         'printed_question': None,
         'student_answer': None,
         'model_bbox': [0.1, 0.2, 0.4, 0.5],
+        'teacher_mark_type': 'red_other',
+        'teacher_mark_bbox': [0.3, 0.2, 0.4, 0.3],
         'confidence': 0.9,
         'uncertain_fields': ['printed_question'],
     })
@@ -552,8 +558,49 @@ def test_marked_page_question_is_required_but_may_be_null():
         MarkedPageRecognitionItem.model_validate({
             'student_answer': None,
             'model_bbox': [0.1, 0.2, 0.4, 0.5],
+            'teacher_mark_type': 'red_other',
+            'teacher_mark_bbox': [0.3, 0.2, 0.4, 0.3],
             'confidence': 0.9,
             'uncertain_fields': ['printed_question'],
+        })
+
+
+def test_marked_page_requires_explicit_red_teacher_mark_evidence():
+    from app.services.vision_recognition import MarkedPageRecognitionItem
+
+    item = MarkedPageRecognitionItem.model_validate({
+        'printed_question': '珍珠（zhū zū）',
+        'student_answer': 'zū',
+        'model_bbox': [0.1, 0.2, 0.4, 0.5],
+        'teacher_mark_type': 'red_circle',
+        'teacher_mark_bbox': [0.2, 0.18, 0.35, 0.3],
+        'confidence': 0.9,
+        'uncertain_fields': [],
+    })
+
+    assert item.teacher_mark_type == 'red_circle'
+    assert item.teacher_mark_bbox == [0.2, 0.18, 0.35, 0.3]
+
+    for missing_field in ('teacher_mark_type', 'teacher_mark_bbox'):
+        payload = item.model_dump()
+        payload.pop(missing_field)
+        with pytest.raises(ValidationError):
+            MarkedPageRecognitionItem.model_validate(payload)
+
+
+@pytest.mark.parametrize('teacher_mark_type', ['black_tick', 'gray_pencil', 'red'])
+def test_marked_page_rejects_non_contract_teacher_mark_types(teacher_mark_type):
+    from app.services.vision_recognition import MarkedPageRecognitionItem
+
+    with pytest.raises(ValidationError):
+        MarkedPageRecognitionItem.model_validate({
+            'printed_question': '题面',
+            'student_answer': '作答',
+            'model_bbox': [0.1, 0.2, 0.4, 0.5],
+            'teacher_mark_type': teacher_mark_type,
+            'teacher_mark_bbox': [0.2, 0.18, 0.35, 0.3],
+            'confidence': 0.9,
+            'uncertain_fields': [],
         })
 
 
@@ -570,6 +617,8 @@ def test_marked_page_rejects_non_float_or_non_finite_model_bbox(model_bbox):
             'printed_question': '题面',
             'student_answer': None,
             'model_bbox': model_bbox,
+            'teacher_mark_type': 'red_cross',
+            'teacher_mark_bbox': [0.3, 0.2, 0.4, 0.3],
             'confidence': 0.9,
             'uncertain_fields': [],
         })

@@ -547,6 +547,8 @@ class MarkedPageRecognitionItem(BaseModel):
     printed_question: Optional[str]
     student_answer: Optional[str]
     model_bbox: List[float]
+    teacher_mark_type: Literal["red_circle", "red_cross", "red_other"]
+    teacher_mark_bbox: List[float]
     confidence: float = Field(ge=0, le=1)
     uncertain_fields: List[
         Literal["printed_question", "student_answer", "model_bbox"]
@@ -559,16 +561,16 @@ class MarkedPageRecognitionItem(BaseModel):
             raise ValueError("visible text must not be blank")
         return value
 
-    @field_validator("model_bbox", mode="before")
+    @field_validator("model_bbox", "teacher_mark_bbox", mode="before")
     @classmethod
-    def model_bbox_must_use_strict_finite_floats(cls, value):
+    def bbox_must_use_strict_finite_floats(cls, value):
         if (
             not isinstance(value, list)
             or len(value) != 4
             or any(type(coordinate) is not float for coordinate in value)
             or any(not math.isfinite(coordinate) for coordinate in value)
         ):
-            raise ValueError("model_bbox must contain four finite float coordinates")
+            raise ValueError("bbox must contain four finite float coordinates")
         return validate_normalized_bbox(value)
 
     @field_validator("confidence", mode="before")
