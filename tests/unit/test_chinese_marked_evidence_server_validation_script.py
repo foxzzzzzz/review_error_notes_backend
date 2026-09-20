@@ -378,17 +378,41 @@ exit 9
                 (temp_path / "results").as_posix(),
                 "--skip-human-review",
             ]
-            result = subprocess.run(
-                command,
-                cwd=ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            replay_source = ROOT / "config" / "deepseek-raw-page-comparison-bbox-prompt.md"
+            unavailable_replay_source = replay_source.with_suffix(".test-hidden")
+            os.replace(replay_source, unavailable_replay_source)
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=ROOT,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            finally:
+                os.replace(unavailable_replay_source, replay_source)
 
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("shares its Redis broker with the production worker", result.stderr)
+            self.assertNotIn("required return artifact missing", result.stderr)
+            self.assertNotIn("required replay hash input missing", result.stderr)
+            self.assertNotIn("write_return_package_contract_best_effort: command not found", result.stderr)
+            archives = list((temp_path / "results").glob("*.tar.gz"))
+            self.assertEqual(len(archives), 1)
+            with tarfile.open(archives[0], "r:gz") as archive:
+                summary = next(
+                    archive.extractfile(member).read()
+                    for member in archive.getmembers()
+                    if member.name.endswith("run-summary.json")
+                )
+                packaging_warnings = next(
+                    archive.extractfile(member).read().decode("utf-8")
+                    for member in archive.getmembers()
+                    if member.name.endswith("packaging-warnings.log")
+                )
+            self.assertEqual(json.loads(summary)["exit_code"], 2)
+            self.assertIn("required replay hash input missing", packaging_warnings)
 
     def _run_automatic_packaging_with_host_python(self, host_python_command):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -697,6 +721,8 @@ else:
                 effective_config_name = next(name for name in members if name.endswith("effective-config.json"))
                 effective_config = json.loads(members[effective_config_name])
                 self.assertNotIn("ACCESS_TOKEN", json.dumps(effective_config))
+                contract_name = next(name for name in members if name.endswith("return-package-contract.json"))
+                self.assertEqual(json.loads(members[contract_name])["schema_version"], 1)
                 effective_hash_name = next(name for name in members if name.endswith("effective-config.sha256"))
                 expected_effective_hash = members[effective_hash_name].decode("utf-8").split()[0]
                 self.assertEqual(hashlib.sha256(members[effective_config_name]).hexdigest(), expected_effective_hash)

@@ -341,8 +341,12 @@ write_return_package_contract() {
   },
   "quality_rule": "HTTP 200, JSON parsing, OCR support, CV coverage, and validator acceptance are not substitutes for per-question human correctness and answer review."
 }
-
 EOF
+}
+
+write_return_package_contract_best_effort() {
+  ( write_return_package_contract ) >> "$RESULT_DIR/packaging-warnings.log" 2>&1 \
+    || printf 'WARNING: unable to write the complete return package contract after validation failure\n' >&2
 }
 
 verify_return_package_contract() {
@@ -369,8 +373,12 @@ package_results() {
   local exit_code="$1"
   [[ -n "$RESULT_DIR" && -d "$RESULT_DIR" ]] || return 0
   collect_logs
-  write_return_package_contract
-  verify_return_package_contract
+  if [[ "$exit_code" -eq 0 ]]; then
+    write_return_package_contract
+    verify_return_package_contract
+  else
+    write_return_package_contract_best_effort
+  fi
   printf '{"commit":"%s","exit_code":%s,"human_review_mode":"%s","shadow_db":"%s","raw_comparison_failed":%s}\n' \
     "$EXPECTED_COMMIT" "$exit_code" "$HUMAN_REVIEW_MODE" "$SHADOW_DB" \
     "$RAW_COMPARISON_FAILED" > "$RESULT_DIR/run-summary.json"
@@ -385,7 +393,9 @@ package_results() {
 finish() {
   local exit_code=$?
   trap - EXIT
-  package_results "$exit_code" || exit_code=1
+  if ! package_results "$exit_code" && [[ "$exit_code" -eq 0 ]]; then
+    exit_code=1
+  fi
   if [[ "$exit_code" -eq 0 && "$KEEP_CONTAINERS" == false ]]; then
     sudo docker rm -f evidence-shadow-api evidence-shadow-worker >/dev/null 2>&1 || true
   elif [[ "$exit_code" -ne 0 ]]; then

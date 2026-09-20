@@ -72,15 +72,30 @@ def _draw_overlay(
     image.save(output_path)
 
 
-def _stage_audit_for(image: dict) -> dict:
+def _stage_audit_for(image: dict) -> dict | None:
     for question in image.get("questions") or []:
         raw = question.get("ocr_raw_json") or {}
         audit = raw.get("stage_audit")
         if isinstance(audit, dict):
             return audit
+    return None
+
+
+def _page_primary_audit_for(image: dict, image_audit: dict) -> dict:
+    raw_response = image_audit.get("page_primary_raw_response")
+    invalid_item_diagnostics = image_audit.get("invalid_item_diagnostics")
+    if (
+        image_audit.get("status") == "completed"
+        and isinstance(raw_response, str)
+        and isinstance(invalid_item_diagnostics, list)
+    ):
+        return {
+            "status": "completed",
+            "invalid_item_diagnostics": invalid_item_diagnostics,
+        }
     raise ValueError(
         f"image {image.get('image_id')} has no stage_audit; "
-        "start the shadow worker with CHINESE_MARKED_EVIDENCE_STAGE_AUDIT_ENABLED=true"
+        "a candidate page without legacy stages requires a completed page-primary image audit"
     )
 
 
@@ -236,10 +251,12 @@ def render_stage_audit_report(
 ) -> list[dict]:
     review_images = json.loads(review_path.read_text(encoding="utf-8"))
     by_image_id = {image["image_id"]: image for image in review_images}
+    page_primary_audit_mode = image_audits is not None
     output_dir.mkdir(parents=True, exist_ok=True)
     summary = []
     for page in pages:
         image = by_image_id.get(page["image_id"])
+        review_image_present = image is not None
         image_audit = (image_audits or {}).get(str(page["image_id"])) or {}
         if image is None:
             if not image_audit:
@@ -248,7 +265,12 @@ def render_stage_audit_report(
         image_path = Path(page["image_path"])
         if not image_path.is_file():
             raise ValueError(f"source image does not exist: {image_path}")
-        audit = _stage_audit_for(image) if image.get("questions") else {}
+        audit = _stage_audit_for(image)
+        page_primary_audit = None
+        if audit is None:
+            if page_primary_audit_mode or image.get("questions") or not review_image_present:
+                page_primary_audit = _page_primary_audit_for(image, image_audit)
+            audit = {}
         page_dir = output_dir / str(page["label"])
         page_dir.mkdir(parents=True, exist_ok=True)
         if isinstance(image_audit.get("page_primary_raw_response"), str):
@@ -325,11 +347,23 @@ def render_stage_audit_report(
             [dict(item, id=f"P{item.get('mark_id')}") for item in persisted],
         )
 
-        page_audit = {
-            **audit,
-            "content_observations": content_observations,
-            "persisted_candidates": persisted,
-        }
+        if page_primary_audit is None:
+            page_audit = {
+                **audit,
+                "content_observations": content_observations,
+                "persisted_candidates": persisted,
+            }
+        else:
+            page_audit = {
+                "recognition_mode": "page_primary",
+                "legacy_stage_audit": {
+                    "applicable": False,
+                    "reason": "page-primary recognition does not emit legacy stage_audit data",
+                },
+                "page_primary_audit": page_primary_audit,
+                "content_observations": content_observations,
+                "persisted_candidates": persisted,
+            }
         (page_dir / "audit.json").write_text(
             json.dumps(page_audit, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -342,29 +376,39 @@ def render_stage_audit_report(
         local_ocr_page = first_raw.get("local_ocr_page") or {}
         evidence_timing = first_raw.get("evidence_timing") or {}
         truth_count = page.get("truth_count")
-        event_count = len(mark_events)
+        stage_audit_applicable = page_primary_audit is None
+        event_count = len(mark_events) if stage_audit_applicable else None
         summary.append(
             {
                 "label": str(page["label"]),
                 "image_id": page["image_id"],
                 "truth_count": truth_count,
-                "raw_component_count": len(red_components),
-                "evidence_group_count": len(evidence_groups),
-                "mark_attempt_primitive_count": sum(
-                    len(attempt.get("marks") or []) for attempt in mark_attempts
+                "raw_component_count": len(red_components) if stage_audit_applicable else None,
+                "evidence_group_count": len(evidence_groups) if stage_audit_applicable else None,
+                "mark_attempt_primitive_count": (
+                    sum(len(attempt.get("marks") or []) for attempt in mark_attempts)
+                    if stage_audit_applicable else None
                 ),
                 "mark_event_count": event_count,
-                "localized_count": len(localizations),
-                "content_item_count": int(three_stage.get("content_item_count", 0) or 0),
+                "localized_count": len(localizations) if stage_audit_applicable else None,
+                "content_item_count": (
+                    int(three_stage.get("content_item_count", 0) or 0)
+                    if stage_audit_applicable else None
+                ),
                 "persisted_candidate_count": len(persisted),
                 "event_inflation": (
-                    event_count - int(truth_count) if truth_count is not None else None
+                    event_count - int(truth_count)
+                    if event_count is not None and truth_count is not None else None
                 ),
-                "red_scan_ms": audit.get("red_scan_ms"),
-                "full_page_ocr_ms": local_ocr_page.get("duration_ms"),
-                "mark_detection_ms": three_stage.get("mark_llm_ms"),
-                "question_localization_ms": three_stage.get("localization_llm_ms"),
-                "content_recognition_ms": three_stage.get("content_llm_ms"),
+                "red_scan_ms": audit.get("red_scan_ms") if stage_audit_applicable else None,
+                "full_page_ocr_ms": local_ocr_page.get("duration_ms") if stage_audit_applicable else None,
+                "mark_detection_ms": three_stage.get("mark_llm_ms") if stage_audit_applicable else None,
+                "question_localization_ms": (
+                    three_stage.get("localization_llm_ms") if stage_audit_applicable else None
+                ),
+                "content_recognition_ms": (
+                    three_stage.get("content_llm_ms") if stage_audit_applicable else None
+                ),
                 "before_persistence_elapsed_ms": (
                     (evidence_timing.get("before_persistence") or {}).get("elapsed_ms")
                 ),

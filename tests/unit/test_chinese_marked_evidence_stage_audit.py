@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from PIL import Image
+import pytest
 
 
 def test_renderer_writes_stage_overlays_and_inflation_summary(tmp_path):
@@ -270,7 +271,11 @@ def test_stage_audit_writes_zero_candidate_page_from_image_audit(tmp_path):
         review_path=review_path,
         output_dir=tmp_path / "audit",
         pages=[{"label": "zero", "image_id": "zero-id", "image_path": image_path}],
-        image_audits={"zero-id": {"page_primary_raw_response": raw_content, "status": "completed"}},
+        image_audits={"zero-id": {
+            "page_primary_raw_response": raw_content,
+            "status": "completed",
+            "invalid_item_diagnostics": [],
+        }},
     )
 
     page_dir = tmp_path / "audit" / "zero"
@@ -278,3 +283,127 @@ def test_stage_audit_writes_zero_candidate_page_from_image_audit(tmp_path):
     assert json.loads((page_dir / "audit.json").read_text())["persisted_candidates"] == []
     assert (page_dir / "primary-raw-response.md").read_text() == raw_content
     assert json.loads((page_dir / "primary-raw-response.json").read_text())["page_primary_raw_response"] == raw_content
+
+
+def test_legacy_zero_candidate_page_without_image_audit_writes_empty_stage_audit(tmp_path):
+    from scripts.chinese_marked_evidence_stage_audit import render_stage_audit_report
+
+    image_path = tmp_path / "legacy-zero.jpg"
+    Image.new("RGB", (100, 100), "white").save(image_path)
+    review_path = tmp_path / "review.json"
+    review_path.write_text(json.dumps([{"image_id": "legacy-zero", "questions": []}]), encoding="utf-8")
+
+    render_stage_audit_report(
+        review_path=review_path,
+        output_dir=tmp_path / "audit",
+        pages=[{"label": "legacy-zero", "image_id": "legacy-zero", "image_path": image_path}],
+    )
+
+    page_audit = json.loads((tmp_path / "audit" / "legacy-zero" / "audit.json").read_text())
+    assert page_audit == {"content_observations": [], "persisted_candidates": []}
+
+
+@pytest.mark.parametrize("image_audits", [
+    {},
+    {"primary-empty": {
+        "status": "failed",
+        "page_primary_raw_response": "{}",
+        "invalid_item_diagnostics": [],
+    }},
+])
+def test_explicit_page_primary_zero_candidate_requires_valid_image_audit(tmp_path, image_audits):
+    from scripts.chinese_marked_evidence_stage_audit import render_stage_audit_report
+
+    image_path = tmp_path / "primary-empty.jpg"
+    Image.new("RGB", (100, 100), "white").save(image_path)
+    review_path = tmp_path / "review.json"
+    review_path.write_text(
+        json.dumps([{"image_id": "primary-empty", "questions": []}]), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="requires a completed page-primary image audit"):
+        render_stage_audit_report(
+            review_path=review_path,
+            output_dir=tmp_path / "audit",
+            pages=[{"label": "primary-empty", "image_id": "primary-empty", "image_path": image_path}],
+            image_audits=image_audits,
+        )
+
+
+def test_candidate_without_stage_audit_rejects_invalid_page_primary_image_audit(tmp_path):
+    from scripts.chinese_marked_evidence_stage_audit import render_stage_audit_report
+
+    image_path = tmp_path / "invalid-primary.jpg"
+    Image.new("RGB", (100, 100), "white").save(image_path)
+    review_path = tmp_path / "review.json"
+    review_path.write_text(json.dumps([{
+        "image_id": "invalid-primary",
+        "questions": [{"id": "question", "ocr_raw_json": {}}],
+    }]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="requires a completed page-primary image audit"):
+        render_stage_audit_report(
+            review_path=review_path,
+            output_dir=tmp_path / "audit",
+            pages=[{"label": "invalid", "image_id": "invalid-primary", "image_path": image_path}],
+            image_audits={"invalid-primary": {
+                "status": "failed",
+                "page_primary_raw_response": "{}",
+                "invalid_item_diagnostics": [],
+            }},
+        )
+
+
+def test_page_primary_candidates_without_legacy_stage_audit_render_auditable_report(tmp_path):
+    from scripts.chinese_marked_evidence_stage_audit import render_stage_audit_report
+
+    image_path = tmp_path / "primary.jpg"
+    Image.new("RGB", (100, 100), "white").save(image_path)
+    review_path = tmp_path / "review.json"
+    review_path.write_text(json.dumps([{
+        "image_id": "primary-candidate",
+        "questions": [{
+            "id": "question-primary",
+            "ocr_text": "题面",
+            "ocr_answer": "答案",
+            "ocr_raw_json": {
+                "evidence_timing": {
+                    "before_persistence": {"elapsed_ms": 20.0},
+                    "pre_commit": {"elapsed_ms": 25.0},
+                },
+                "evidence_bundle": {
+                    "identity": {
+                        "mark_id": 7,
+                        "question_geometry": {"question_bbox": [0.1, 0.1, 0.5, 0.5]},
+                    },
+                },
+            },
+        }],
+    }]), encoding="utf-8")
+    raw_response = '{"wrong_questions":[{"question":"题面"}]}'
+
+    summary = render_stage_audit_report(
+        review_path=review_path,
+        output_dir=tmp_path / "audit",
+        pages=[{"label": "primary", "image_id": "primary-candidate", "image_path": image_path}],
+        image_audits={"primary-candidate": {
+            "status": "completed",
+            "page_primary_raw_response": raw_response,
+            "invalid_item_diagnostics": [],
+        }},
+    )
+
+    page_dir = tmp_path / "audit" / "primary"
+    audit = json.loads((page_dir / "audit.json").read_text(encoding="utf-8"))
+    assert audit["recognition_mode"] == "page_primary"
+    assert audit["legacy_stage_audit"]["applicable"] is False
+    assert audit["page_primary_audit"] == {
+        "status": "completed",
+        "invalid_item_diagnostics": [],
+    }
+    assert json.loads((page_dir / "candidate-ledger.json").read_text(encoding="utf-8"))[0]["question_id"] == "question-primary"
+    assert (page_dir / "08-content-observations.png").is_file()
+    assert (page_dir / "09-persisted-candidates.png").is_file()
+    assert (page_dir / "primary-raw-response.md").read_text(encoding="utf-8") == raw_response
+    assert summary[0]["before_persistence_elapsed_ms"] == 20.0
+    assert summary[0]["pre_commit_elapsed_ms"] == 25.0
