@@ -139,8 +139,6 @@ def run_comparison(
     prompt = prompt_path.read_text(encoding="utf-8").strip()
     if not prompt:
         raise ValueError("comparison prompt must not be empty")
-    if len(pages) != 3:
-        raise ValueError("raw comparison requires exactly three pages")
     if input_mode not in {"raw", "prepared"}:
         raise ValueError("input mode must be raw or prepared")
     labels = [str(page["label"]) for page in pages]

@@ -181,10 +181,14 @@ def test_deepseek_marked_page_uses_one_standardized_page_and_external_prompt(tmp
     assert 'model_bbox' in prompt and 'uncertain_fields' in prompt
     assert '每个被老师批改的答题格、填空位或选择项作为一个最小独立候选' in prompt
     assert '同一行多个批改项必须分别返回，禁止整行合并' in prompt
-    assert '只有红色勾与红色圈是本次认可的老师批改依据' in prompt
+    assert '教师批改痕迹使用红色笔迹' in prompt
+    assert '红圈和红叉是错题定位依据' in prompt
+    assert '红勾表示答案正确，不能据此返回错题候选' in prompt
+    assert '其他红色文字、订正内容、划线或零散笔迹不能单独作为错题依据' in prompt
     assert '黑色、灰色或其他非红色笔迹' in prompt
     assert 'teacher_mark_type' not in prompt and 'teacher_mark_bbox' not in prompt
-    assert '红叉' not in prompt and '其他明确批改标记' not in prompt
+    assert '返回候选数量应与' not in prompt
+    assert '其他明确批改标记' not in prompt
     for forbidden in ('OCR', 'CV', 'region_id', 'sample_id', '人工答案', '正确答案'):
         assert forbidden not in prompt
     assert result.wrong_questions[0].student_answer is None

@@ -162,6 +162,52 @@ def test_raw_comparison_records_failures_without_retrying_or_stopping_other_page
     assert all(row["http_status"] == 503 for row in summary)
 
 
+def test_raw_comparison_accepts_nine_page_validation_set(tmp_path):
+    from scripts.deepseek_raw_page_comparison import run_comparison
+
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text(PROMPT, encoding="utf-8")
+    pages = []
+    for index in range(9):
+        label = f"P{index + 1:03d}"
+        image_path = tmp_path / f"{label}.jpg"
+        image_path.write_bytes(label.encode())
+        pages.append(
+            {
+                "label": label,
+                "image_path": image_path,
+                "source_name": image_path.name,
+                "truth_count": None,
+            }
+        )
+
+    calls = 0
+
+    def respond(_request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "model": "deepseek-flash",
+                "choices": [
+                    {"message": {"content": "结果"}, "finish_reason": "stop"}
+                ],
+            },
+        )
+
+    summary = run_comparison(
+        pages=pages,
+        prompt_path=prompt_path,
+        output_dir=tmp_path / "raw-direct",
+        settings_obj=_settings(),
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert calls == 9
+    assert [row["status"] for row in summary] == ["completed"] * 9
+
+
 def test_prepared_comparison_reuses_a_preprocessing_and_persists_sent_image(tmp_path):
     from scripts.deepseek_raw_page_comparison import run_comparison
 
