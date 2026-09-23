@@ -513,6 +513,35 @@ def test_marked_page_validation_keeps_valid_questions_when_siblings_are_invalid(
     assert [item['item_index'] for item in result.invalid_item_diagnostics] == [1, 2, 3]
 
 
+def test_marked_page_empty_student_answers_remain_candidates():
+    from app.services.vision_recognition import (
+        MarkedPageRecognitionResult,
+        _validate_response_result,
+    )
+
+    result = _validate_response_result(
+        {'wrong_questions': [
+            {'printed_question': 'xìng yùn', 'student_answer': '',
+             'model_bbox': [0.1, 0.2, 0.2, 0.3], 'confidence': 0.9,
+             'uncertain_fields': ['student_answer']},
+            {'printed_question': 'kē dǒu', 'student_answer': '  ',
+             'model_bbox': [0.3, 0.2, 0.4, 0.3], 'confidence': 0.9,
+             'uncertain_fields': ['student_answer']},
+            {'printed_question': 'bīng kuài', 'student_answer': None,
+             'model_bbox': [0.5, 0.2, 0.6, 0.3], 'confidence': 0.9,
+             'uncertain_fields': ['student_answer']},
+        ]},
+        MarkedPageRecognitionResult,
+        {'operation': 'marked_page_recognition'},
+    )
+
+    assert [item.printed_question for item in result.wrong_questions] == [
+        'xìng yùn', 'kē dǒu', 'bīng kuài',
+    ]
+    assert [item.student_answer for item in result.wrong_questions] == [None, None, None]
+    assert result.invalid_item_diagnostics == []
+
+
 def test_marked_page_validation_isolates_non_object_siblings():
     from app.services.vision_recognition import (
         MarkedPageRecognitionResult,

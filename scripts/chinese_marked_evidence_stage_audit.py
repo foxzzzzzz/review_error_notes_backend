@@ -154,6 +154,7 @@ def _candidate_ledger(image: dict) -> list[dict]:
         raw = question.get("ocr_raw_json") or {}
         crop_region = question.get("crop_region") or {}
         bundle = raw.get("evidence_bundle") or {}
+        marked_page_item = raw.get("marked_page_item")
         cv_audit = raw.get("local_cv_audit") or {}
         cv_status = cv_audit.get("status") or ("available" if cv_audit else "unavailable")
         ocr_page = raw.get("ocr_page") or {}
@@ -161,8 +162,16 @@ def _candidate_ledger(image: dict) -> list[dict]:
             {
                 "question_id": question.get("id"),
                 "content": {
-                    "printed_question": question.get("ocr_text"),
-                    "student_answer": question.get("ocr_answer"),
+                    "printed_question": (
+                        marked_page_item.get("printed_question")
+                        if isinstance(marked_page_item, dict)
+                        else question.get("ocr_text")
+                    ),
+                    "student_answer": (
+                        marked_page_item.get("student_answer")
+                        if isinstance(marked_page_item, dict)
+                        else question.get("ocr_answer")
+                    ),
                 },
                 "model_bbox": raw.get("model_bbox") or crop_region.get("model_bbox"),
                 "display_bbox": raw.get("display_bbox") or crop_region.get("display_bbox"),
@@ -184,6 +193,13 @@ def _candidate_ledger(image: dict) -> list[dict]:
             }
         )
     return ledger
+
+
+def _elapsed_ms(stage_timing: dict) -> float | None:
+    if stage_timing.get("elapsed_ms") is not None:
+        return stage_timing["elapsed_ms"]
+    seconds = stage_timing.get("elapsed_seconds")
+    return float(seconds) * 1000 if seconds is not None else None
 
 
 def _write_summary_files(output_dir: Path, summary: list[dict]) -> None:
@@ -410,10 +426,10 @@ def render_stage_audit_report(
                     three_stage.get("content_llm_ms") if stage_audit_applicable else None
                 ),
                 "before_persistence_elapsed_ms": (
-                    (evidence_timing.get("before_persistence") or {}).get("elapsed_ms")
+                    _elapsed_ms(evidence_timing.get("before_persistence") or {})
                 ),
                 "pre_commit_elapsed_ms": (
-                    (evidence_timing.get("pre_commit") or {}).get("elapsed_ms")
+                    _elapsed_ms(evidence_timing.get("pre_commit") or {})
                 ),
             }
         )

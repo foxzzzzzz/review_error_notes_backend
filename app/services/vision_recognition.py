@@ -552,6 +552,13 @@ class MarkedPageRecognitionItem(BaseModel):
         Literal["printed_question", "student_answer", "model_bbox"]
     ] = Field(default_factory=list)
 
+    @field_validator("student_answer", mode="before")
+    @classmethod
+    def empty_student_answer_is_missing(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("printed_question", "student_answer")
     @classmethod
     def visible_text_must_not_be_blank(cls, value):

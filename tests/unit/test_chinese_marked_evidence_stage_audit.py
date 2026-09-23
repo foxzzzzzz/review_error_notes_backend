@@ -183,10 +183,14 @@ def test_renderer_writes_page_candidate_ledger_with_primary_evidence_contract(tm
                 "image_id": "image-primary",
                 "questions": [{
                     "id": "question-primary",
-                    "ocr_text": "印刷题面",
-                    "ocr_answer": "学生原答",
+                    "ocr_text": "学生原答",
+                    "ocr_answer": None,
                     "ocr_raw_json": {
                         "stage_audit": {"mark_events": []},
+                        "marked_page_item": {
+                            "printed_question": "印刷题面",
+                            "student_answer": "学生原答",
+                        },
                         "model_bbox": [0.2, 0.2, 0.4, 0.4],
                         "display_bbox": [0.1, 0.1, 0.5, 0.5],
                         "display_bbox_scale": 2.0,
@@ -216,7 +220,7 @@ def test_renderer_writes_page_candidate_ledger_with_primary_evidence_contract(tm
         pages=[{"label": "old", "image_id": "image-primary", "image_path": image_path}],
     )
 
-    ledger = json.loads((tmp_path / "audit" / "old" / "candidate-ledger.json").read_text())
+    ledger = json.loads((tmp_path / "audit" / "old" / "candidate-ledger.json").read_text(encoding="utf-8"))
     assert ledger == [{
         "question_id": "question-primary",
         "content": {"printed_question": "印刷题面", "student_answer": "学生原答"},
@@ -368,8 +372,8 @@ def test_page_primary_candidates_without_legacy_stage_audit_render_auditable_rep
             "ocr_answer": "答案",
             "ocr_raw_json": {
                 "evidence_timing": {
-                    "before_persistence": {"elapsed_ms": 20.0},
-                    "pre_commit": {"elapsed_ms": 25.0},
+                    "before_persistence": {"elapsed_seconds": 0.020},
+                    "pre_commit": {"elapsed_seconds": 0.025},
                 },
                 "evidence_bundle": {
                     "identity": {
