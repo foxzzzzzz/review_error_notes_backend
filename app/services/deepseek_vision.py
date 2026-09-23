@@ -11,6 +11,7 @@ from app.services.vision_recognition import (
     VisionRecognitionError,
     _extract_json,
     prepare_image_data_url,
+    recognition_correction_instruction,
 )
 
 
@@ -50,7 +51,9 @@ class DeepSeekVisionClient(MiniMaxVisionClient):
                                headers={'Authorization':'Bearer '+self.api_key,'Content-Type':'application/json'},
                                json=request)
 
-    def recognize_marked_page(self, image_path: str) -> MarkedPageRecognitionResult:
+    def recognize_marked_page(
+        self, image_path: str, *, correction: str | None = None
+    ) -> MarkedPageRecognitionResult:
         diagnostic = {"operation": "marked_page_recognition"}
         image_url = prepare_image_data_url(
             image_path, self.max_edge, self.jpeg_quality, diagnostic
@@ -58,6 +61,9 @@ class DeepSeekVisionClient(MiniMaxVisionClient):
         prompt = Path(settings.CHINESE_DEEPSEEK_PAGE_PROMPT_PATH).read_text(
             encoding="utf-8"
         )
+        correction_instruction = recognition_correction_instruction(correction)
+        if correction_instruction:
+            prompt += "\n\n纠偏要求：" + correction_instruction
         return self._request(
             {"prompt": prompt, "image_url": image_url},
             MarkedPageRecognitionResult,

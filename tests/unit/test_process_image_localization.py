@@ -173,6 +173,7 @@ def _run_batch(
     evidence_localization_recheck_limit=None,
     stage_audit_enabled=False,
     deepseek_page_primary_enabled=False,
+    recognition_correction=None,
 ):
     from app.services.vision_recognition import recognize_question_batch
 
@@ -215,6 +216,7 @@ def _run_batch(
         tag_config_path=_write_tag_config(tmp_path),
         ocr_verifier=ocr_verifier or FakeOCRVerifier(),
         crop_context_padding_ratio=crop_context_padding_ratio,
+        recognition_correction=recognition_correction,
         local_red_scan=local_red_scan,
         mark_mismatch_retry_count=mark_mismatch_retry_count,
         force_mode=force_mode,
@@ -384,6 +386,30 @@ def test_deepseek_page_primary_uses_one_page_call_without_legacy_stages(tmp_path
     assert values[0]["ocr_raw_json"]["page_review_reasons"] == [
         "primary_page_recognition_pending_review"
     ]
+
+
+def test_deepseek_page_primary_passes_recognition_correction_to_client(tmp_path):
+    from app.services.vision_recognition import MarkedPageRecognitionResult
+
+    class PrimaryClient:
+        def __init__(self):
+            self.correction = None
+
+        def recognize_marked_page(self, _image_path, *, correction=None):
+            self.correction = correction
+            return MarkedPageRecognitionResult(wrong_questions=[])
+
+    client = PrimaryClient()
+    _run_batch(
+        tmp_path,
+        client=client,
+        local_red_scan=_detected_red_scan(),
+        evidence_mode=True,
+        deepseek_page_primary_enabled=True,
+        recognition_correction="both",
+    )
+
+    assert client.correction == "both"
 
 
 def test_deepseek_page_primary_does_not_duplicate_raw_content_in_candidates(tmp_path):

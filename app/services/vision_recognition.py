@@ -3449,7 +3449,12 @@ def recognize_question_batch(
                 diagnostic={"operation": "marked_page_recognition"},
             )
         try:
-            page_result = client.recognize_marked_page(image_path)
+            if recognition_correction in {"missed_errors", "false_positives", "both"}:
+                page_result = client.recognize_marked_page(
+                    image_path, correction=recognition_correction
+                )
+            else:
+                page_result = client.recognize_marked_page(image_path)
         except (VisionRecognitionError, httpx.TimeoutException, TimeoutError) as exc:
             raise ImageReviewRequired(
                 "deepseek_page_primary_failed",

@@ -178,6 +178,7 @@ def test_deepseek_marked_page_uses_one_standardized_page_and_external_prompt(tmp
     assert len(content) == 2
     assert content[1]['image_url']['url'].startswith('data:image/jpeg;base64,')
     prompt = content[0]['text']
+    assert "纠偏要求：" not in prompt
     assert 'model_bbox' in prompt and 'uncertain_fields' in prompt
     assert '每个被老师批改的答题格、填空位或选择项作为一个最小独立候选' in prompt
     assert '同一行多个批改项必须分别返回，禁止整行合并' in prompt
@@ -192,6 +193,36 @@ def test_deepseek_marked_page_uses_one_standardized_page_and_external_prompt(tmp
     for forbidden in ('OCR', 'CV', 'region_id', 'sample_id', '人工答案', '正确答案'):
         assert forbidden not in prompt
     assert result.wrong_questions[0].student_answer is None
+
+
+@pytest.mark.parametrize(
+    ("correction", "expected_instruction"),
+    [
+        ("missed_errors", "本图上次可能漏识别错题"),
+        ("false_positives", "本图上次可能误识别正确题"),
+        ("both", "本图上次可能同时漏识别错题并误识别正确题"),
+    ],
+)
+def test_deepseek_marked_page_appends_selected_correction_instruction(
+    tmp_path, correction, expected_instruction
+):
+    image = tmp_path / "page.png"
+    Image.new("RGB", (320, 240), "white").save(image)
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {"content": json.dumps({"wrong_questions": []})},
+                "finish_reason": "stop",
+            }],
+        })
+
+    deepseek_client(respond).recognize_marked_page(str(image), correction=correction)
+
+    prompt = requests[0]["messages"][0]["content"][0]["text"]
+    assert "\n\n纠偏要求：" + expected_instruction in prompt
 
 
 def test_deepseek_marked_page_preserves_exact_production_response_content_for_audit(tmp_path):
