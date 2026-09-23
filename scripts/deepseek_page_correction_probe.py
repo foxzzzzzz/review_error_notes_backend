@@ -28,12 +28,28 @@ def _extract_correction_json(content: str) -> dict:
             if line.strip().startswith("```")
         ]
         if (
-            len(fences) != 2
-            or fences[0][1].lower() != "```json"
-            or fences[1][1] != "```"
+            len(fences) == 2
+            and fences[0][1].lower() == "```json"
+            and fences[1][1] == "```"
         ):
-            raise ValueError("correction response requires one JSON code block") from error
-        return _extract_json("\n".join(lines[fences[0][0] + 1:fences[1][0]]))
+            return _extract_json("\n".join(lines[fences[0][0] + 1:fences[1][0]]))
+
+        decoder = json.JSONDecoder()
+        candidates = []
+        for index, character in enumerate(content):
+            if character != "{":
+                continue
+            try:
+                value, end = decoder.raw_decode(content, index)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and not content[end:].strip():
+                candidates.append((index, value))
+        if len(candidates) == 1 and not any(
+            character in "{}" for character in content[:candidates[0][0]]
+        ):
+            return candidates[0][1]
+        raise ValueError("correction response requires one JSON code block") from error
 
 
 def _validated_decisions(raw: dict, candidates: list[dict]) -> list[dict]:

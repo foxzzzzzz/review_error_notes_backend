@@ -155,3 +155,33 @@ def test_probe_rejects_unstructured_or_multiple_json_blocks(tmp_path, content):
             transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)),
         )
     assert (tmp_path / "probe" / "answer.md").read_text(encoding="utf-8").strip() == content
+
+
+def test_probe_extracts_single_trailing_bare_json_object():
+    from scripts.deepseek_page_correction_probe import _extract_correction_json
+
+    content = (
+        "逐项复核：只有候选 13 有明确红圈与红叉。\n\n"
+        '{"decisions":[{"candidate_id":13,"verdict":"keep",'
+        '"mark_type":"red_circle_and_cross",'
+        '"mark_bbox":[0.186,0.664,0.281,0.734]}]}'
+    )
+
+    assert _extract_correction_json(content) == {"decisions": [
+        {"candidate_id": 13, "verdict": "keep",
+         "mark_type": "red_circle_and_cross",
+         "mark_bbox": [0.186, 0.664, 0.281, 0.734]},
+    ]}
+
+
+@pytest.mark.parametrize("content", [
+    '说明 {"other":true}\n{"decisions":[]}',
+    '{"decisions":[]}\n补充说明',
+    '说明\n{"decisions":[',
+    '只有说明文字，没有结构化结果。',
+])
+def test_probe_rejects_invalid_trailing_bare_json(content):
+    from scripts.deepseek_page_correction_probe import _extract_correction_json
+
+    with pytest.raises(ValueError, match="one JSON code block"):
+        _extract_correction_json(content)
