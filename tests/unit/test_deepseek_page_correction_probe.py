@@ -107,3 +107,51 @@ def test_p010_probe_rejects_incomplete_decision_set_but_keeps_raw_response(tmp_p
         )
 
     assert json.loads((tmp_path / "probe" / "response.json").read_text(encoding="utf-8")) == response
+
+
+def test_probe_accepts_explanation_before_single_json_block(tmp_path):
+    from scripts.deepseek_page_correction_probe import run_probe
+
+    image, first, prompt = _inputs(tmp_path)
+    content = (
+        "逐项复核：只有冰快附近有红圈。\n"
+        "```json\n"
+        '{"decisions":['
+        '{"candidate_id":0,"verdict":"reject","mark_type":null,"mark_bbox":null},'
+        '{"candidate_id":1,"verdict":"keep","mark_type":"red_circle",'
+        '"mark_bbox":[0.18,0.65,0.29,0.74]}]}'
+        "\n```\n"
+    )
+    response = {"model": "deepseek-flash", "choices": [{
+        "finish_reason": "stop", "message": {"content": content},
+    }]}
+
+    result = run_probe(
+        image_path=image, first_response_path=first, prompt_path=prompt,
+        output_dir=tmp_path / "probe", settings_obj=_settings(),
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)),
+    )
+
+    assert result["kept_candidate_ids"] == [1]
+    assert result["decisions"][1]["mark_bbox"] == [0.18, 0.65, 0.29, 0.74]
+
+
+@pytest.mark.parametrize("content", [
+    "逐项复核：候选 1 有红圈。",
+    '说明\n```json\n{"decisions":[]}\n```\n另一个结果\n```json\n{"decisions":[]}\n```',
+])
+def test_probe_rejects_unstructured_or_multiple_json_blocks(tmp_path, content):
+    from scripts.deepseek_page_correction_probe import run_probe
+
+    image, first, prompt = _inputs(tmp_path)
+    response = {"model": "deepseek-flash", "choices": [{
+        "finish_reason": "stop", "message": {"content": content},
+    }]}
+
+    with pytest.raises(ValueError, match="one JSON code block"):
+        run_probe(
+            image_path=image, first_response_path=first, prompt_path=prompt,
+            output_dir=tmp_path / "probe", settings_obj=_settings(),
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)),
+        )
+    assert (tmp_path / "probe" / "answer.md").read_text(encoding="utf-8").strip() == content

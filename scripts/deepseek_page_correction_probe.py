@@ -12,8 +12,28 @@ from pathlib import Path
 
 import httpx
 
-from app.services.vision_recognition import _extract_json, prepare_image_data_url
+from app.services.vision_recognition import (
+    VisionRecognitionError, _extract_json, prepare_image_data_url,
+)
 from scripts.deepseek_raw_page_comparison import _credential, _write_json
+
+
+def _extract_correction_json(content: str) -> dict:
+    try:
+        return _extract_json(content)
+    except VisionRecognitionError as error:
+        lines = content.splitlines()
+        fences = [
+            (index, line.strip()) for index, line in enumerate(lines)
+            if line.strip().startswith("```")
+        ]
+        if (
+            len(fences) != 2
+            or fences[0][1].lower() != "```json"
+            or fences[1][1] != "```"
+        ):
+            raise ValueError("correction response requires one JSON code block") from error
+        return _extract_json("\n".join(lines[fences[0][0] + 1:fences[1][0]]))
 
 
 def _validated_decisions(raw: dict, candidates: list[dict]) -> list[dict]:
@@ -107,7 +127,7 @@ def run_probe(
     if not isinstance(content, str):
         raise ValueError("correction response has no final text")
     (output_dir / "answer.md").write_text(content.rstrip() + "\n", encoding="utf-8")
-    decisions = _validated_decisions(_extract_json(content), candidates)
+    decisions = _validated_decisions(_extract_correction_json(content), candidates)
     kept_ids = [decision["candidate_id"] for decision in decisions if decision["verdict"] == "keep"]
     result = {
         "first_candidate_count": len(candidates),
