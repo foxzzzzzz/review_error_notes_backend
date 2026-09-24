@@ -190,7 +190,7 @@ def test_dev_first_run_creates_env_and_stops_before_docker(deploy_project):
     assert result.returncode != 0
     assert (deploy_project["project_dir"] / ".env").is_file()
     assert "开发环境" in result.stdout
-    assert "MINIMAX_API_KEY" in result.stdout
+    assert "VISION_PROVIDER=deepseek" in result.stdout
     assert not deploy_project["docker_log"].exists()
 
 
@@ -237,9 +237,6 @@ def test_invalid_production_config_stops_before_docker(
 @pytest.mark.parametrize(
     ("key", "invalid_value"),
     [
-        ("MINIMAX_API_KEY", None),
-        ("MINIMAX_API_KEY", "..."),
-        ("MINIMAX_API_HOST", None),
         ("DEV_LOGIN_IDENTITY", None),
         ("JWT_SECRET", "change-me-in-production"),
         ("AES_KEY", "change-me-32bytes-secret-key-ok!"),
@@ -269,6 +266,50 @@ def test_invalid_development_config_stops_before_docker(
     assert key in f"{result.stdout}\n{result.stderr}"
     if invalid_value and key.endswith(("KEY", "SECRET")):
         assert invalid_value not in f"{result.stdout}\n{result.stderr}"
+    assert not deploy_project["docker_log"].exists()
+
+
+def test_dev_deploy_deepseek_allows_empty_legacy_minimax_config(deploy_project):
+    values = _valid_dev_env()
+    values.update(
+        {
+            "VISION_PROVIDER": "deepseek",
+            "MINIMAX_API_KEY": "",
+            "MINIMAX_API_HOST": "",
+        }
+    )
+    _write_env(deploy_project["project_dir"], values)
+
+    result = _run_deploy(deploy_project, script_name="dev_deploy.sh")
+
+    assert result.returncode == 0, result.stderr
+    assert "部署完成" in result.stdout
+    assert deploy_project["docker_log"].exists()
+
+
+@pytest.mark.parametrize(
+    ("key", "invalid_value"),
+    [
+        ("MINIMAX_API_KEY", None),
+        ("MINIMAX_API_KEY", "..."),
+        ("MINIMAX_API_HOST", None),
+    ],
+)
+def test_dev_deploy_minimax_requires_minimax_config(
+    deploy_project, key, invalid_value
+):
+    values = _valid_dev_env()
+    values["VISION_PROVIDER"] = "minimax"
+    if invalid_value is None:
+        values.pop(key)
+    else:
+        values[key] = invalid_value
+    _write_env(deploy_project["project_dir"], values)
+
+    result = _run_deploy(deploy_project, script_name="dev_deploy.sh")
+
+    assert result.returncode != 0
+    assert key in f"{result.stdout}\n{result.stderr}"
     assert not deploy_project["docker_log"].exists()
 
 

@@ -6,8 +6,7 @@ source "$SCRIPT_DIR/deploy_common.sh"
 
 print_required_config() {
   printf '%s\n' \
-    'MINIMAX_API_KEY' \
-    'MINIMAX_API_HOST' \
+    'VISION_PROVIDER=deepseek' \
     'JWT_SECRET' \
     'AES_KEY' \
     'PHONE_HMAC_SECRET' \
@@ -21,8 +20,6 @@ require_exact_value "开发环境" APP_ENV development
 require_exact_value "开发环境" DEV_MODE true
 
 for key in \
-  MINIMAX_API_KEY \
-  MINIMAX_API_HOST \
   JWT_SECRET \
   AES_KEY \
   PHONE_HMAC_SECRET \
@@ -31,7 +28,13 @@ do
   require_value "开发环境" "$key"
 done
 
-reject_example_value "开发环境" MINIMAX_API_KEY '...'
+ENV_VALUES[VISION_PROVIDER]="${ENV_VALUES[VISION_PROVIDER]:-deepseek}"
+if [[ "${ENV_VALUES[VISION_PROVIDER]}" == "minimax" ]]; then
+  require_value "开发环境" MINIMAX_API_KEY
+  require_value "开发环境" MINIMAX_API_HOST
+  reject_example_value "开发环境" MINIMAX_API_KEY '...'
+fi
+
 reject_example_value "开发环境" JWT_SECRET change-me-in-production
 reject_example_value "开发环境" AES_KEY 'change-me-32bytes-secret-key-ok!'
 reject_example_value "开发环境" PHONE_HMAC_SECRET change-me-phone-hmac-secret
@@ -50,6 +53,7 @@ export_env_values \
   DEV_MODE \
   DEV_LOGIN_IDENTITY \
   LLM_API_KEY \
+  VISION_PROVIDER \
   MINIMAX_API_KEY \
   MINIMAX_API_HOST \
   WECHAT_APP_ID \

@@ -91,10 +91,12 @@ bash scripts/dev_deploy.sh
 
 - `APP_ENV=development`、`DEV_MODE=true`
 - 稳定且非空的 `DEV_LOGIN_IDENTITY`
-- `MINIMAX_API_KEY`、`MINIMAX_API_HOST`
+- `VISION_PROVIDER=deepseek` 时，历史 `MINIMAX_API_KEY` 可留空；仅选择
+  `VISION_PROVIDER=minimax` 时必须配置 `MINIMAX_API_KEY`、`MINIMAX_API_HOST`
 - 随机且互不共用的 `JWT_SECRET`、`AES_KEY`、`PHONE_HMAC_SECRET`
 
-`LLM_API_KEY` 可暂时留空，但衍生题功能不可用。`WECHAT_APP_ID` 或
+`LLM_API_KEY` 可暂时留空，但衍生题功能不可用；使用默认的 DeepSeek
+`text_llm` 视觉密钥来源时，图片识别也需要该 Key。`WECHAT_APP_ID` 或
 `WECHAT_APP_SECRET` 缺失时，真实微信登录和手机号能力不可用，可先使用
 开发登录验证基础流程。补齐配置后再次运行同一命令即可构建镜像、迁移数据库、
 启动全部服务并执行健康检查。
