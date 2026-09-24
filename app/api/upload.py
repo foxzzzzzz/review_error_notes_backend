@@ -3,7 +3,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -16,6 +16,7 @@ from app.models.student import Student
 from app.tasks.process_image import process_image
 from app.config import settings
 from PIL import Image, UnidentifiedImageError
+from app.services.question_image import QuestionImageInvalid, QuestionImageNotFound, render_question_image
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 ACTIVE_IMAGE_STATUSES = ("pending", "segmented", "needs_review", "failed")
@@ -170,6 +171,7 @@ async def retry_image(
 @router.get("/images/{image_id}/original")
 async def get_original_image(
     image_id: str,
+    normalized: bool = Query(False),
     student: Student = Depends(get_default_student),
     db: AsyncSession = Depends(get_db),
 ):
@@ -191,6 +193,20 @@ async def get_original_image(
     media_type = media_types.get(filepath.suffix.lower())
     if media_type is None or not filepath.is_file():
         raise HTTPException(status_code=404, detail="Image file not found")
+    if normalized:
+        try:
+            image_bytes = render_question_image(
+                filepath,
+                None,
+                "original",
+                settings.MINIMAX_IMAGE_JPEG_QUALITY,
+                settings.QUESTION_IMAGE_MAX_PIXELS,
+            )
+        except QuestionImageNotFound as exc:
+            raise HTTPException(status_code=404, detail="Image file not found") from exc
+        except QuestionImageInvalid as exc:
+            raise HTTPException(status_code=422, detail="Image file is invalid") from exc
+        return Response(content=image_bytes, media_type="image/jpeg")
     return FileResponse(filepath, media_type=media_type)
 
 

@@ -17,6 +17,7 @@ from app.schemas.question import (
     QuestionUpdate,
     ReviewDecisionRequest,
     ReviewImageReprocessRequest,
+    ManualWrongQuestionRequest,
 )
 from app.config import settings
 from app.tasks.process_image import process_image
@@ -24,6 +25,7 @@ from app.services.chinese_marked_evidence import PIPELINE_NAME
 from app.services.question_image import (
     QuestionImageInvalid,
     QuestionImageNotFound,
+    _validated_normalized_bbox,
     render_question_image,
 )
 
@@ -72,6 +74,117 @@ def _current_evidence_prompt_values(question, raw_json: dict, bundle: dict) -> d
             previous_override.get("question_type") or question_type
         ).strip(),
     }
+
+
+@router.post("/review/images/{image_id}/manual-questions")
+async def add_manual_review_question(
+    image_id: str,
+    data: ManualWrongQuestionRequest,
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    image = await db.scalar(
+        select(WrongImage)
+        .where(WrongImage.id == image_id, WrongImage.student_id == student.id)
+        .with_for_update()
+    )
+    if image is None:
+        raise HTTPException(status_code=404, detail="Review image not found")
+    if image.status not in {"needs_review", "confirmed"}:
+        raise HTTPException(status_code=409, detail="Image is not available for review")
+
+    try:
+        bbox = _validated_normalized_bbox(data.bbox)
+    except QuestionImageInvalid as exc:
+        raise HTTPException(status_code=422, detail="bbox must be normalized left, top, right, bottom") from exc
+
+    question_type = data.question_type.strip()
+    if question_type not in {"write_pinyin", "write_word", "fill_blank", "calculation", "other"}:
+        raise HTTPException(status_code=422, detail="Unsupported question_type")
+    values = {
+        "bbox": bbox,
+        "instruction": data.instruction.strip(),
+        "prompt_text": data.prompt_text.strip(),
+        "question_type": question_type,
+        "correct_answer": data.correct_answer.strip(),
+        "student_answer": (data.student_answer or "").strip() or None,
+    }
+    if not all(values[key] for key in ("instruction", "prompt_text", "correct_answer")):
+        raise HTTPException(status_code=422, detail="Question fields must not be blank")
+
+    existing = await db.get(WrongQuestion, data.question_id)
+    if existing is not None:
+        previous = ((existing.ocr_raw_json or {}).get("evidence_bundle") or {}).get(
+            "manual_add_request"
+        )
+        if (
+            existing.image_id == image.id
+            and existing.student_id == student.id
+            and previous == values
+        ):
+            return {"question_id": str(existing.id), "idempotent": True}
+        raise HTTPException(status_code=409, detail="question_id was already used")
+
+    raw_json = {
+        "evidence_bundle": {
+            "human_confirmed_prompt": {
+                "instruction": values["instruction"],
+                "prompt_text": values["prompt_text"],
+                "question_type": values["question_type"],
+                "source": "human",
+                "actor_id": str(student.id),
+            },
+            "review_history": [
+                {
+                    "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "human",
+                    "actor_id": str(student.id),
+                    "decision": "manual_add",
+                    "new_values": values,
+                }
+            ],
+            "manual_add_request": values,
+        }
+    }
+    question = WrongQuestion(
+        id=data.question_id,
+        student_id=student.id,
+        image_id=image.id,
+        crop_region={"bbox_format": "normalized_ltrb", "bbox": bbox},
+        subject=image.subject,
+        grade=image.grade,
+        semester=image.semester,
+        ocr_text=values["student_answer"],
+        ocr_answer=values["correct_answer"],
+        ocr_raw_json=raw_json,
+        recognition_pipeline=PIPELINE_NAME,
+        mark_status="confirmed",
+        question_evidence_status="confirmed",
+        answer_status="confirmed",
+        question_type=question_type,
+        tags=[],
+        collection_status="collected",
+        review_status="confirmed",
+        mastery_status="learning",
+    )
+    db.add(question)
+    image.question_count = (image.question_count or 0) + 1
+    pending = await db.scalar(
+        select(WrongQuestion.id)
+        .where(
+            WrongQuestion.image_id == image.id,
+            WrongQuestion.student_id == student.id,
+            WrongQuestion.deleted_at.is_(None),
+            WrongQuestion.collection_status == "pending_review",
+        )
+        .limit(1)
+    )
+    if pending is None:
+        image.status = "confirmed"
+        image.error_code = None
+        image.error_message = None
+    await db.commit()
+    return {"question_id": str(question.id), "idempotent": False}
 
 
 @router.get("", response_model=list[QuestionOut])
@@ -178,6 +291,11 @@ async def list_review_images(
         )
         item = QuestionOut.model_validate(question).model_dump(mode="json")
         item["crop_region"] = question.crop_region
+        item["review_fields"] = _current_evidence_prompt_values(
+            question,
+            question.ocr_raw_json or {},
+            (question.ocr_raw_json or {}).get("evidence_bundle") or {},
+        )
         group["questions"].append(item)
         group["question_count"] += 1
 
@@ -190,6 +308,7 @@ async def list_review_images(
             WrongImage.error_code.is_not(None),
         )
         .order_by(WrongImage.created_at.desc())
+        .limit(settings.INCOMPLETE_IMAGE_STATUS_LIMIT)
     )
     for image, collected_count in issue_result.all():
         image_id = str(image.id)
@@ -202,6 +321,30 @@ async def list_review_images(
                 "auto_collected_count": collected_count,
                 "issue_code": image.error_code,
                 "issue_message": image.error_message,
+                "questions": [],
+                "_created_at": image.created_at,
+            },
+        )
+    completed_result = await db.execute(
+        select(WrongImage, auto_collected_count.label("auto_collected_count"))
+        .where(
+            WrongImage.student_id == student.id,
+            WrongImage.status == "confirmed",
+        )
+        .order_by(WrongImage.created_at.desc())
+        .limit(settings.REVIEW_IMAGE_HISTORY_LIMIT)
+    )
+    for image, collected_count in completed_result.all():
+        image_id = str(image.id)
+        groups.setdefault(
+            image_id,
+            {
+                "group_type": "completed_image",
+                "image_id": image_id,
+                "question_count": 0,
+                "auto_collected_count": collected_count,
+                "issue_code": None,
+                "issue_message": None,
                 "questions": [],
                 "_created_at": image.created_at,
             },

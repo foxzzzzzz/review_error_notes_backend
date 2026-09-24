@@ -157,6 +157,12 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "./uploads"
     UPLOAD_MAX_BYTES: int = Field(default=10_485_760, gt=0)
     INCOMPLETE_IMAGE_STATUS_LIMIT: int = Field(default=100, ge=1, le=500)
+    REVIEW_IMAGE_HISTORY_LIMIT: int = Field(
+        default=100,
+        ge=1,
+        le=500,
+        description="Maximum recent completed images shown in manual question review history.",
+    )
     PDF_DIR: str = "./pdfs"
     AVATAR_DIR: str = "./avatars"
     AVATAR_MAX_BYTES: int = Field(default=5_242_880, gt=0)

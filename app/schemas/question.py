@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Literal, Optional
 from datetime import datetime
 from uuid import UUID
@@ -58,3 +58,22 @@ class ReviewImageReprocessRequest(BaseModel):
         "both",
         "force_unmarked",
     ]
+
+
+class ManualWrongQuestionRequest(BaseModel):
+    question_id: UUID
+    bbox: list[float] = Field(min_length=4, max_length=4)
+    instruction: str = Field(min_length=1, max_length=500)
+    prompt_text: str = Field(min_length=1, max_length=5000)
+    question_type: str = Field(min_length=1, max_length=20)
+    correct_answer: str = Field(min_length=1, max_length=1000)
+    student_answer: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("bbox", mode="before")
+    @classmethod
+    def reject_boolean_bbox_coordinates(cls, value):
+        if isinstance(value, (list, tuple)) and any(
+            isinstance(coordinate, bool) for coordinate in value
+        ):
+            raise ValueError("bbox coordinates must be numbers")
+        return value
