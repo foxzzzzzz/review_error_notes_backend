@@ -1,4 +1,5 @@
 from copy import deepcopy
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal
@@ -18,6 +19,7 @@ from app.schemas.question import (
     ReviewDecisionRequest,
     ReviewImageReprocessRequest,
     ManualWrongQuestionRequest,
+    ManualQuestionSuggestionRequest,
 )
 from app.config import settings
 from app.tasks.process_image import process_image
@@ -28,6 +30,7 @@ from app.services.question_image import (
     _validated_normalized_bbox,
     render_question_image,
 )
+from app.services.manual_question_suggestion import recognize_manual_suggestion
 
 router = APIRouter(prefix="/questions", tags=["questions"])
 
@@ -42,6 +45,7 @@ def _current_evidence_prompt_values(question, raw_json: dict, bundle: dict) -> d
     """Read the current review display without copying observations to legacy keys."""
     previous_override = bundle.get("human_override") or {}
     deepseek_content = raw_json.get("deepseek_content") or {}
+    marked_page_item = raw_json.get("marked_page_item") or {}
     fields = bundle.get("fields") or {}
 
     def selected(field_name: str) -> str:
@@ -65,7 +69,11 @@ def _current_evidence_prompt_values(question, raw_json: dict, bundle: dict) -> d
     if not prompt_text:
         prompt_text = next(
             (value for value in (selected(role) for role in prompt_roles) if value),
-            str(deepseek_content.get("prompt_text") or "").strip(),
+            str(
+                deepseek_content.get("prompt_text")
+                or marked_page_item.get("printed_question")
+                or ""
+            ).strip(),
         )
     return {
         "instruction": instruction,
@@ -74,6 +82,51 @@ def _current_evidence_prompt_values(question, raw_json: dict, bundle: dict) -> d
             previous_override.get("question_type") or question_type
         ).strip(),
     }
+
+
+@router.post("/review/images/{image_id}/manual-suggestion")
+async def suggest_manual_review_question(
+    image_id: str,
+    data: ManualQuestionSuggestionRequest,
+    student: Student = Depends(get_default_student),
+    db: AsyncSession = Depends(get_db),
+):
+    image = await db.scalar(
+        select(WrongImage).where(
+            WrongImage.id == image_id,
+            WrongImage.student_id == student.id,
+        )
+    )
+    if image is None:
+        raise HTTPException(status_code=404, detail="Review image not found")
+    if image.status not in {"needs_review", "confirmed"}:
+        raise HTTPException(status_code=409, detail="Image is not available for review")
+
+    try:
+        bbox = _validated_normalized_bbox(data.bbox)
+    except QuestionImageInvalid as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="bbox must be normalized left, top, right, bottom",
+        ) from exc
+
+    image_path = Path(settings.UPLOAD_DIR) / Path(image.original_url).name
+    try:
+        return await asyncio.to_thread(
+            recognize_manual_suggestion,
+            str(image_path),
+            bbox,
+            data.mode,
+            subject=image.subject,
+            grade=image.grade,
+            semester=image.semester,
+        )
+    except Exception as exc:
+        # Suggestions are optional; the client can continue with manual entry.
+        raise HTTPException(
+            status_code=503,
+            detail="Recognition suggestion unavailable; continue manual entry",
+        ) from exc
 
 
 @router.post("/review/images/{image_id}/manual-questions")

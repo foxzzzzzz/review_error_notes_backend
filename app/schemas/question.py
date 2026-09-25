@@ -77,3 +77,17 @@ class ManualWrongQuestionRequest(BaseModel):
         ):
             raise ValueError("bbox coordinates must be numbers")
         return value
+
+
+class ManualQuestionSuggestionRequest(BaseModel):
+    bbox: list[float] = Field(min_length=4, max_length=4)
+    mode: Literal["ocr", "llm"]
+
+    @field_validator("bbox", mode="before")
+    @classmethod
+    def reject_boolean_bbox_coordinates(cls, value):
+        if isinstance(value, (list, tuple)) and any(
+            isinstance(coordinate, bool) for coordinate in value
+        ):
+            raise ValueError("bbox coordinates must be numbers")
+        return value

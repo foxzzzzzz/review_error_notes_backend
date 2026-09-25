@@ -8,7 +8,11 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy.dialects import postgresql
 
-from app.api.questions import decide_image_reviews, update_question
+from app.api.questions import (
+    _current_evidence_prompt_values,
+    decide_image_reviews,
+    update_question,
+)
 from app.schemas.question import QuestionUpdate, ReviewDecision, ReviewDecisionRequest
 from app.services.chinese_marked_evidence import PIPELINE_NAME
 
@@ -145,6 +149,27 @@ def _review(question, decision, db=None):
         )
     )
     return response, db
+
+
+def test_primary_page_review_prefills_visible_printed_question_when_ocr_conflicts():
+    question = _question(question_type=None)
+    raw_json = {
+        "marked_page_item": {"printed_question": "qiū liáng"},
+    }
+    bundle = {
+        "fields": {
+            "printed_prompt": {
+                "status": "conflict",
+                "selected_value": None,
+            },
+        },
+    }
+
+    values = _current_evidence_prompt_values(question, raw_json, bundle)
+
+    assert values["prompt_text"] == "qiū liáng"
+    assert values["instruction"] == ""
+    assert values["question_type"] == ""
 
 
 def test_collect_confirms_all_evidence_and_appends_normalized_audit_record():

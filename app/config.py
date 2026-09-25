@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     MINIMAX_LOCALIZATION_CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0, le=1)
     MINIMAX_LOCALIZATION_MAX_AREA_RATIO: float = Field(default=0.35, gt=0, le=1)
     QUESTION_CROP_CONTEXT_PADDING_RATIO: float = Field(default=0.15, ge=0, le=1)
+    MANUAL_QUESTION_SUGGESTION_PROMPT_PATH: str = Field(
+        default="./config/manual-question-suggestion-prompt.md",
+        description="External prompt for optional DeepSeek suggestions on manually selected question regions.",
+    )
     MARK_RED_PIXEL_MIN_RATIO: float = Field(default=0.005, ge=0, le=1)
     MARK_RED_PIXEL_EXPANSION_RATIO: float = Field(default=0.08, ge=0, le=1)
     MARK_CORRECTION_GROUP_ENABLED: bool = True
