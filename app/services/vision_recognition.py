@@ -546,6 +546,7 @@ class MarkedPageRecognitionItem(BaseModel):
 
     printed_question: Optional[str]
     student_answer: Optional[str]
+    correct_answer_suggestion: Optional[str] = None
     model_bbox: List[float]
     confidence: float = Field(ge=0, le=1)
     uncertain_fields: List[
@@ -558,6 +559,13 @@ class MarkedPageRecognitionItem(BaseModel):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("correct_answer_suggestion", mode="before")
+    @classmethod
+    def unusable_answer_suggestion_is_missing(cls, value):
+        if isinstance(value, str):
+            return value.strip() or None
+        return None
 
     @field_validator("printed_question", "student_answer")
     @classmethod
@@ -3580,6 +3588,7 @@ def recognize_question_batch(
                     else {}
                 ),
                 role_routing_hints=role_routing_hints,
+                suggested_answer_candidate=item.correct_answer_suggestion,
                 mark_status="needs_review",
             )
             if ocr_page_evidence is None or ocr_page_evidence.status != "available":

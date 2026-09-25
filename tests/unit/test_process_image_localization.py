@@ -388,6 +388,38 @@ def test_deepseek_page_primary_uses_one_page_call_without_legacy_stages(tmp_path
     ]
 
 
+def test_deepseek_page_primary_persists_answer_as_unconfirmed_suggestion(tmp_path):
+    from app.services.vision_recognition import (
+        MarkedPageRecognitionItem,
+        MarkedPageRecognitionResult,
+    )
+
+    class PrimaryClient:
+        def recognize_marked_page(self, _image_path):
+            return MarkedPageRecognitionResult(wrong_questions=[
+                MarkedPageRecognitionItem(
+                    printed_question="bīng kuài",
+                    student_answer="冰快",
+                    model_bbox=[0.1, 0.2, 0.4, 0.5],
+                    confidence=0.9,
+                    correct_answer_suggestion="冰块",
+                )
+            ])
+
+    _, values = _run_batch(
+        tmp_path, client=PrimaryClient(), local_red_scan=_detected_red_scan(),
+        evidence_mode=True, image_id="answer-page",
+        deepseek_page_primary_enabled=True,
+    )
+
+    assert values[0]["ocr_answer"] == "冰块"
+    assert values[0]["answer_status"] == "suggested"
+    assert values[0]["collection_status"] == "pending_review"
+    assert values[0]["ocr_raw_json"]["evidence_bundle"]["answer_suggestion"] == {
+        "status": "suggested", "selected_value": "冰块",
+    }
+
+
 def test_deepseek_page_primary_passes_recognition_correction_to_client(tmp_path):
     from app.services.vision_recognition import MarkedPageRecognitionResult
 

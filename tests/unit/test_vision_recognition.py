@@ -542,6 +542,34 @@ def test_marked_page_empty_student_answers_remain_candidates():
     assert result.invalid_item_diagnostics == []
 
 
+def test_marked_page_answer_suggestion_is_optional_and_cannot_drop_question():
+    from app.services.vision_recognition import (
+        MarkedPageRecognitionResult,
+        _validate_response_result,
+    )
+
+    base = {
+        'printed_question': 'bīng kuài', 'student_answer': '冰快',
+        'model_bbox': [0.1, 0.2, 0.3, 0.4], 'confidence': 0.9,
+        'uncertain_fields': [],
+    }
+    result = _validate_response_result(
+        {'wrong_questions': [
+            {**base, 'correct_answer_suggestion': ' 冰块 '},
+            {**base, 'correct_answer_suggestion': None},
+            {**base, 'correct_answer_suggestion': {'bad': 'value'}},
+            base,
+        ]},
+        MarkedPageRecognitionResult,
+        {'operation': 'marked_page_recognition'},
+    )
+
+    assert [item.correct_answer_suggestion for item in result.wrong_questions] == [
+        '冰块', None, None, None,
+    ]
+    assert result.invalid_item_diagnostics == []
+
+
 def test_marked_page_validation_isolates_non_object_siblings():
     from app.services.vision_recognition import (
         MarkedPageRecognitionResult,

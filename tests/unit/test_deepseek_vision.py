@@ -158,6 +158,7 @@ def test_deepseek_marked_page_uses_one_standardized_page_and_external_prompt(tmp
             'model_bbox': [0.1, 0.2, 0.4, 0.5],
             'confidence': 0.91,
             'uncertain_fields': ['student_answer'],
+            'correct_answer_suggestion': '正确答案',
         }],
     }
 
@@ -190,9 +191,11 @@ def test_deepseek_marked_page_uses_one_standardized_page_and_external_prompt(tmp
     assert 'teacher_mark_type' not in prompt and 'teacher_mark_bbox' not in prompt
     assert '返回候选数量应与' not in prompt
     assert '其他明确批改标记' not in prompt
-    for forbidden in ('OCR', 'CV', 'region_id', 'sample_id', '人工答案', '正确答案'):
+    for forbidden in ('OCR', 'CV', 'region_id', 'sample_id', '人工答案'):
         assert forbidden not in prompt
+    assert 'correct_answer_suggestion' in prompt
     assert result.wrong_questions[0].student_answer is None
+    assert result.wrong_questions[0].correct_answer_suggestion == '正确答案'
 
 
 @pytest.mark.parametrize(

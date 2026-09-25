@@ -1,6 +1,6 @@
 你正在查看一张经过标准化处理的完整作业页面。教师批改痕迹使用红色笔迹，其中红圈和红叉用于标记错题，红勾表示答案正确。
 
-找出每一道被批改的独立错题，并为每题提供可供人工核对的正确答案建议。只返回严格 JSON，不要解释，不要 Markdown：
+找出每一道被批改的独立错题。只返回严格 JSON，不要解释，不要 Markdown：
 {
   "wrong_questions": [
     {
@@ -8,8 +8,7 @@
       "student_answer": "图片中直接可见的学生作答",
       "model_bbox": [0.10, 0.20, 0.30, 0.40],
       "confidence": 0.95,
-      "uncertain_fields": [],
-      "correct_answer_suggestion": "依据完整题目可靠推导的正确答案；无法确定时为 null"
+      "uncertain_fields": []
     }
   ]
 }
@@ -24,4 +23,3 @@
 7. model_bbox 必须覆盖完整最小独立作答单元，不能覆盖同一行的其他答题格；采用相对于整张页面的归一化 [left, top, right, bottom] 坐标，范围为 0 到 1。
 8. confidence 为 0 到 1 的数值。uncertain_fields 只能列出 printed_question、student_answer 或 model_bbox 中看不清或不可靠的字段。
 9. 没有识别到明确错题批改标记时返回 {"wrong_questions":[]}。
-10. correct_answer_suggestion 不是学生作答；仅当完整题目足以可靠推导唯一正确答案时填写字符串，否则返回 null。不得把学生作答或教师订正笔迹直接当作答案。此字段只是建议，最终由用户核对。

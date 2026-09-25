@@ -19,7 +19,7 @@ def _settings():
         DEEPSEEK_VISION_TIMEOUT_SECONDS=60,
         MINIMAX_IMAGE_MAX_EDGE=2048,
         MINIMAX_IMAGE_JPEG_QUALITY=90,
-        CHINESE_DEEPSEEK_PAGE_PROMPT_PATH="config/deepseek-marked-page-primary-prompt.md",
+        CHINESE_DEEPSEEK_PAGE_PROMPT_PATH="config/deepseek-answer-strategy-detection-prompt.md",
         LLM_API_KEY="",
         LLM_API_BASE="https://api.deepseek.test/v1",
     )

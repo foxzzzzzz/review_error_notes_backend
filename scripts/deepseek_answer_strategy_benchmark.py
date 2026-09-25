@@ -54,7 +54,7 @@ def _validate_candidates(value: dict, *, require_suggestion: bool = False) -> di
     invalid_answer_fields = 0
     valid_indexes = [index for index in range(len(raw_items)) if index not in rejected]
     for index, item in zip(valid_indexes, result.wrong_questions):
-        candidate = item.model_dump()
+        candidate = item.model_dump(exclude={"correct_answer_suggestion"})
         if require_suggestion:
             raw_item = raw_items[index]
             if "correct_answer_suggestion" not in raw_item:
@@ -192,7 +192,7 @@ def run_benchmark(*, pages: list[dict], output_dir: Path, repeats: int, settings
                   b_prompt_path: Path | None = None, transport=None) -> list[dict]:
     if repeats < 1:
         raise ValueError("repeats must be positive")
-    primary_prompt_path = primary_prompt_path or Path(settings_obj.CHINESE_DEEPSEEK_PAGE_PROMPT_PATH)
+    primary_prompt_path = primary_prompt_path or Path("config/deepseek-answer-strategy-detection-prompt.md")
     a_prompt_path = a_prompt_path or Path("config/deepseek-answer-strategy-a-prompt.md")
     b_prompt_path = b_prompt_path or Path("config/deepseek-answer-strategy-b-prompt.md")
     primary = primary_prompt_path.read_text(encoding="utf-8").strip()
@@ -345,7 +345,7 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, help='JSON list or {"pages":[{"label":"P003","image_path":"..."}]}')
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--repeats", type=int, default=2)
-    parser.add_argument("--primary-prompt", type=Path, default=Path(settings.CHINESE_DEEPSEEK_PAGE_PROMPT_PATH))
+    parser.add_argument("--primary-prompt", type=Path, default=Path("config/deepseek-answer-strategy-detection-prompt.md"))
     parser.add_argument("--a-prompt", type=Path, default=Path("config/deepseek-answer-strategy-a-prompt.md"))
     parser.add_argument("--b-batch-prompt", type=Path, default=Path("config/deepseek-answer-strategy-b-prompt.md"))
     args = parser.parse_args()
